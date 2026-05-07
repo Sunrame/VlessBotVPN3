@@ -20,7 +20,7 @@ ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0))]
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
-# Обновленные данные тарифов (косметические правки)
+# Обновленные данные тарифов
 TARIFFS_CONFIG = {
     "standart": {
         "name": "Стандарт",
@@ -39,7 +39,8 @@ TARIFFS_CONFIG = {
     }
 }
 
-PANEL_URL = os.getenv('PANEL_URL') 
+# Очищаем URL от лишних слэшей в конце для корректной работы ссылок
+PANEL_URL = os.getenv('PANEL_URL', '').rstrip('/')
 SUB_PORT = os.getenv('SUB_PORT', '2096') 
 LOGIN = os.getenv('PANEL_LOGIN')
 PASSWORD = os.getenv('PANEL_PASSWORD')
@@ -101,16 +102,25 @@ async def activate_user_in_db(user_id, plan, months):
 def get_3xui_session():
     s = requests.Session()
     try:
-        r = s.post(f"{PANEL_URL.strip('/')}/login", data={'username': LOGIN, 'password': PASSWORD}, timeout=10)
+        r = s.post(f"{PANEL_URL}/login", data={'username': LOGIN, 'password': PASSWORD}, timeout=10)
         return s if r.status_code == 200 else None
     except: return None
 
 def get_vpn_link(user_id, username, expiry_ts, plan):
-    session = get_3xui_session()
-    if not session: return "Ошибка связи с панелью"
+    """
+    Генерирует ссылку на подписку. 
+    Пользователь вставляет её в приложение и получает список всех серверов.
+    """
+    # UUID генерируется на основе ID пользователя для постоянства
     u_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
+    
+    # Извлекаем чистый хост (IP или домен) из PANEL_URL
+    # Например из http://31.44.9.47:52790 получаем 31.44.9.47
     host = PANEL_URL.split('://')[-1].split(':')[0]
-    return f"{PANEL_URL.split('://')[0]}://{host}:{SUB_PORT}/sub/{u_uuid}?remark=Truba_{plan.replace(' ', '_')}"
+    
+    # Формируем стандартную ссылку подписки для 3X-UI
+    # Формат: http://IP:ПОРТ_ПОДПИСКИ/sub/UUID
+    return f"http://{host}:{SUB_PORT}/sub/{u_uuid}"
 
 # --- ОБРАБОТЧИКИ ---
 
@@ -138,7 +148,6 @@ async def choose_duration(callback: CallbackQuery):
     for months, price in info['prices'].items():
         m_int = int(months)
         price_per_month = price // m_int
-        # Добавляем инфо о цене в месяц для наглядности
         btn_text = f"{months} мес. — {price}₽ ({price_per_month}₽/мес)"
         btns.append([InlineKeyboardButton(text=btn_text, callback_data=f"buy_{t_type}_{months}")])
         
@@ -173,9 +182,10 @@ async def create_payment_link(callback: CallbackQuery):
         f"💳 <b>Оформление подписки</b>\n\n"
         f"Тариф: <b>{plan_display}</b>\n"
         f"К оплате: <b>{price}₽</b>\n\n"
-        "1. Нажмите кнопку «Оплатить»\n"
-        "2. После завершения платежа нажмите «Проверить оплату».\n\n"
-        "<i>Ссылка на оплату действительна 15 минут.</i>",
+        f"1. Нажмите кнопку «Оплатить»\n"
+        f"2. После завершения платежа нажмите «Проверить оплату».\n\n"
+        f"🆘 <i>Если возникли вопросы или нужен чек, пишите в поддержку: {SUPPORT_CONTACT}</i>\n\n"
+        f"<i>Ссылка на оплату действительна 15 минут.</i>",
         reply_markup=markup, 
         parse_mode="HTML"
     )
@@ -197,8 +207,8 @@ async def check_payment(callback: CallbackQuery):
             f"✅ <b>Оплата прошла успешно!</b>\n\n"
             f"Тариф <b>{plan_name}</b> активирован.\n"
             f"📅 До: <b>{time.strftime('%d.%m.%Y', time.localtime(expiry_ts))}</b>\n\n"
-            f"🔗 <b>Ваш ключ:</b>\n{hcode(lnk)}\n\n"
-            f"Инструкции по настройке в канале @Truba_VPN", parse_mode="HTML"
+            f"🔗 <b>Твоя подписка (нажми, чтобы скопировать):</b>\n{hcode(lnk)}\n\n"
+            f"Добавь эту ссылку в приложение (Nekobox, v2rayNG или Streisand), чтобы увидеть все доступные серверы.", parse_mode="HTML"
         )
         
         admin_txt = f"💰 <b>Успешная оплата!</b>\nСумма: {payment.amount.value}₽\nЮзер: @{callback.from_user.username}\nID: <code>{user_id}</code>"
@@ -249,7 +259,7 @@ async def show_profile(callback: CallbackQuery):
 
     if is_active:
         lnk = get_vpn_link(callback.from_user.id, d[2], d[0], d[3])
-        text += f"\n\n🔗 <b>Ваш ключ:</b>\n{hcode(lnk)}"
+        text += f"\n\n🔗 <b>Ваша подписка:</b>\n{hcode(lnk)}"
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
