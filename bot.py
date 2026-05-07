@@ -133,15 +133,19 @@ async def create_payment_link(callback: CallbackQuery):
         "metadata": {"user_id": callback.from_user.id, "t_type": t_type, "months": months}
     }, idempotency_key)
 
+    # Добавляем кнопку ОТМЕНА (назад к выбору тарифа)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплатить (СБП / Карты)", url=payment.confirmation.confirmation_url)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{payment.id}")]
+        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{payment.id}")],
+        [InlineKeyboardButton(text="❌ Отменить покупку", callback_data=f"type_{t_type}")] # Вернет к выбору срока
     ])
 
     await callback.message.edit_text(
         f"💳 <b>Оплата тарифа: {plan_display}</b>\n\nК оплате: <b>{price}₽</b>\n\n"
-        "После оплаты нажмите кнопку «Проверить оплату», чтобы получить ключ.",
-        reply_markup=markup, parse_mode="HTML"
+        "После оплаты нажмите кнопку «Проверить оплату».\n"
+        "Если передумали — нажмите «Отменить покупку».",
+        reply_markup=markup, 
+        parse_mode="HTML"
     )
 
 @router.callback_query(F.data.startswith("check_"))
