@@ -290,6 +290,56 @@ async def about_menu(callback: CallbackQuery):
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]
     ]
     await callback.message.edit_text("📖 <b>Информация и поддержка:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
+    
+# --- АДМИН-ФУНКЦИИ ---
+
+@router.message(Command("give"))
+async def admin_give_sub(message: types.Message, command: CommandObject):
+    if message.from_user.id not in ADMINS: return
+    
+    if not command.args or len(command.args.split()) < 2:
+        return await message.answer("Использование: `/give @username дни`\nПример: `/give @ivan 30`", parse_mode="Markdown")
+    
+    username_target, days = command.args.split()
+    username_target = username_target.replace("@", "")
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users WHERE username = ?', (username_target,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        target_id = row[0]
+        expiry = await activate_user_in_db(target_id, "Admin Начисление", days, is_days=True)
+        date_str = time.strftime('%d.%m.%Y', time.localtime(expiry))
+        await message.answer(f"✅ Пользователю @{username_target} выдана подписка до {date_str}")
+        try:
+            await bot.send_message(target_id, f"🎁 Администратор выдал вам подписку!\n📅 Срок до: {date_str}\n\nВаша ссылка:\n{hcode(get_vpn_link(target_id))}", parse_mode="HTML")
+        except: pass
+    else:
+        await message.answer("❌ Пользователь не найден в базе бота.")
+
+@router.message(Command("take"))
+async def admin_take_sub(message: types.Message, command: CommandObject):
+    if message.from_user.id not in ADMINS: return
+    
+    if not command.args:
+        return await message.answer("Использование: `/take @username`", parse_mode="Markdown")
+    
+    username_target = command.args.replace("@", "").strip()
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET is_active = 0, expiry_date = 0, current_plan = "none" WHERE username = ?', (username_target,))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    
+    if affected:
+        await message.answer(f"⛔ У @{username_target} аннулирована подписка.")
+    else:
+        await message.answer("❌ Пользователь не найден.")
 
 async def main():
     init_db()
