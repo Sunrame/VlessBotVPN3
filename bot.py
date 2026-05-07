@@ -26,12 +26,12 @@ TARIFFS_CONFIG = {
     "standart": {
         "name": "Стандарт",
         "prices": {"1": 100, "3": 270, "6": 480, "12": 840},
-        "desc": "— Трафик: <b>50 ГБ</b>\n— Устройств: <b>1</b>\n— Локации: NL, DE"
+        "desc": "— Трафик: <b>50 ГБ</b>\n— Устройств: <b>1</b>\n— Локация: DE"
     },
     "standart_plus": {
         "name": "Стандарт +",
         "prices": {"1": 150, "3": 405, "6": 720, "12": 1260},
-        "desc": "— Трафик: <b>БЕЗЛИМИТ</b>\n— Устройств: <b>1</b>\n— Локации: NL, DE, KZ"
+        "desc": "— Трафик: <b>БЕЗЛИМИТ</b>\n— Устройств: <b>1</b>\n— Локация: DE"
     },
     "premium": {
         "name": "Премиум",
@@ -234,6 +234,27 @@ async def show_ref(callback: CallbackQuery):
     link = f"https://t.me/{me.username}?start={callback.from_user.id}"
     text = f"🤝 <b>Рефералы</b>\nПриглашено: {d[5] if d else 0} / 5\n\nСсылка:\n{hcode(link)}"
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
+
+@router.callback_query(F.data == "about_menu")
+async def about_menu(callback: CallbackQuery):
+    # Формируем кнопки
+    btns = [
+        # Ссылка на канал (используем переменную CHANNEL_ID из конфига)
+        [InlineKeyboardButton(text="📢 Наш Telegram-канал", url=f"https://t.me/{CHANNEL_ID.replace('@','')}")],
+        
+        [InlineKeyboardButton(text="📜 Пользовательское Соглашение", url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
+        [InlineKeyboardButton(text="🛡 Политика Конфиденциальности", url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+        
+        [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.replace('@','')}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]
+    ]
+    
+    await callback.message.edit_text(
+        "📖 <b>Информация и полезные ссылки:</b>\n\n"
+        "Подписывайтесь на наш канал, чтобы следить за обновлениями и статусом работы серверов.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), 
+        parse_mode="HTML"
+    )
 
 async def main():
     init_db()
