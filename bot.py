@@ -18,20 +18,19 @@ SHOP_ID = '1350293'
 YOOKASSA_KEY = 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oPPHQH_z9R2c'
 ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0))]
 
-# Настройка ЮKassa API
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
-# Данные тарифов
+# Обновленные данные тарифов (косметические правки)
 TARIFFS_CONFIG = {
     "standart": {
         "name": "Стандарт",
         "prices": {"1": 100, "3": 270, "6": 480, "12": 840},
-        "desc": "— Трафик: <b>50 ГБ</b>\n— Устройств: <b>1</b>\n— Локация: DE"
+        "desc": "— Трафик: <b>50 ГБ</b>\n— Устройств: <b>1</b>\n— Локация: NL, DE"
     },
     "standart_plus": {
         "name": "Стандарт +",
         "prices": {"1": 150, "3": 405, "6": 720, "12": 1260},
-        "desc": "— Трафик: <b>БЕЗЛИМИТ</b>\n— Устройств: <b>1</b>\n— Локация: DE"
+        "desc": "— Трафик: <b>БЕЗЛИМИТ</b>\n— Устройств: <b>1</b>\n— Локация: NL, DE, KZ"
     },
     "premium": {
         "name": "Премиум",
@@ -113,7 +112,38 @@ def get_vpn_link(user_id, username, expiry_ts, plan):
     host = PANEL_URL.split('://')[-1].split(':')[0]
     return f"{PANEL_URL.split('://')[0]}://{host}:{SUB_PORT}/sub/{u_uuid}?remark=Truba_{plan.replace(' ', '_')}"
 
-# --- ОБРАБОТЧИКИ ОПЛАТЫ (YOOKASSA API) ---
+# --- ОБРАБОТЧИКИ ---
+
+@router.callback_query(F.data == "tariffs")
+async def show_tariffs(callback: CallbackQuery):
+    text = "💎 <b>Выберите тарифный план:</b>\n\nВсе наши серверы используют современный протокол VLESS + REALITY для максимальной маскировки."
+    btns = [[InlineKeyboardButton(text=f"🔹 {v['name']}", callback_data=f"type_{k}")] for k, v in TARIFFS_CONFIG.items()]
+    btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("type_"))
+async def choose_duration(callback: CallbackQuery):
+    t_type = callback.data.replace("type_", "")
+    info = TARIFFS_CONFIG[t_type]
+    
+    text = (
+        f"💳 <b>Тариф: {info['name']}</b>\n\n"
+        f"{info['desc']}\n\n"
+        f"—————\n"
+        f"⏳ <b>Выберите срок подписки:</b>\n"
+        f"<i>При покупке на долгий срок цена ниже!</i>"
+    )
+    
+    btns = []
+    for months, price in info['prices'].items():
+        m_int = int(months)
+        price_per_month = price // m_int
+        # Добавляем инфо о цене в месяц для наглядности
+        btn_text = f"{months} мес. — {price}₽ ({price_per_month}₽/мес)"
+        btns.append([InlineKeyboardButton(text=btn_text, callback_data=f"buy_{t_type}_{months}")])
+        
+    btns.append([InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("buy_"))
 async def create_payment_link(callback: CallbackQuery):
@@ -133,17 +163,19 @@ async def create_payment_link(callback: CallbackQuery):
         "metadata": {"user_id": callback.from_user.id, "t_type": t_type, "months": months}
     }, idempotency_key)
 
-    # Добавляем кнопку ОТМЕНА (назад к выбору тарифа)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплатить (СБП / Карты)", url=payment.confirmation.confirmation_url)],
         [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{payment.id}")],
-        [InlineKeyboardButton(text="❌ Отменить покупку", callback_data=f"type_{t_type}")] # Вернет к выбору срока
+        [InlineKeyboardButton(text="❌ Отменить покупку", callback_data=f"type_{t_type}")]
     ])
 
     await callback.message.edit_text(
-        f"💳 <b>Оплата тарифа: {plan_display}</b>\n\nК оплате: <b>{price}₽</b>\n\n"
-        "После оплаты нажмите кнопку «Проверить оплату».\n"
-        "Если передумали — нажмите «Отменить покупку».",
+        f"💳 <b>Оформление подписки</b>\n\n"
+        f"Тариф: <b>{plan_display}</b>\n"
+        f"К оплате: <b>{price}₽</b>\n\n"
+        "1. Нажмите кнопку «Оплатить»\n"
+        "2. После завершения платежа нажмите «Проверить оплату».\n\n"
+        "<i>Ссылка на оплату действительна 15 минут.</i>",
         reply_markup=markup, 
         parse_mode="HTML"
     )
@@ -158,24 +190,25 @@ async def check_payment(callback: CallbackQuery):
         t_type, months = payment.metadata['t_type'], payment.metadata['months']
         plan_name = f"{TARIFFS_CONFIG[t_type]['name']} ({months} мес.)"
         
-        # Активация
         expiry_ts = await activate_user_in_db(user_id, plan_name, months)
         lnk = get_vpn_link(user_id, callback.from_user.username, expiry_ts, plan_name)
 
         await callback.message.edit_text(
-            f"✅ <b>Оплата принята!</b>\n\nТариф: <b>{plan_name}</b>\n🔗 <b>Ваш ключ:</b>\n{hcode(lnk)}\n\n"
-            f"Если нужен чек, напишите @vvvvvpppnn", parse_mode="HTML"
+            f"✅ <b>Оплата прошла успешно!</b>\n\n"
+            f"Тариф <b>{plan_name}</b> активирован.\n"
+            f"📅 До: <b>{time.strftime('%d.%m.%Y', time.localtime(expiry_ts))}</b>\n\n"
+            f"🔗 <b>Ваш ключ:</b>\n{hcode(lnk)}\n\n"
+            f"Инструкции по настройке в канале @Truba_VPN", parse_mode="HTML"
         )
         
-        # Админ-уведомление для "Мой Налог"
-        admin_txt = f"💰 <b>Новая продажа!</b>\nСумма: {payment.amount.value}₽\nЮзер: @{callback.from_user.username}\n<a href='tg://user?id={user_id}'>Открыть профиль</a>"
+        admin_txt = f"💰 <b>Успешная оплата!</b>\nСумма: {payment.amount.value}₽\nЮзер: @{callback.from_user.username}\nID: <code>{user_id}</code>"
         for admin in ADMINS:
             try: await bot.send_message(admin, admin_txt, parse_mode="HTML")
             except: pass
     else:
-        await callback.answer("⏳ Оплата пока не подтверждена или возникла ошибка.", show_alert=True)
+        await callback.answer("⏳ Оплата ещё не поступила. Попробуйте через минуту.", show_alert=True)
 
-# --- ГЛАВНОЕ МЕНЮ И ПРОФИЛЬ ---
+# --- ГЛАВНОЕ МЕНЮ И СТАРТ ---
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
@@ -186,7 +219,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
     cursor.execute('INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = EXCLUDED.username', (message.from_user.id, message.from_user.username, r_id))
     conn.commit()
     conn.close()
-    await message.answer(f"🚀 {hbold('TrubaVPN')} готов к работе!", reply_markup=main_panel(), parse_mode="HTML")
+    await message.answer(f"🚀 {hbold('TrubaVPN')} — быстрый и анонимный доступ в сеть!", reply_markup=main_panel(), parse_mode="HTML")
 
 def main_panel():
     btns = [
@@ -196,31 +229,28 @@ def main_panel():
     ]
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-@router.callback_query(F.data == "tariffs")
-async def show_tariffs(callback: CallbackQuery):
-    btns = [[InlineKeyboardButton(text=f"🔹 {v['name']}", callback_data=f"type_{k}")] for k, v in TARIFFS_CONFIG.items()]
-    btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")])
-    await callback.message.edit_text("💎 <b>Выберите тариф:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
-
-@router.callback_query(F.data.startswith("type_"))
-async def choose_duration(callback: CallbackQuery):
-    t_type = callback.data.replace("type_", "")
-    info = TARIFFS_CONFIG[t_type]
-    text = f"💳 <b>{info['name']}</b>\n\n{info['desc']}\n\n⏳ <b>Выберите срок:</b>"
-    btns = [[InlineKeyboardButton(text=f"{m} мес. — {p}₽", callback_data=f"buy_{t_type}_{m}")] for m, p in info['prices'].items()]
-    btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tariffs")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
-
 @router.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery):
     d = get_user_data(callback.from_user.id)
     if not d: return
     now = int(time.time())
-    expiry_text = time.strftime('%d.%m.%Y', time.localtime(d[0])) if d[0] > now else "Не активна"
-    text = f"👤 <b>Профиль</b>\nID: <code>{callback.from_user.id}</code>\nТариф: {d[3]}\nДо: {expiry_text}"
-    if d[1] == 1:
+    
+    is_active = d[0] > now
+    expiry_text = time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else "❌ Не активна"
+    plan_text = d[3] if is_active else "Отсутствует"
+
+    text = (
+        f"👤 <b>Ваш профиль</b>\n"
+        f"—————\n"
+        f"🆔 ID: <code>{callback.from_user.id}</code>\n"
+        f"💎 Тариф: <b>{plan_text}</b>\n"
+        f"📅 Срок до: <b>{expiry_text}</b>"
+    )
+
+    if is_active:
         lnk = get_vpn_link(callback.from_user.id, d[2], d[0], d[3])
         text += f"\n\n🔗 <b>Ваш ключ:</b>\n{hcode(lnk)}"
+    
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "to_main")
@@ -232,29 +262,24 @@ async def show_ref(callback: CallbackQuery):
     d = get_user_data(callback.from_user.id)
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start={callback.from_user.id}"
-    text = f"🤝 <b>Рефералы</b>\nПриглашено: {d[5] if d else 0} / 5\n\nСсылка:\n{hcode(link)}"
+    text = (
+        f"🤝 <b>Реферальная программа</b>\n\n"
+        f"Пригласите 5 друзей, которые купят любую подписку, и получите тариф <b>ПРЕМИУМ НАВСЕГДА!</b>\n\n"
+        f"👥 Приглашено друзей: <b>{d[5] if d else 0} / 5</b>\n\n"
+        f"🔗 Ваша ссылка для приглашения:\n{hcode(link)}"
+    )
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "about_menu")
 async def about_menu(callback: CallbackQuery):
-    # Формируем кнопки
     btns = [
-        # Ссылка на канал (используем переменную CHANNEL_ID из конфига)
         [InlineKeyboardButton(text="📢 Наш Telegram-канал", url=f"https://t.me/{CHANNEL_ID.replace('@','')}")],
-        
         [InlineKeyboardButton(text="📜 Пользовательское Соглашение", url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
         [InlineKeyboardButton(text="🛡 Политика Конфиденциальности", url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
-        
         [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.replace('@','')}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]
     ]
-    
-    await callback.message.edit_text(
-        "📖 <b>Информация и полезные ссылки:</b>\n\n"
-        "Подписывайтесь на наш канал, чтобы следить за обновлениями и статусом работы серверов.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), 
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text("📖 <b>Информация и поддержка:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
 async def main():
     init_db()
