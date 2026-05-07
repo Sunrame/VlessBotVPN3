@@ -14,8 +14,8 @@ from yookassa import Configuration, Payment
 
 # --- КОНФИГУРАЦИЯ ---
 API_TOKEN = os.getenv('BOT_TOKEN')
-SHOP_ID = os.getenv('SHOP_ID')  # Твой ID: 1350293
-YOOKASSA_KEY = os.getenv('YOOKASSA_API_KEY')  # Твой ключ live_...
+SHOP_ID = '1350293' 
+YOOKASSA_KEY = 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oPPHQH_z9R2c'
 ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0))]
 
 # Настройка ЮKassa API
