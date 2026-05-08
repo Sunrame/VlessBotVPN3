@@ -40,10 +40,9 @@ TARIFFS_CONFIG = {
     }
 }
 
+# Эти переменные теперь используются меньше, так как мы перешли на прямые ссылки
 PANEL_URL = os.getenv('PANEL_URL', '').rstrip('/')
 SUB_PORT = os.getenv('SUB_PORT', '2096') 
-LOGIN = os.getenv('PANEL_LOGIN')
-PASSWORD = os.getenv('PANEL_PASSWORD')
 
 SUPPORT_CONTACT = "@vvvvvpppnn"
 CHANNEL_ID = "@Truba_VPN"
@@ -106,11 +105,22 @@ async def activate_user_in_db(user_id, plan, amount, is_days=False):
     conn.close()
     return expiry
 
-# --- API ПАНЕЛИ ---
+# --- ГЕНЕРАЦИЯ ПЕРСОНАЛЬНОЙ VLESS ССЫЛКИ ---
 def get_vpn_link(user_id):
+    # Генерируем уникальный UUID для каждого пользователя
     u_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
-    host = PANEL_URL.split('://')[-1].split(':')[0]
-    return f"http://{host}:{SUB_PORT}/sub/{u_uuid}"
+    
+    # Твои рабочие параметры (Германия)
+    ip = "51.250.121.176"
+    port = "443"
+    params = (
+        "type=tcp&encryption=none&security=reality"
+        "&pbk=B-1Qi4UHnODvnBfJ4IEaT5hcO6xYngxhJRU1M8FmSQg"
+        "&fp=chrome&sni=x5media.ru&sid=b3f386&spx=%2F"
+    )
+    
+    # Собираем персонализированную ссылку
+    return f"vless://{u_uuid}@{ip}:{port}?{params}#TrubaVPN_{user_id}"
 
 # --- АДМИН-КОМАНДЫ ---
 
@@ -135,7 +145,7 @@ async def admin_give_sub(message: types.Message, command: CommandObject):
         date_str = time.strftime('%d.%m.%Y', time.localtime(expiry))
         await message.answer(f"✅ Пользователю @{username_target} выдана подписка до {date_str}")
         try:
-            await bot.send_message(target_id, f"🎁 Админ выдал вам доступ до {date_str}!\n\nСсылка:\n{hcode(get_vpn_link(target_id))}", parse_mode="HTML")
+            await bot.send_message(target_id, f"🎁 Админ выдал вам доступ до {date_str}!\n\nВаша персональная ссылка:\n{hcode(get_vpn_link(target_id))}", parse_mode="HTML")
         except: pass
     else:
         await message.answer("❌ Юзер не найден.")
@@ -218,7 +228,7 @@ async def check_payment(callback: CallbackQuery):
         expiry_ts = await activate_user_in_db(u_id, plan_name, months)
         date_str = time.strftime('%d.%m.%Y', time.localtime(expiry_ts))
         
-        await callback.message.edit_text(f"✅ Успешно! До {date_str}\n\n{hcode(get_vpn_link(u_id))}", parse_mode="HTML")
+        await callback.message.edit_text(f"✅ Успешно! До {date_str}\n\nВаша персональная ссылка (нажмите, чтобы скопировать):\n{hcode(get_vpn_link(u_id))}", parse_mode="HTML")
         
         admin_msg = (
             f"💰 <b>НОВАЯ ОПЛАТА!</b>\n\n"
@@ -240,19 +250,21 @@ async def show_profile(callback: CallbackQuery):
     d = get_user_data(callback.from_user.id)
     if not d: return
     is_active = d[0] > int(time.time())
-    text = f"👤 Профиль\n📅 До: {time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else '❌ Нет подписки'}"
-    if is_active: text += f"\n\n🔗 Ссылка:\n{hcode(get_vpn_link(callback.from_user.id))}"
+    text = f"👤 <b>Ваш профиль</b>\n\n📅 Подписка до: <b>{time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else '❌ Нет подписки'}</b>"
+    if is_active: 
+        text += f"\n\n🔗 <b>Ваша персональная ссылка:</b>\n<i>(Нажмите, чтобы скопировать)</i>\n\n{hcode(get_vpn_link(callback.from_user.id))}"
+    
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "to_main")
 async def to_main(callback: CallbackQuery):
-    await callback.message.edit_text(f"🚀 Меню:", reply_markup=main_panel(), parse_mode="HTML")
+    await callback.message.edit_text(f"🚀 {hbold('TrubaVPN')} активен!", reply_markup=main_panel(), parse_mode="HTML")
 
 @router.callback_query(F.data == "ref_program")
 async def show_ref(callback: CallbackQuery):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start={callback.from_user.id}"
-    await callback.message.edit_text(f"🤝 Пригласи 5 друзей — получи вечный Премиум!\n\nСсылка:\n{hcode(link)}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
+    await callback.message.edit_text(f"🤝 Пригласи 5 друзей — получи вечный Премиум!\n\nВаша реферальная ссылка:\n{hcode(link)}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "about_menu")
 async def about_menu(callback: CallbackQuery):
