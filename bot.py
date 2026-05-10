@@ -53,26 +53,62 @@ dp = Dispatcher()
 router = Router()
 
 # --- API ПАНЕЛИ ---
+# --- API ПАНЕЛИ (С учетом секретного пути) ---
 def get_panel_cookie():
     try:
-        res = requests.post(f"{PANEL_URL}/login", data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD}, timeout=5)
-        return res.cookies
-    except: return None
+        # Используем PANEL_URL, который уже содержит секретный путь из переменных Amvera
+        login_url = f"{PANEL_URL}/login"
+        data = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
+        
+        # Отключаем проверку SSL (verify=False), так как на IP часто нет сертификата
+        res = requests.post(login_url, data=data, timeout=10, verify=False)
+        if res.status_code == 200:
+            logging.info("Авторизация в 3x-ui прошла успешно.")
+            return res.cookies
+        else:
+            logging.error(f"Панель отказала в доступе. Код: {res.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"Ошибка сети при логине: {e}")
+        return None
 
 def add_user_to_panel(user_uuid, user_id):
     cookies = get_panel_cookie()
     if not cookies: return False
+    
+    # Берем ID из переменных (там должно быть 2)
+    inbound_id = int(os.getenv('INBOUND_ID', 2)) 
+
     payload = {
-        "id": INBOUND_ID,
-        "settings": json.dumps({"clients": [{
-            "id": user_uuid, "alterId": 0, "email": f"user_{user_id}",
-            "limitIp": 1, "totalGB": 0, "expiryTime": 0, "enable": True, "tgId": user_id
-        }]})
+        "id": inbound_id,
+        "settings": json.dumps({
+            "clients": [{
+                "id": user_uuid,
+                "alterId": 0,
+                "email": f"user_{user_id}",
+                "limitIp": 1,
+                "totalGB": 0,
+                "expiryTime": 0,
+                "enable": True,
+                "tgId": str(user_id)
+            }]
+        })
     }
+    
     try:
-        res = requests.post(f"{PANEL_URL}/panel/api/inbounds/addClient", json=payload, cookies=cookies, timeout=5)
-        return res.json().get("success", False)
-    except: return False
+        # Путь для добавления клиента
+        add_url = f"{PANEL_URL}/panel/api/inbounds/addClient"
+        res = requests.post(add_url, json=payload, cookies=cookies, timeout=10, verify=False)
+        
+        if res.status_code == 200 and res.json().get("success"):
+            logging.info(f"Клиент {user_id} успешно создан в панели!")
+            return True
+        else:
+            logging.error(f"Ошибка создания клиента: {res.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Ошибка API: {e}")
+        return False
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
