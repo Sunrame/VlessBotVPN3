@@ -29,8 +29,8 @@ API_TOKEN = os.getenv('BOT_TOKEN')
 SHOP_ID = os.getenv('SHOP_ID', '1350293') 
 YOOKASSA_KEY = os.getenv('YOOKASSA_KEY', 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oPPHQH_z9R2c')
 
-PANEL_LOGIN = os.getenv('PANEL_LOGIN', 'Infobiznes240305082009')
-PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', 'Infobiznes')
+PANEL_LOGIN = os.getenv('PANEL_LOGIN', 'Infobiznes')
+PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', 'Infobiznes240305082009')
 INBOUND_ID = int(os.getenv('INBOUND_ID', 2)) 
 
 ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0)), 5906233405]
