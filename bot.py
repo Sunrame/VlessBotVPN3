@@ -13,7 +13,7 @@ from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from yookassa import Configuration, Payment
 
-# Отключаем предупреждения SSL для работы по IP
+# Отключаем предупреждения SSL для работы с панелью по IP
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- КОНФИГУРАЦИЯ ---
@@ -21,11 +21,10 @@ API_TOKEN = os.getenv('BOT_TOKEN')
 SHOP_ID = os.getenv('SHOP_ID', '1350293') 
 YOOKASSA_KEY = os.getenv('YOOKASSA_KEY', 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oPPHQH_z9R2c')
 
-# URL должен быть вида: https://213.176.94.201:21524/rNsOideTnxjP1005fX
-PANEL_URL = os.getenv('PANEL_URL', 'http://127.0.0.1:2053').rstrip('/')
+PANEL_URL = os.getenv('PANEL_URL', '').rstrip('/')
 PANEL_LOGIN = os.getenv('PANEL_LOGIN')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD')
-INBOUND_ID = int(os.getenv('INBOUND_ID', 2)) # На твоем скрине ID 2
+INBOUND_ID = int(os.getenv('INBOUND_ID', 2)) 
 
 ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0)), 5906233405]
 
@@ -57,52 +56,61 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 router = Router()
 
+# Глобальная сессия для работы с API панели
+session = requests.Session()
+session.verify = False 
+
 # --- API ПАНЕЛИ ---
-def get_panel_cookie():
+def login_to_panel():
     try:
         login_url = f"{PANEL_URL}/login"
-        data = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
-        res = requests.post(login_url, data=data, timeout=10, verify=False)
-        if res.status_code == 200:
-            return res.cookies
-        return None
+        payload = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        response = session.post(login_url, data=payload, headers=headers, timeout=10)
+        if response.status_code == 200 and response.json().get("success"):
+            return True
+        return False
     except Exception as e:
-        logging.error(f"Ошибка входа в панель: {e}")
-        return None
+        logging.error(f"Ошибка логина в панель: {e}")
+        return False
 
 def add_user_to_panel(user_uuid, user_id):
-    cookies = get_panel_cookie()
-    if not cookies: return False
+    if not login_to_panel():
+        logging.error("Не удалось войти в панель для создания клиента.")
+        return False
     
+    add_url = f"{PANEL_URL}/panel/api/inbounds/addClient"
+    client_data = {
+        "id": user_uuid,
+        "alterId": 0,
+        "email": f"user_{user_id}",
+        "limitIp": 1,
+        "totalGB": 0,
+        "expiryTime": 0,
+        "enable": True,
+        "tgId": str(user_id),
+        "subId": str(uuid.uuid4())[:8]
+    }
     payload = {
         "id": INBOUND_ID,
-        "settings": json.dumps({
-            "clients": [{
-                "id": user_uuid,
-                "alterId": 0,
-                "email": f"user_{user_id}",
-                "limitIp": 1,
-                "totalGB": 0,
-                "expiryTime": 0,
-                "enable": True,
-                "tgId": str(user_id)
-            }]
-        })
+        "settings": json.dumps({"clients": [client_data]})
     }
-    
+    headers = {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"}
+
     try:
-        add_url = f"{PANEL_URL}/panel/api/inbounds/addClient"
-        res = requests.post(add_url, json=payload, cookies=cookies, timeout=10, verify=False)
-        return res.status_code == 200 and res.json().get("success")
+        res = session.post(add_url, json=payload, headers=headers, timeout=10)
+        return res.json().get("success", False)
     except Exception as e:
-        logging.error(f"Ошибка создания клиента: {e}")
+        logging.error(f"Ошибка вызова addClient: {e}")
         return False
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
     conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+    conn.execute('''CREATE TABLE IF NOT EXISTS users 
                       (user_id INTEGER PRIMARY KEY, username TEXT, referrer_id INTEGER, 
                        bought_friends INTEGER DEFAULT 0, expiry_date INTEGER DEFAULT 0,
                        is_active INTEGER DEFAULT 0, current_plan TEXT DEFAULT 'none',
@@ -125,22 +133,27 @@ async def activate_user_in_db(user_id, plan, amount, is_days=False):
     added_time = int(amount) * (24*60*60 if is_days else 30*24*60*60)
     cursor.execute('SELECT expiry_date, referrer_id, is_active FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
-    expiry = (max(row[0], now) + added_time) if row else (now + added_time)
+    
+    expiry = (max(row[0], now) + added_time) if row and row[0] > 0 else (now + added_time)
     ref_id = row[1] if row else None
     already_active = row[2] if row else 0
     
     cursor.execute('UPDATE users SET is_active = 1, expiry_date = ?, current_plan = ? WHERE user_id = ?', (expiry, plan, user_id))
     
+    # Рефералка
     if not is_days and not already_active and ref_id:
         cursor.execute('UPDATE users SET bought_friends = bought_friends + 1 WHERE user_id = ?', (ref_id,))
         cursor.execute('SELECT bought_friends FROM users WHERE user_id = ?', (ref_id,))
         ref_data = cursor.fetchone()
         if ref_data and ref_data[0] >= 5:
             forever = now + (100 * 365 * 24 * 60 * 60)
-            cursor.execute('UPDATE users SET expiry_date = ?, is_active = 1, current_plan = "Премиум (Вечный)" WHERE user_id = ?', (forever, ref_id))
-    
+            cursor.execute('UPDATE users SET expiry_date = ?, is_active = 1, current_plan = "Вечный Премиум" WHERE user_id = ?', (forever, ref_id))
+            try: await bot.send_message(ref_id, "🎉 Ура! Вы пригласили 5 друзей и получили Вечный Премиум!")
+            except: pass
+            
     conn.commit()
     conn.close()
+    
     u_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
     add_user_to_panel(u_uuid, user_id)
     return expiry
@@ -160,8 +173,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
     cursor = conn.cursor()
     cursor.execute('INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = EXCLUDED.username', 
                    (message.from_user.id, message.from_user.username, r_id))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     await message.answer(f"🚀 {hbold('TrubaVPN')} активен!", reply_markup=main_panel(), parse_mode="HTML")
 
 def main_panel():
@@ -181,9 +193,7 @@ async def choose_duration(callback: CallbackQuery):
     info = TARIFFS_CONFIG[t_type]
     btns = []
     for m, p in info['prices'].items():
-        month_price = int(p) // int(m)
-        text = f"{m} мес. — {month_price}₽/мес" if int(m) > 1 else f"{m} мес. — {p}₽"
-        btns.append([InlineKeyboardButton(text=text, callback_data=f"buy_{t_type}_{m}")])
+        btns.append([InlineKeyboardButton(text=f"{m} мес. — {p}₽", callback_data=f"buy_{t_type}_{m}")])
     btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tariffs")])
     await callback.message.edit_text(f"💳 <b>{info['name']}</b>\n{info['desc']}", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
@@ -224,39 +234,27 @@ async def admin_give(message: types.Message, command: CommandObject):
         return await message.answer("Формат: `/give @username дни`")
     target, days = command.args.split()
     target = target.replace("@", "")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
+    conn = sqlite3.connect('users.db'); cursor = conn.cursor()
     cursor.execute('SELECT user_id FROM users WHERE username = ?', (target,))
-    row = cursor.fetchone()
-    conn.close()
+    row = cursor.fetchone(); conn.close()
     if row:
-        expiry = await activate_user_in_db(row[0], "Admin Grant", days, is_days=True)
-        await message.answer(f"✅ Выдано до {time.strftime('%d.%m.%Y', time.localtime(expiry))}")
-        try: await bot.send_message(row[0], f"🎁 Доступ выдан!\n{hcode(get_vpn_link(row[0]))}", parse_mode="HTML")
+        expiry = await activate_user_in_db(row[0], "Админ-доступ", days, is_days=True)
+        await message.answer(f"✅ Выдано @{target} до {time.strftime('%d.%m.%Y', time.localtime(expiry))}")
+        try: await bot.send_message(row[0], f"🎁 Вам выдан доступ!\n{hcode(get_vpn_link(row[0]))}", parse_mode="HTML")
         except: pass
-    else: await message.answer("❌ Юзер не найден")
+    else: await message.answer("❌ Юзер не найден в базе.")
 
 @router.message(Command("take"))
 async def admin_take(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMINS: return
     if not command.args: return await message.answer("Формат: `/take @username`")
     target = command.args.replace("@", "").strip()
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET is_active = 0, expiry_date = 0, current_plan = "none" WHERE username = ?', (target,))
-    success = cursor.rowcount
-    conn.commit()
-    conn.close()
+    conn = sqlite3.connect('users.db'); cursor = conn.cursor()
+    cursor.execute('UPDATE users SET is_active = 0, expiry_date = 0 WHERE username = ?', (target,))
+    success = cursor.rowcount; conn.commit(); conn.close()
     await message.answer(f"⛔ Подписка @{target} аннулирована" if success else "❌ Юзер не найден")
 
-@router.callback_query(F.data == "ref_program")
-async def show_ref(callback: CallbackQuery):
-    me = await bot.get_me()
-    d = get_user_data(callback.from_user.id)
-    friends = d[5] if d else 0
-    link = f"https://t.me/{me.username}?start={callback.from_user.id}"
-    await callback.message.edit_text(f"🤝 5 друзей = Вечный Премиум!\n👥 Друзей: {friends}/5\n🔗 Ссылка:\n{hcode(link)}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
-
+# --- МЕНЮ ИНФО ---
 @router.callback_query(F.data == "about_menu")
 async def about_menu(callback: CallbackQuery):
     btns = [
@@ -268,12 +266,20 @@ async def about_menu(callback: CallbackQuery):
     ]
     await callback.message.edit_text("📖 <b>Информация и поддержка:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
+@router.callback_query(F.data == "ref_program")
+async def show_ref(callback: CallbackQuery):
+    me = await bot.get_me()
+    d = get_user_data(callback.from_user.id)
+    friends = d[5] if d else 0
+    link = f"https://t.me/{me.username}?start={callback.from_user.id}"
+    await callback.message.edit_text(f"🤝 <b>Реферальная программа</b>\n\nПригласи 5 друзей и получи Вечный Премиум!\n👥 Друзей: <b>{friends}/5</b>\n🔗 Ссылка:\n{hcode(link)}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
+
 @router.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery):
     d = get_user_data(callback.from_user.id)
     is_active = d and d[0] > int(time.time())
-    text = f"👤 Профиль\n📅 До: {time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else '❌ Нет подписки'}"
-    if is_active: text += f"\n🔗 Ссылка:\n{hcode(get_vpn_link(callback.from_user.id))}"
+    text = f"👤 <b>Ваш профиль</b>\n\n📅 До: <b>{time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else '❌ Нет подписки'}</b>"
+    if is_active: text += f"\n\n🔗 <b>Ваша ссылка:</b>\n{hcode(get_vpn_link(callback.from_user.id))}"
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "to_main")
@@ -281,9 +287,7 @@ async def to_main(callback: CallbackQuery):
     await callback.message.edit_text(f"🚀 {hbold('TrubaVPN')} активен!", reply_markup=main_panel(), parse_mode="HTML")
 
 async def main():
-    init_db()
-    dp.include_router(router)
-    await dp.start_polling(bot)
+    init_db(); dp.include_router(router); await dp.start_polling(bot)
 
 if __name__ == '__main__':
     asyncio.run(main())
