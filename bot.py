@@ -17,8 +17,8 @@ from yookassa import Configuration, Payment
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- АДМИНЫ (В КОДЕ) ---
-ADMIN_1 = 5906233405
-ADMIN_2 = 0000000000  # <--- ВТОРОЙ ID
+ADMIN_1 = 939883122
+ADMIN_2 = 1883819477  # <--- ВТОРОЙ ID
 ADMINS = [ADMIN_1, ADMIN_2]
 
 # --- НАСТРОЙКИ ИЗ VARIABLES ---
