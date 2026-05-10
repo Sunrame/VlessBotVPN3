@@ -25,8 +25,8 @@ PANEL_LOGIN = os.getenv('PANEL_LOGIN')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD')
 SUB_PORT = os.getenv('SUB_PORT', '2096')
 
-# Список админов (включая твой статический ID)
-ADMINS = [939883122, 1883819477]
+# Список админов
+ADMINS = [5906233405]
 if os.getenv('ADMIN_ID_1'): ADMINS.append(int(os.getenv('ADMIN_ID_1')))
 if os.getenv('ADMIN_ID_2'): ADMINS.append(int(os.getenv('ADMIN_ID_2')))
 
@@ -113,12 +113,10 @@ async def activate_user_in_db(user_id, plan_name, amount, is_days=False):
     
     current_expiry = row[0] if row else 0
     ref_id = row[1] if row else None
-    current_friends = row[2] if row else 0
     existing_token = row[3] if row else None
     
     new_expiry = (current_expiry + added_time) if current_expiry > now else (now + added_time)
     
-    # Если токена еще нет — создаем в панели
     token = existing_token
     if not token:
         token = add_user_to_panel(user_id)
@@ -127,13 +125,12 @@ async def activate_user_in_db(user_id, plan_name, amount, is_days=False):
     
     cursor.execute('UPDATE users SET expiry_date = ?, sub_token = ? WHERE user_id = ?', (new_expiry, token, user_id))
     
-    # Реферальный бонус пригласившему (только при первой покупке новичка)
     if not is_days and current_expiry <= now and ref_id:
         cursor.execute('UPDATE users SET bought_friends = bought_friends + 1 WHERE user_id = ?', (ref_id,))
         cursor.execute('SELECT bought_friends FROM users WHERE user_id = ?', (ref_id,))
         ref_data = cursor.fetchone()
         if ref_data and ref_data[0] >= 5:
-            forever = now + (10 * 365 * 24 * 60 * 60) # 10 лет
+            forever = now + (10 * 365 * 24 * 60 * 60)
             cursor.execute('UPDATE users SET expiry_date = ? WHERE user_id = ?', (forever, ref_id))
             try: await bot.send_message(ref_id, "🎁 Поздравляем! 5 ваших друзей купили VPN. Вам выдан Вечный Премиум!")
             except: pass
@@ -170,9 +167,20 @@ async def choose_duration(callback: CallbackQuery):
     t_type = callback.data.replace("type_", "")
     info = TARIFFS_CONFIG[t_type]
     btns = []
+    
     for m, p in info['prices'].items():
-        text = f"{m} мес. — {p}₽"
-        btns.append([InlineKeyboardButton(text=text, callback_data=f"buy_{t_type}_{m}")])
+        months_count = int(m)
+        total_price = int(p)
+        # Считаем цену за 1 месяц
+        monthly_price = total_price // months_count
+        
+        if months_count > 1:
+            btn_text = f"{months_count} мес. — {monthly_price}₽/мес ({total_price}₽)"
+        else:
+            btn_text = f"{months_count} мес. — {total_price}₽"
+            
+        btns.append([InlineKeyboardButton(text=btn_text, callback_data=f"buy_{t_type}_{m}")])
+        
     btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tariffs")])
     await callback.message.edit_text(f"💳 <b>{info['name']}</b>\n{info['desc']}", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
@@ -209,8 +217,7 @@ async def check_payment(callback: CallbackQuery):
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMINS: return
-    if not command.args or len(command.args.split()) < 2:
-        return await message.answer("Формат: `/give @username дни`")
+    if not command.args or len(command.args.split()) < 2: return
     target, days = command.args.split()
     target = target.replace("@", "").lower().strip()
     conn = sqlite3.connect('users.db')
@@ -221,7 +228,6 @@ async def admin_give(message: types.Message, command: CommandObject):
         await message.answer(f"✅ Выдано до {time.strftime('%d.%m.%Y', time.localtime(expiry))}")
         try: await bot.send_message(row[0], f"🎁 Доступ выдан!\n{hcode(get_vpn_link(token))}", parse_mode="HTML")
         except: pass
-    else: await message.answer("❌ Юзер не найден")
 
 @router.message(Command("take"))
 async def admin_take(message: types.Message, command: CommandObject):
@@ -234,11 +240,19 @@ async def admin_take(message: types.Message, command: CommandObject):
         conn.execute('UPDATE users SET expiry_date = 0 WHERE user_id = ?', (user[0],))
         conn.commit(); conn.close()
         await message.answer(f"⛔ Подписка @{target} аннулирована")
-    else:
-        conn.close()
-        await message.answer("❌ Юзер не найден")
 
 # --- ДОПОЛНИТЕЛЬНЫЕ МЕНЮ ---
+@router.callback_query(F.data == "about_menu")
+async def about_menu(callback: CallbackQuery):
+    btns = [
+        [InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{CHANNEL_ID.replace('@','')}")],
+        [InlineKeyboardButton(text="📜 Пользовательское соглашение", url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
+        [InlineKeyboardButton(text="🛡 Политика конфиденциальности", url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.replace('@','')}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]
+    ]
+    await callback.message.edit_text("📖 <b>Информация и поддержка:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
+
 @router.callback_query(F.data == "ref_program")
 async def show_ref(callback: CallbackQuery):
     me = await bot.get_me()
@@ -247,17 +261,8 @@ async def show_ref(callback: CallbackQuery):
     conn.close()
     friends = row[0] if row else 0
     link = f"https://t.me/{me.username}?start={callback.from_user.id}"
-    await callback.message.edit_text(f"🤝 <b>5 покупок друзей = Вечный Премиум!</b>\n\nБонус засчитывается, когда друг совершает первую покупку.\n\n👥 Друзей купило: {friends}/5\n🔗 Ссылка:\n{hcode(link)}", 
+    await callback.message.edit_text(f"🤝 <b>5 покупок друзей = Вечный Премиум!</b>\n\n👥 Друзей купило: {friends}/5\n🔗 Ссылка:\n{hcode(link)}", 
                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
-
-@router.callback_query(F.data == "about_menu")
-async def about_menu(callback: CallbackQuery):
-    btns = [[InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{CHANNEL_ID.replace('@','')}")],
-            [InlineKeyboardButton(text="📜 Соглашение", url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
-            [InlineKeyboardButton(text="🛡 Политика", url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
-            [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.replace('@','')}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]
-    await callback.message.edit_text("📖 <b>Информация и поддержка:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
 @router.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery):
@@ -266,7 +271,7 @@ async def show_profile(callback: CallbackQuery):
     conn.close()
     is_active = d and d[0] > int(time.time())
     text = f"👤 <b>Ваш профиль</b>\n\n📅 До: {time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else '❌ Нет подписки'}"
-    if is_active: text += f"\n🔗 Ваша ссылка подписки:\n{hcode(get_vpn_link(d[1]))}"
+    if is_active: text += f"\n🔗 Ссылка:\n{hcode(get_vpn_link(d[1]))}"
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "to_main")
