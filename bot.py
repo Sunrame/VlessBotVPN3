@@ -6,21 +6,26 @@ import time
 import sqlite3
 import asyncio
 import json
+import urllib3
 from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from yookassa import Configuration, Payment
 
+# Отключаем предупреждения SSL для работы по IP
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # --- КОНФИГУРАЦИЯ ---
 API_TOKEN = os.getenv('BOT_TOKEN')
 SHOP_ID = os.getenv('SHOP_ID', '1350293') 
 YOOKASSA_KEY = os.getenv('YOOKASSA_KEY', 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oPPHQH_z9R2c')
 
+# URL должен быть вида: https://213.176.94.201:21524/rNsOideTnxjP1005fX
 PANEL_URL = os.getenv('PANEL_URL', 'http://127.0.0.1:2053').rstrip('/')
 PANEL_LOGIN = os.getenv('PANEL_LOGIN')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD')
-INBOUND_ID = int(os.getenv('INBOUND_ID', 1))
+INBOUND_ID = int(os.getenv('INBOUND_ID', 2)) # На твоем скрине ID 2
 
 ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0)), 5906233405]
 
@@ -53,34 +58,24 @@ dp = Dispatcher()
 router = Router()
 
 # --- API ПАНЕЛИ ---
-# --- API ПАНЕЛИ (С учетом секретного пути) ---
 def get_panel_cookie():
     try:
-        # Используем PANEL_URL, который уже содержит секретный путь из переменных Amvera
         login_url = f"{PANEL_URL}/login"
         data = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
-        
-        # Отключаем проверку SSL (verify=False), так как на IP часто нет сертификата
         res = requests.post(login_url, data=data, timeout=10, verify=False)
         if res.status_code == 200:
-            logging.info("Авторизация в 3x-ui прошла успешно.")
             return res.cookies
-        else:
-            logging.error(f"Панель отказала в доступе. Код: {res.status_code}")
-            return None
+        return None
     except Exception as e:
-        logging.error(f"Ошибка сети при логине: {e}")
+        logging.error(f"Ошибка входа в панель: {e}")
         return None
 
 def add_user_to_panel(user_uuid, user_id):
     cookies = get_panel_cookie()
     if not cookies: return False
     
-    # Берем ID из переменных (там должно быть 2)
-    inbound_id = int(os.getenv('INBOUND_ID', 2)) 
-
     payload = {
-        "id": inbound_id,
+        "id": INBOUND_ID,
         "settings": json.dumps({
             "clients": [{
                 "id": user_uuid,
@@ -96,18 +91,11 @@ def add_user_to_panel(user_uuid, user_id):
     }
     
     try:
-        # Путь для добавления клиента
         add_url = f"{PANEL_URL}/panel/api/inbounds/addClient"
         res = requests.post(add_url, json=payload, cookies=cookies, timeout=10, verify=False)
-        
-        if res.status_code == 200 and res.json().get("success"):
-            logging.info(f"Клиент {user_id} успешно создан в панели!")
-            return True
-        else:
-            logging.error(f"Ошибка создания клиента: {res.text}")
-            return False
+        return res.status_code == 200 and res.json().get("success")
     except Exception as e:
-        logging.error(f"Ошибка API: {e}")
+        logging.error(f"Ошибка создания клиента: {e}")
         return False
 
 # --- БАЗА ДАННЫХ ---
@@ -137,10 +125,12 @@ async def activate_user_in_db(user_id, plan, amount, is_days=False):
     added_time = int(amount) * (24*60*60 if is_days else 30*24*60*60)
     cursor.execute('SELECT expiry_date, referrer_id, is_active FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
-    expiry = (row[0] + added_time) if row and row[0] > now else (now + added_time)
+    expiry = (max(row[0], now) + added_time) if row else (now + added_time)
     ref_id = row[1] if row else None
     already_active = row[2] if row else 0
+    
     cursor.execute('UPDATE users SET is_active = 1, expiry_date = ?, current_plan = ? WHERE user_id = ?', (expiry, plan, user_id))
+    
     if not is_days and not already_active and ref_id:
         cursor.execute('UPDATE users SET bought_friends = bought_friends + 1 WHERE user_id = ?', (ref_id,))
         cursor.execute('SELECT bought_friends FROM users WHERE user_id = ?', (ref_id,))
@@ -148,6 +138,7 @@ async def activate_user_in_db(user_id, plan, amount, is_days=False):
         if ref_data and ref_data[0] >= 5:
             forever = now + (100 * 365 * 24 * 60 * 60)
             cursor.execute('UPDATE users SET expiry_date = ?, is_active = 1, current_plan = "Премиум (Вечный)" WHERE user_id = ?', (forever, ref_id))
+    
     conn.commit()
     conn.close()
     u_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
@@ -156,7 +147,7 @@ async def activate_user_in_db(user_id, plan, amount, is_days=False):
 
 def get_vpn_link(user_id):
     u_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
-    ip = "51.250.121.176"
+    ip = "213.176.94.201"
     params = "type=tcp&encryption=none&security=reality&pbk=B-1Qi4UHnODvnBfJ4IEaT5hcO6xYngxhJRU1M8FmSQg&fp=chrome&sni=x5media.ru&sid=b3f386&spx=%2F"
     return f"vless://{u_uuid}@{ip}:443?{params}#TrubaVPN_{user_id}"
 
@@ -268,12 +259,14 @@ async def show_ref(callback: CallbackQuery):
 
 @router.callback_query(F.data == "about_menu")
 async def about_menu(callback: CallbackQuery):
-    btns = [[InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{CHANNEL_ID.replace('@','')}")],
-            [InlineKeyboardButton(text="📜 Соглашение", url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
-            [InlineKeyboardButton(text="🛡 Политика", url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
-            [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.replace('@','')}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]
-    await callback.message.edit_text("📖 Инфо:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
+    btns = [
+        [InlineKeyboardButton(text="📢 Наш Telegram-канал", url=f"https://t.me/{CHANNEL_ID.replace('@','')}")],
+        [InlineKeyboardButton(text="📜 Пользовательское Соглашение", url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
+        [InlineKeyboardButton(text="🛡 Политика Конфиденциальности", url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.replace('@','')}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]
+    ]
+    await callback.message.edit_text("📖 <b>Информация и поддержка:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
 @router.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery):
