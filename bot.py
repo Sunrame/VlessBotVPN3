@@ -21,7 +21,7 @@ YOOKASSA_KEY = os.getenv('YOOKASSA_KEY', 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oP
 PANEL_URL = os.getenv('PANEL_URL', 'http://127.0.0.1:2053').rstrip('/')
 PANEL_LOGIN = os.getenv('PANEL_LOGIN')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD')
-INBOUND_ID = int(os.getenv('INBOUND_ID', 1))
+INBOUND_ID = int(os.getenv('INBOUND_ID', 2))
 
 # Список ID администраторов
 ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0)), 5906233405]
