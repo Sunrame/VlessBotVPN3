@@ -13,7 +13,7 @@ from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from yookassa import Configuration, Payment
 
-# Отключаем предупреждения SSL для работы с панелью по IP
+# Отключаем предупреждения SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- КОНФИГУРАЦИЯ ---
@@ -21,6 +21,7 @@ API_TOKEN = os.getenv('BOT_TOKEN')
 SHOP_ID = os.getenv('SHOP_ID', '1350293') 
 YOOKASSA_KEY = os.getenv('YOOKASSA_KEY', 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oPPHQH_z9R2c')
 
+# URL: https://213.176.94.201:21524/rNsOideTnxjP1005fX
 PANEL_URL = os.getenv('PANEL_URL', '').rstrip('/')
 PANEL_LOGIN = os.getenv('PANEL_LOGIN')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD')
@@ -56,7 +57,6 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Глобальная сессия для работы с API панели
 session = requests.Session()
 session.verify = False 
 
@@ -67,22 +67,23 @@ def login_to_panel():
         payload = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         }
         response = session.post(login_url, data=payload, headers=headers, timeout=10)
         if response.status_code == 200 and response.json().get("success"):
             return True
+        logging.error(f"Ошибка входа в панель: {response.text}")
         return False
     except Exception as e:
-        logging.error(f"Ошибка логина в панель: {e}")
+        logging.error(f"Ошибка логина: {e}")
         return False
 
-def add_user_to_panel(user_uuid, user_id):
-    if not login_to_panel():
-        logging.error("Не удалось войти в панель для создания клиента.")
-        return False
+def add_user_to_panel(user_id):
+    if not login_to_panel(): return False
     
+    user_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
     add_url = f"{PANEL_URL}/panel/api/inbounds/addClient"
+    
     client_data = {
         "id": user_uuid,
         "alterId": 0,
@@ -102,12 +103,17 @@ def add_user_to_panel(user_uuid, user_id):
 
     try:
         res = session.post(add_url, json=payload, headers=headers, timeout=10)
-        return res.json().get("success", False)
+        result = res.json()
+        if result.get("success") or "already exists" in result.get("msg", ""):
+            logging.info(f"Клиент {user_id} добавлен или уже существует.")
+            return True
+        logging.error(f"Панель вернула ошибку: {result.get('msg')}")
+        return False
     except Exception as e:
-        logging.error(f"Ошибка вызова addClient: {e}")
+        logging.error(f"Ошибка API: {e}")
         return False
 
-# --- БАЗА ДАННЫХ ---
+# --- БД ---
 def init_db():
     conn = sqlite3.connect('users.db')
     conn.execute('''CREATE TABLE IF NOT EXISTS users 
@@ -115,71 +121,58 @@ def init_db():
                        bought_friends INTEGER DEFAULT 0, expiry_date INTEGER DEFAULT 0,
                        is_active INTEGER DEFAULT 0, current_plan TEXT DEFAULT 'none',
                        last_notified INTEGER DEFAULT 0)''')
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 def get_user_data(user_id):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
+    conn = sqlite3.connect('users.db'); cursor = conn.cursor()
     cursor.execute('SELECT expiry_date, is_active, username, current_plan, referrer_id, bought_friends FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
-    conn.close()
+    row = cursor.fetchone(); conn.close()
     return row
 
-async def activate_user_in_db(user_id, plan, amount, is_days=False):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
+async def activate_user_logic(user_id, plan, amount, is_days=False):
+    conn = sqlite3.connect('users.db'); cursor = conn.cursor()
     now = int(time.time())
-    added_time = int(amount) * (24*60*60 if is_days else 30*24*60*60)
+    added_time = int(amount) * (86400 if is_days else 2592000)
     cursor.execute('SELECT expiry_date, referrer_id, is_active FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     
     expiry = (max(row[0], now) + added_time) if row and row[0] > 0 else (now + added_time)
-    ref_id = row[1] if row else None
-    already_active = row[2] if row else 0
     
     cursor.execute('UPDATE users SET is_active = 1, expiry_date = ?, current_plan = ? WHERE user_id = ?', (expiry, plan, user_id))
     
-    # Рефералка
-    if not is_days and not already_active and ref_id:
+    # Реферальная система
+    if not is_days and row and not row[2] and row[1]:
+        ref_id = row[1]
         cursor.execute('UPDATE users SET bought_friends = bought_friends + 1 WHERE user_id = ?', (ref_id,))
         cursor.execute('SELECT bought_friends FROM users WHERE user_id = ?', (ref_id,))
-        ref_data = cursor.fetchone()
-        if ref_data and ref_data[0] >= 5:
-            forever = now + (100 * 365 * 24 * 60 * 60)
-            cursor.execute('UPDATE users SET expiry_date = ?, is_active = 1, current_plan = "Вечный Премиум" WHERE user_id = ?', (forever, ref_id))
-            try: await bot.send_message(ref_id, "🎉 Ура! Вы пригласили 5 друзей и получили Вечный Премиум!")
-            except: pass
-            
-    conn.commit()
-    conn.close()
+        if (f := cursor.fetchone()) and f[0] >= 5:
+            forever = now + 3153600000 # 100 лет
+            cursor.execute('UPDATE users SET expiry_date = ?, is_active = 1, current_plan = "Вечный" WHERE user_id = ?', (forever, ref_id))
     
-    u_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
-    add_user_to_panel(u_uuid, user_id)
+    conn.commit(); conn.close()
+    add_user_to_panel(user_id)
     return expiry
 
 def get_vpn_link(user_id):
     u_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_v2_{user_id}"))
-    ip = "213.176.94.201"
-    params = "type=tcp&encryption=none&security=reality&pbk=B-1Qi4UHnODvnBfJ4IEaT5hcO6xYngxhJRU1M8FmSQg&fp=chrome&sni=x5media.ru&sid=b3f386&spx=%2F"
-    return f"vless://{u_uuid}@{ip}:443?{params}#TrubaVPN_{user_id}"
+    return f"vless://{u_uuid}@213.176.94.201:443?type=tcp&encryption=none&security=reality&pbk=B-1Qi4UHnODvnBfJ4IEaT5hcO6xYngxhJRU1M8FmSQg&fp=chrome&sni=x5media.ru&sid=b3f386&spx=%2F#TrubaVPN_{user_id}"
 
 # --- ОБРАБОТЧИКИ ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
     init_db()
     r_id = int(command.args) if command.args and command.args.isdigit() else None
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
+    conn = sqlite3.connect('users.db'); cursor = conn.cursor()
     cursor.execute('INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = EXCLUDED.username', 
                    (message.from_user.id, message.from_user.username, r_id))
     conn.commit(); conn.close()
     await message.answer(f"🚀 {hbold('TrubaVPN')} активен!", reply_markup=main_panel(), parse_mode="HTML")
 
 def main_panel():
-    btns = [[InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs"), InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
-            [InlineKeyboardButton(text="🤝 Реф. программа", callback_data="ref_program"), InlineKeyboardButton(text="📖 Инфо", callback_data="about_menu")]]
-    return InlineKeyboardMarkup(inline_keyboard=btns)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs"), InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🤝 Реф. программа", callback_data="ref_program"), InlineKeyboardButton(text="📖 Инфо", callback_data="about_menu")]
+    ])
 
 @router.callback_query(F.data == "tariffs")
 async def show_tariffs(callback: CallbackQuery):
@@ -191,9 +184,7 @@ async def show_tariffs(callback: CallbackQuery):
 async def choose_duration(callback: CallbackQuery):
     t_type = callback.data.replace("type_", "")
     info = TARIFFS_CONFIG[t_type]
-    btns = []
-    for m, p in info['prices'].items():
-        btns.append([InlineKeyboardButton(text=f"{m} мес. — {p}₽", callback_data=f"buy_{t_type}_{m}")])
+    btns = [[InlineKeyboardButton(text=f"{m} мес. — {p}₽", callback_data=f"buy_{t_type}_{m}")] for m, p in info['prices'].items()]
     btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tariffs")])
     await callback.message.edit_text(f"💳 <b>{info['name']}</b>\n{info['desc']}", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
@@ -221,7 +212,7 @@ async def check_payment(callback: CallbackQuery):
     payment = Payment.find_one(payment_id)
     if payment.status == 'succeeded':
         u_id = int(payment.metadata['user_id'])
-        expiry = await activate_user_in_db(u_id, payment.metadata['t_type'], payment.metadata['months'])
+        expiry = await activate_user_logic(u_id, payment.metadata['t_type'], payment.metadata['months'])
         await callback.message.edit_text(f"✅ Готово! До {time.strftime('%d.%m.%Y', time.localtime(expiry))}\n\n{hcode(get_vpn_link(u_id))}", parse_mode="HTML")
     else:
         await callback.answer("⏳ Оплата не найдена.", show_alert=True)
@@ -230,29 +221,27 @@ async def check_payment(callback: CallbackQuery):
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMINS: return
-    if not command.args or len(command.args.split()) < 2:
-        return await message.answer("Формат: `/give @username дни`")
+    if not command.args or len(command.args.split()) < 2: return await message.answer("Формат: `/give @username дни`")
     target, days = command.args.split()
     target = target.replace("@", "")
     conn = sqlite3.connect('users.db'); cursor = conn.cursor()
     cursor.execute('SELECT user_id FROM users WHERE username = ?', (target,))
     row = cursor.fetchone(); conn.close()
     if row:
-        expiry = await activate_user_in_db(row[0], "Админ-доступ", days, is_days=True)
+        expiry = await activate_user_logic(row[0], "Admin Grant", days, is_days=True)
         await message.answer(f"✅ Выдано @{target} до {time.strftime('%d.%m.%Y', time.localtime(expiry))}")
-        try: await bot.send_message(row[0], f"🎁 Вам выдан доступ!\n{hcode(get_vpn_link(row[0]))}", parse_mode="HTML")
+        try: await bot.send_message(row[0], f"🎁 Доступ выдан!\n{hcode(get_vpn_link(row[0]))}", parse_mode="HTML")
         except: pass
-    else: await message.answer("❌ Юзер не найден в базе.")
+    else: await message.answer("❌ Юзер не найден")
 
 @router.message(Command("take"))
 async def admin_take(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMINS: return
-    if not command.args: return await message.answer("Формат: `/take @username`")
-    target = command.args.replace("@", "").strip()
+    target = command.args.replace("@", "").strip() if command.args else ""
     conn = sqlite3.connect('users.db'); cursor = conn.cursor()
     cursor.execute('UPDATE users SET is_active = 0, expiry_date = 0 WHERE username = ?', (target,))
     success = cursor.rowcount; conn.commit(); conn.close()
-    await message.answer(f"⛔ Подписка @{target} аннулирована" if success else "❌ Юзер не найден")
+    await message.answer(f"⛔ Подписка @{target} удалена" if success else "❌ Не найден")
 
 # --- МЕНЮ ИНФО ---
 @router.callback_query(F.data == "about_menu")
@@ -268,18 +257,16 @@ async def about_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data == "ref_program")
 async def show_ref(callback: CallbackQuery):
-    me = await bot.get_me()
-    d = get_user_data(callback.from_user.id)
+    me = await bot.get_me(); d = get_user_data(callback.from_user.id)
     friends = d[5] if d else 0
     link = f"https://t.me/{me.username}?start={callback.from_user.id}"
-    await callback.message.edit_text(f"🤝 <b>Реферальная программа</b>\n\nПригласи 5 друзей и получи Вечный Премиум!\n👥 Друзей: <b>{friends}/5</b>\n🔗 Ссылка:\n{hcode(link)}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
+    await callback.message.edit_text(f"🤝 5 друзей = Вечный Премиум!\n👥 Приглашено: {friends}/5\n🔗 Ссылка:\n{hcode(link)}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery):
-    d = get_user_data(callback.from_user.id)
-    is_active = d and d[0] > int(time.time())
-    text = f"👤 <b>Ваш профиль</b>\n\n📅 До: <b>{time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else '❌ Нет подписки'}</b>"
-    if is_active: text += f"\n\n🔗 <b>Ваша ссылка:</b>\n{hcode(get_vpn_link(callback.from_user.id))}"
+    d = get_user_data(callback.from_user.id); is_active = d and d[0] > int(time.time())
+    text = f"👤 Профиль\n📅 До: {time.strftime('%d.%m.%Y', time.localtime(d[0])) if is_active else '❌ Нет подписки'}"
+    if is_active: text += f"\n🔗 Ссылка:\n{hcode(get_vpn_link(callback.from_user.id))}"
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="to_main")]]), parse_mode="HTML")
 
 @router.callback_query(F.data == "to_main")
