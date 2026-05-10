@@ -20,12 +20,12 @@ YOOKASSA_KEY = os.getenv('YOOKASSA_KEY', 'live_Vgr2Ea4LpPVScKOVQK5_QZW8fkGCAT9oP
 PANEL_URL = os.getenv('PANEL_URL', 'http://127.0.0.1:2053').rstrip('/')
 PANEL_LOGIN = os.getenv('PANEL_LOGIN', 'admin')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', 'admin')
-INBOUND_ID = int(os.getenv('INBOUND_ID', 1)) # ID подключения в 3x-ui
+INBOUND_ID = int(os.getenv('INBOUND_ID', 2)) # ID подключения в 3x-ui
 
 # Список ID администраторов
 ADMINS = [int(os.getenv('ADMIN_ID_1', 0)), int(os.getenv('ADMIN_ID_2', 0)), 5906233405]
 
-Configuration.configure(SHOP_ID, YOOKASSA_KEY)
+Configuration.configure(YOOKASSA_KEY)
 
 TARIFFS_CONFIG = {
     "standart": {
