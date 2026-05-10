@@ -33,7 +33,7 @@ PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', 'Infobiznes')
 INBOUND_ID = 2 
 
 # Список админов (добавлен твой ID)
-ADMINS = [5906233405]
+ADMINS = [939883122]
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
