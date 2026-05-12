@@ -18,7 +18,7 @@ PANEL_PASSWORD = os.getenv('PANEL_PASSWORD')
 SUB_PORT = os.getenv('SUB_PORT', '2096')
 
 # Твой ID и список админов
-ADMINS = [5906233405]
+ADMINS = [939883122]
 SUPPORT_CONTACT = "@vvvvvpppnn"
 CHANNEL_ID = "@Truba_VPN"
 
