@@ -123,7 +123,9 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                 return None
 
             # GET INBOUNDS - try multiple paths
+            # PANEL_URL contains security token, so /panel/inbounds should work
             inbound_paths = [
+                "/panel/inbounds",
                 "/panel/api/inbounds",
                 "/xui/API/inbounds",
                 "/xui/inbounds",
@@ -136,16 +138,22 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             for path in inbound_paths:
                 log.info("[Panel] Trying GET %s", path)
                 try:
-                    r = await s.get(f"{PANEL_URL}{path}")
+                    full_url = f"{PANEL_URL}{path}"
+                    r = await s.get(full_url)
                     raw = await r.text()
+                    log.info("[Panel] %s: status=%d, len=%d", path, r.status, len(raw))
                     
                     # Skip HTML responses
                     if raw.startswith("<!"):
-                        log.info("[Panel] %s returns HTML, skipping", path)
+                        log.info("[Panel] %s returns HTML", path)
+                        continue
+                    
+                    if not raw:
+                        log.info("[Panel] %s: empty response", path)
                         continue
                     
                     data = json.loads(raw)
-                    log.info("[Panel] %s: parsed OK", path)
+                    log.info("[Panel] %s: parsed JSON OK", path)
                     
                     inbounds = None
                     if isinstance(data, dict):
@@ -156,11 +164,13 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                     if inbounds and isinstance(inbounds, list) and inbounds:
                         inbound_id = inbounds[0].get("id")
                         port = inbounds[0].get("port", 443)
-                        log.info("[Panel] ✓ Found inbound_id=%s, port=%s via %s", inbound_id, port, path)
+                        log.info("[Panel] ✓ Found id=%s, port=%s", inbound_id, port)
                         break
                         
+                except json.JSONDecodeError as e:
+                    log.info("[Panel] %s: JSON error", path)
                 except Exception as e:
-                    log.info("[Panel] %s: error %s", path, e)
+                    log.info("[Panel] %s: error %s", path, type(e).__name__)
             
             if not inbound_id:
                 log.error("[Panel] ✗ No inbound found")
@@ -179,7 +189,6 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             add_paths = [
                 "/xui/inbound/addClient",
                 f"/xui/inbound/{inbound_id}/addClient",
-                f"/panel/api/inbounds/{inbound_id}/addClient",
             ]
             
             add_ok = False
@@ -191,27 +200,29 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                     resp = json.loads(raw)
                     
                     if resp.get("success"):
-                        log.info("[Panel] ✓ addClient OK")
+                        log.info("[Panel] ✓ addClient success")
                         add_ok = True
                         break
+                    else:
+                        log.info("[Panel] addClient resp: %s", resp)
                 except Exception as e:
-                    log.info("[Panel] %s: error %s", add_path, e)
+                    log.info("[Panel] POST error: %s", type(e).__name__)
             
             if not add_ok:
                 log.error("[Panel] ✗ addClient failed")
                 return None
 
             # BUILD VLESS LINK
-            host_port = PANEL_URL.split("://")[-1]
+            host_port = PANEL_URL.split("://")[-1].split("/")[0]
             panel_host = host_port.split(":")[0]
             vless_port = port or 443
             
             vless_link = f"vless://{client_id}@{panel_host}:{vless_port}?encryption=none&type=tcp#TrubaVPN"
-            log.info("[Panel] ✓ VLESS created: %s", vless_link[:60])
+            log.info("[Panel] ✓ VLESS link created")
             return vless_link
 
     except Exception as e:
-        log.exception("[Panel] Error: %s", e)
+        log.exception("[Panel] Unexpected error")
         return None
 
 
