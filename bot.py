@@ -189,7 +189,7 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                 return None
 
             # 2. Список inbound'ов
-            r2 = await s.get(f"{base}/xui/inbound/list")
+            r2 = await s.get(f"{base}/xui/API/inbounds")
             raw2 = await r2.text()
             log.info("Panel inbound/list status=%s body=%s", r2.status, raw2[:300])
             try:
@@ -205,17 +205,25 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
 
             # 3. Добавляем клиента
             import json as _json2
-            settings_obj = {
-                "clients": [{
-                    "id": client_id,
-                    "email": email,
-                    "expiryTime": expire_ms,
-                    "enable": True,
-                    "flow": "",
-                }]
+            payload = {
+                "id": inbound_id,
+                "settings": _json2.dumps({
+                    "clients": [{
+                        "id": client_id,
+                        "email": email,
+                        "expiryTime": expire_ms,
+                        "enable": True,
+                        "flow": "",
+                        "totalGB": 0,
+                        "limitIp": 0,
+                        "reset": 0,
+                        "tgId": "",
+                        "subId": "",
+                        "comment": "",
+                    }]
+                }),
             }
-            payload = {"id": inbound_id, "settings": _json2.dumps(settings_obj)}
-            r3 = await s.post(f"{base}/xui/inbound/addClient", json=payload)
+            r3 = await s.post(f"{base}/xui/API/inbounds/{inbound_id}/addClient", json=payload)
             raw3 = await r3.text()
             log.info("Panel addClient status=%s body=%s", r3.status, raw3[:200])
             try:
@@ -262,7 +270,7 @@ async def panel_update_client_expiry(user_id: int, new_expiry_ts: int) -> bool:
             if not resp or not resp.get("success"):
                 return False
 
-            r2 = await s.get(f"{base}/xui/inbound/list")
+            r2 = await s.get(f"{base}/xui/API/inbounds")
             raw2 = await r2.text()
             try:
                 data = _json.loads(raw2)
@@ -284,7 +292,7 @@ async def panel_update_client_expiry(user_id: int, new_expiry_ts: int) -> bool:
                             "settings": _json.dumps(settings),
                         }
                         r3 = await s.post(
-                            f"{base}/xui/inbound/{inbound['id']}/updateClient/{client['id']}",
+                            f"{base}/xui/API/inbounds/updateClient/{client['id']}",
                             json=payload,
                         )
                         try:
