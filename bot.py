@@ -6,6 +6,7 @@ import sqlite3
 import asyncio
 import urllib3
 import aiohttp
+import json
 
 from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.filters import Command, CommandStart, CommandObject
@@ -96,7 +97,7 @@ def init_db():
                 username    TEXT,
                 referrer_id INTEGER,
                 expiry_date INTEGER DEFAULT 0,
-                sub_token   TEXT,
+                sub_token    TEXT,
                 has_paid    INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS promos (
@@ -109,7 +110,6 @@ def init_db():
 # ─────────────────────────────────────────────
 #  3X-UI ПАНЕЛЬ: выдача ключа
 # ─────────────────────────────────────────────
-import json
 
 async def panel_create_client(user_id: int, days: int) -> str | None:
     """
@@ -148,24 +148,19 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             if not data.get("success") or not data.get("obj"):
                 log.error("Inbound list error: %s", data)
                 return None
-                inbound = next(
-    (i for i in data["obj"] if i["id"] == 2),
-    None
-)
+            
+            inbound = next((i for i in data["obj"] if i["id"] == 2), None)
 
-if not inbound:
-    log.error("Inbound with ID=2 not found")
-    return None
+            if not inbound:
+                log.error("Inbound with ID=2 not found")
+                return None
 
-log.warning("USING INBOUND: %s", inbound)
-
-if inbound["protocol"] != "vless":
-    log.error("Inbound is NOT VLESS: %s", inbound["protocol"])
-    return None
+            if inbound["protocol"] != "vless":
+                log.error("Inbound is NOT VLESS: %s", inbound["protocol"])
+                return None
 
             inbound_id = inbound["id"]
             port = inbound["port"]
-
             settings_json = json.loads(inbound["settings"])
             stream_json = json.loads(inbound["streamSettings"])
 
@@ -197,14 +192,13 @@ if inbound["protocol"] != "vless":
             # 4. Формируем VLESS ссылку
             host = os.environ.get("VPN_HOST")
             if not host:
-                host = base.replace("https://", "").replace("http://", "")
+                host = base.replace("https://", "").replace("http://", "").split(":")[0]
 
             security = stream_json.get("security", "none")
 
             # === REALITY ===
             if security == "reality":
                 reality = stream_json.get("realitySettings", {})
-
                 public_key = reality.get("publicKey", "")
                 short_id = reality.get("shortIds", [""])[0]
                 server_name = reality.get("serverNames", [""])[0]
@@ -218,10 +212,6 @@ if inbound["protocol"] != "vless":
                     f"&sid={short_id}"
                     f"&fp=chrome"
                 )
-
-                if flow:
-                    vless_link += f"&flow={flow}"
-
             # === ОБЫЧНЫЙ TCP ===
             else:
                 vless_link = (
@@ -229,62 +219,11 @@ if inbound["protocol"] != "vless":
                     f"?type=tcp&security=none"
                 )
 
-                if flow:
-                    vless_link += f"&flow={flow}"
-
+            if flow:
+                vless_link += f"&flow={flow}"
+            
             vless_link += f"#{email}"
-
             return vless_link
-
-    except Exception as e:
-        log.exception("Panel error: %s", e)
-        return None
-    """
-    Логинимся в 3x-ui и создаём VLESS-клиента.
-    Возвращает ссылку-подписку или None при ошибке.
-    """
-    base = PANEL_URL
-    email = f"user_{user_id}"
-    expire_ms = int((time.time() + days * 86400) * 1000)
-    client_id = str(uuid.uuid4())
-
-    jar = aiohttp.CookieJar(unsafe=True)
-    timeout = aiohttp.ClientTimeout(total=15)
-
-    try:
-        async with aiohttp.ClientSession(cookie_jar=jar, timeout=timeout,
-                                         connector=aiohttp.TCPConnector(ssl=False)) as s:
-            # 1. Авторизация
-            r = await s.post(f"{base}/login",
-                             data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
-            resp = await r.json(content_type=None)
-            if not resp.get("success"):
-                log.error("Panel login failed: %s", resp)
-                return None
-
-            # 2. Получаем список inbound'ов (берём первый)
-            r = await s.get(f"{base}/xui/inbound/list")
-            data = await r.json(content_type=None)
-            if not data.get("success") or not data.get("obj"):
-                log.error("Panel inbound list failed: %s", data)
-                return None
-            inbound_id = data["obj"][0]["id"]
-
-            # 3. Добавляем клиента
-            payload = {
-                "id": inbound_id,
-                "settings": f'{{"clients":[{{"id":"{client_id}","email":"{email}",'
-                            f'"expiryTime":{expire_ms},"enable":true,"flow":""}}]}}',
-            }
-            r = await s.post(f"{base}/xui/inbound/addClient", json=payload)
-            add_resp = await r.json(content_type=None)
-            if not add_resp.get("success"):
-                log.error("Panel addClient failed: %s", add_resp)
-                return None
-
-            # 4. Генерируем ссылку подписки
-            sub_link = f"{base.replace('https','http')}:{SUB_PORT}/{client_id}"
-            return sub_link
 
     except Exception as e:
         log.exception("Panel error: %s", e)
@@ -638,149 +577,55 @@ async def back_to_main(cb: CallbackQuery):
     )
 
 # ─────────────────────────────────────────────
-#  АДМИН: /give @username дни
+#  АДМИН КОМАНДЫ
 # ─────────────────────────────────────────────
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
+    if message.from_user.id not in ADMIN_IDS: return
     if not command.args or len(command.args.split()) < 2:
-        await message.answer("⚠️ Формат: <code>/give username дни</code> (без @)", parse_mode="HTML")
+        await message.answer("⚠️ Формат: <code>/give username дни</code>", parse_mode="HTML")
         return
 
     parts = command.args.split()
     target_username = parts[0].lstrip("@")
-    if not parts[1].lstrip("-").isdigit():
-        await message.answer("❌ Количество дней должно быть числом.")
-        return
-    days = int(parts[1])
+    days = int(parts[1]) if parts[1].lstrip("-").isdigit() else 0
 
     with db_conn() as conn:
-        row = conn.execute(
-            "SELECT user_id FROM users WHERE username = ?", (target_username,)
-        ).fetchone()
+        row = conn.execute("SELECT user_id FROM users WHERE username = ?", (target_username,)).fetchone()
 
     if not row:
-        await message.answer(f"❌ Пользователь <b>@{target_username}</b> не найден в базе.", parse_mode="HTML")
+        await message.answer(f"❌ Пользователь @{target_username} не найден.")
         return
 
-    target_id = row["user_id"]
-    expiry, _ = await activate_subscription(target_id, days)
+    expiry, _ = await activate_subscription(row["user_id"], days)
     date_str = time.strftime("%d.%m.%Y", time.localtime(expiry))
+    await message.answer(f"✅ @{target_username} выдано {days} дней. До {date_str}")
 
-    await message.answer(
-        f"✅ <b>@{target_username}</b> выдано <b>{days}</b> дней.\n"
-        f"Подписка до: <b>{date_str}</b>",
-        parse_mode="HTML",
-    )
-    try:
-        await bot.send_message(
-            target_id,
-            f"🎁 Администратор выдал вам <b>{days}</b> дней подписки!\n"
-            f"Подписка действует до <b>{date_str}</b>.",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-
-# ─────────────────────────────────────────────
-#  АДМИН: /add_promo КОД ДНИ [использований]
-# ─────────────────────────────────────────────
 @router.message(Command("add_promo"))
 async def add_promo(message: types.Message, command: CommandObject):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
+    if message.from_user.id not in ADMIN_IDS: return
     parts = (command.args or "").split()
-    if len(parts) < 2:
-        await message.answer(
-            "⚠️ Формат: <code>/add_promo КОД ДНИ [кол-во_использований]</code>\n"
-            "Пример: <code>/add_promo SUMMER30 30 100</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    code = parts[0].upper()
-    if not parts[1].isdigit():
-        await message.answer("❌ Дни должны быть числом.")
-        return
-
-    days = int(parts[1])
-    uses = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
-
+    if len(parts) < 2: return
+    code, days = parts[0].upper(), int(parts[1])
+    uses = int(parts[2]) if len(parts) >= 3 else 1
     with db_conn() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO promos (code, days, uses) VALUES (?, ?, ?)",
-            (code, days, uses),
-        )
+        conn.execute("INSERT OR REPLACE INTO promos (code, days, uses) VALUES (?, ?, ?)", (code, days, uses))
+    await message.answer(f"✅ Промокод {code} на {days} дн. создан.")
 
-    await message.answer(
-        f"✅ Промокод <code>{code}</code> создан.\n"
-        f"Даёт: <b>{days}</b> дней | Использований: <b>{uses}</b>",
-        parse_mode="HTML",
-    )
-
-# ─────────────────────────────────────────────
-#  АДМИН: /broadcast (FSM)
-# ─────────────────────────────────────────────
 @router.message(Command("broadcast"))
 async def broadcast_start(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+    if message.from_user.id not in ADMIN_IDS: return
     await state.set_state(BroadcastState.waiting_text)
-    await message.answer("📢 Введите текст рассылки (HTML поддерживается). /cancel — отмена.")
+    await message.answer("📢 Введите текст рассылки. /cancel — отмена.")
 
-@router.message(Command("cancel"), BroadcastState.waiting_text)
-async def broadcast_cancel(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ Рассылка отменена.")
-
-@router.message(BroadcastState.waiting_text)
-async def broadcast_send(message: types.Message, state: FSMContext):
-    await state.clear()
-    text = f"📢 <b>Рассылка от TrubaVPN:</b>\n\n{message.text}"
-
-    with db_conn() as conn:
-        users = conn.execute("SELECT user_id FROM users").fetchall()
-
-    ok, fail = 0, 0
-    for row in users:
-        try:
-            await bot.send_message(row["user_id"], text, parse_mode="HTML")
-            ok += 1
-        except Exception:
-            fail += 1
-        await asyncio.sleep(0.05)  # ~20 msg/s — в рамках лимитов Telegram
-
-    await message.answer(f"✅ Рассылка завершена.\nОтправлено: {ok} | Ошибок: {fail}")
-
-# ─────────────────────────────────────────────
-#  АДМИН: /stats
-# ─────────────────────────────────────────────
 @router.message(Command("stats"))
 async def admin_stats(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+    if message.from_user.id not in ADMIN_IDS: return
     now = int(time.time())
     with db_conn() as conn:
-        total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        active  = conn.execute(
-            "SELECT COUNT(*) FROM users WHERE expiry_date > ?", (now,)
-        ).fetchone()[0]
-        paid    = conn.execute(
-            "SELECT COUNT(*) FROM users WHERE has_paid = 1"
-        ).fetchone()[0]
-        promos  = conn.execute("SELECT COUNT(*) FROM promos").fetchone()[0]
-
-    await message.answer(
-        f"📊 <b>Статистика TrubaVPN</b>\n\n"
-        f"👥 Всего пользователей: <b>{total}</b>\n"
-        f"✅ Активных подписок: <b>{active}</b>\n"
-        f"💳 Когда-либо платили: <b>{paid}</b>\n"
-        f"🎟 Активных промокодов: <b>{promos}</b>",
-        parse_mode="HTML",
-    )
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM users WHERE expiry_date > ?", (now,)).fetchone()[0]
+    await message.answer(f"📊 Всего: {total}\n✅ Активно: {active}")
 
 # ─────────────────────────────────────────────
 #  ЗАПУСК
@@ -789,10 +634,10 @@ async def main():
     init_db()
     dp.include_router(router)
     log.info("TrubaVPN Bot starting...")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         log.info("Bot stopped.")
