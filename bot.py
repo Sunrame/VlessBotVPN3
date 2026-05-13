@@ -158,7 +158,7 @@ def init_db():
 # ─────────────────────────────────────────────
 async def panel_create_client(user_id: int, days: int) -> str | None:
     """
-    Логинимся в 3x-ui, создаём VLESS-клиента.
+    Логинимся в 3x-ui и создаём VLESS-клиента.
     Возвращает ссылку-подписку или None при ошибке.
     """
     base = PANEL_URL
@@ -167,45 +167,69 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
     client_id = str(uuid.uuid4())
 
     jar = aiohttp.CookieJar(unsafe=True)
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=30)
     try:
         async with aiohttp.ClientSession(
             cookie_jar=jar, timeout=timeout,
             connector=aiohttp.TCPConnector(ssl=False)
         ) as s:
             # 1. Авторизация
-            r = await s.post(f"{base}/login",
-                             data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
-            resp = await r.json(content_type=None)
+            r = await s.post(
+                f"{base}/login",
+                data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD},
+            )
+            raw = await r.text()
+            log.info("Panel login status=%s body=%s", r.status, raw[:200])
+            try:
+                resp = await r.json(content_type=None)
+            except Exception:
+                resp = None
             if not resp or not resp.get("success"):
-                log.error("Panel login failed: %s", resp)
+                log.error("Panel login failed (status %s): %s", r.status, raw[:300])
                 return None
 
             # 2. Список inbound'ов
-            r = await s.get(f"{base}/xui/inbound/list")
-            data = await r.json(content_type=None)
+            r2 = await s.get(f"{base}/xui/inbound/list")
+            raw2 = await r2.text()
+            log.info("Panel inbound/list status=%s body=%s", r2.status, raw2[:300])
+            try:
+                import json as _json
+                data = _json.loads(raw2)
+            except Exception:
+                data = None
             if not data or not data.get("success") or not data.get("obj"):
-                log.error("Panel inbound list failed: %s", data)
+                log.error("Panel inbound list failed (status %s): %s", r2.status, raw2[:300])
                 return None
             inbound_id = data["obj"][0]["id"]
+            log.info("Using inbound id=%s", inbound_id)
 
             # 3. Добавляем клиента
-            payload = {
-                "id": inbound_id,
-                "settings": (
-                    f'{{"clients":[{{"id":"{client_id}","email":"{email}",'
-                    f'"expiryTime":{expire_ms},"enable":true,"flow":""}}]}}'
-                ),
+            import json as _json2
+            settings_obj = {
+                "clients": [{
+                    "id": client_id,
+                    "email": email,
+                    "expiryTime": expire_ms,
+                    "enable": True,
+                    "flow": "",
+                }]
             }
-            r = await s.post(f"{base}/xui/inbound/addClient", json=payload)
-            add_resp = await r.json(content_type=None)
+            payload = {"id": inbound_id, "settings": _json2.dumps(settings_obj)}
+            r3 = await s.post(f"{base}/xui/inbound/addClient", json=payload)
+            raw3 = await r3.text()
+            log.info("Panel addClient status=%s body=%s", r3.status, raw3[:200])
+            try:
+                add_resp = _json2.loads(raw3)
+            except Exception:
+                add_resp = {}
             if not add_resp.get("success"):
-                log.error("Panel addClient failed: %s", add_resp)
+                log.error("Panel addClient failed (status %s): %s", r3.status, raw3[:300])
                 return None
 
-            # 4. Генерируем ссылку подписки
+            # 4. Ссылка подписки
             host = base.split("://", 1)[-1].split(":")[0]
             sub_link = f"http://{host}:{SUB_PORT}/{client_id}"
+            log.info("Created client sub_link=%s", sub_link)
             return sub_link
 
     except Exception as e:
@@ -214,36 +238,42 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
 
 
 async def panel_update_client_expiry(user_id: int, new_expiry_ts: int) -> bool:
-    """
-    Обновляем expiryTime существующего клиента в панели.
-    Возвращает True при успехе.
-    """
-    base = PANEL_URL
+    """Обновляем expiryTime существующего клиента в панели."""
+    import json as _json
+    base  = PANEL_URL
     email = f"user_{user_id}"
     expire_ms = new_expiry_ts * 1000
 
     jar = aiohttp.CookieJar(unsafe=True)
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=30)
     try:
         async with aiohttp.ClientSession(
             cookie_jar=jar, timeout=timeout,
             connector=aiohttp.TCPConnector(ssl=False)
         ) as s:
-            r = await s.post(f"{base}/login",
-                             data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
-            resp = await r.json(content_type=None)
-            if not resp.get("success"):
+            r = await s.post(
+                f"{base}/login",
+                data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD},
+            )
+            try:
+                resp = await r.json(content_type=None)
+            except Exception:
+                resp = None
+            if not resp or not resp.get("success"):
                 return False
 
-            r = await s.get(f"{base}/xui/inbound/list")
-            data = await r.json(content_type=None)
-            if not data.get("success") or not data.get("obj"):
+            r2 = await s.get(f"{base}/xui/inbound/list")
+            raw2 = await r2.text()
+            try:
+                data = _json.loads(raw2)
+            except Exception:
+                return False
+            if not data or not data.get("success") or not data.get("obj"):
                 return False
 
             for inbound in data["obj"]:
-                import json
                 try:
-                    settings = json.loads(inbound.get("settings", "{}"))
+                    settings = _json.loads(inbound.get("settings", "{}"))
                 except Exception:
                     continue
                 for client in settings.get("clients", []):
@@ -251,15 +281,22 @@ async def panel_update_client_expiry(user_id: int, new_expiry_ts: int) -> bool:
                         client["expiryTime"] = expire_ms
                         payload = {
                             "id": inbound["id"],
-                            "settings": json.dumps(settings),
+                            "settings": _json.dumps(settings),
                         }
-                        r2 = await s.post(f"{base}/xui/inbound/{inbound['id']}/updateClient/{client['id']}", json=payload)
-                        upd = await r2.json(content_type=None)
+                        r3 = await s.post(
+                            f"{base}/xui/inbound/{inbound['id']}/updateClient/{client['id']}",
+                            json=payload,
+                        )
+                        try:
+                            upd = await r3.json(content_type=None)
+                        except Exception:
+                            upd = {}
                         return bool(upd.get("success"))
             return False
     except Exception as e:
         log.exception("Panel update error: %s", e)
         return False
+
 
 # ─────────────────────────────────────────────
 #  ПОДПИСКА В БД
