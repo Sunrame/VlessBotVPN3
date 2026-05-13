@@ -1,3 +1,4 @@
+```python
 import os
 import uuid
 import logging
@@ -104,7 +105,7 @@ def init_db():
         """)
 
 # ─────────────────────────────────────────────
-#  3X-UI ПАНЕЛЬ: ИСПРАВЛЕННАЯ ЛОГИКА
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ JSON
 # ─────────────────────────────────────────────
 def _safe_json_or_dict(raw, label: str):
     """
@@ -131,6 +132,41 @@ def _safe_json_or_dict(raw, label: str):
     log.error(f"❌ {label}: неизвестный тип {type(raw)}")
     return None
 
+async def _safe_json_response(resp: aiohttp.ClientResponse, label: str):
+    """
+    Универсальный разбор ответа панели:
+    - пытаемся прочитать text()
+    - логируем
+    - пытаемся json.loads
+    """
+    try:
+        text = await resp.text()
+    except Exception as e:
+        log.error(f"❌ {label}: не удалось прочитать текст ответа: {e}")
+        return None
+
+    log.warning(f"{label} RAW RESPONSE: {text}")
+
+    text_strip = text.strip()
+    if not text_strip:
+        log.error(f"❌ {label}: пустой ответ от панели")
+        return None
+
+    try:
+        data = json.loads(text_strip)
+    except Exception as e:
+        log.error(f"❌ {label}: ответ не JSON: {e}")
+        return None
+
+    if not isinstance(data, dict):
+        log.error(f"❌ {label}: JSON не объект: {data}")
+        return None
+
+    return data
+
+# ─────────────────────────────────────────────
+#  3X-UI ПАНЕЛЬ: УНИВЕРСАЛЬНАЯ ЛОГИКА
+# ─────────────────────────────────────────────
 async def panel_create_client(user_id: int, days: int) -> str | None:
     base = PANEL_URL
     email = f"user_{user_id}"
@@ -140,20 +176,20 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
     try:
         async with aiohttp.ClientSession(
             cookie_jar=aiohttp.CookieJar(unsafe=True),
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=20),
             connector=aiohttp.TCPConnector(ssl=False)
         ) as s:
             # Логин
             r = await s.post(f"{base}/login", data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
-            resp = await r.json(content_type=None)
-            if not resp.get("success"):
-                log.error(f"❌ Ошибка логина: {resp}")
+            login_data = await _safe_json_response(r, "LOGIN")
+            if not login_data or not login_data.get("success"):
+                log.error(f"❌ Ошибка логина в панель: {login_data}")
                 return None
 
             # Список инбаундов
             r = await s.get(f"{base}/xui/inbound/list")
-            data = await r.json(content_type=None)
-            if not data.get("success") or not data.get("obj"):
+            data = await _safe_json_response(r, "INBOUND_LIST")
+            if not data or not data.get("success") or not data.get("obj"):
                 log.error(f"❌ Не удалось получить список инбаундов: {data}")
                 return None
 
@@ -169,7 +205,6 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             inbound_id = inbound.get("id")
             port = inbound.get("port")
 
-            # DEBUG: посмотреть, что реально приходит
             log.warning("===== INBOUND DEBUG START =====")
             log.warning(f"INBOUND RAW: {inbound}")
             log.warning(f"SETTINGS TYPE: {type(inbound.get('settings'))}")
@@ -193,14 +228,12 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                 "flow": ""
             }
 
-            # Если в инбаунде уже есть клиенты — берём flow первого
             if clients_list:
                 try:
                     client_data["flow"] = clients_list[0].get("flow", "")
                 except Exception as e:
                     log.error(f"❌ Ошибка чтения flow из clients: {e}")
 
-            # Добавляем нового клиента к существующим, а не затираем
             new_clients = clients_list + [client_data]
             new_settings_payload = {
                 **current_settings,
@@ -213,9 +246,8 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             }
 
             r = await s.post(f"{base}/xui/inbound/addClient", json=payload)
-            add_resp = await r.json(content_type=None)
-
-            if not add_resp.get("success"):
+            add_resp = await _safe_json_response(r, "ADD_CLIENT")
+            if not add_resp or not add_resp.get("success"):
                 log.error(f"❌ Ошибка addClient: {add_resp}")
                 return None
 
@@ -231,7 +263,6 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
 
             vless_link = f"vless://{client_id}@{host}:{port}?type={network}&security={security}"
 
-            # Reality / TLS / WS параметры
             if security == "reality":
                 reality = stream_settings.get("realitySettings", {}) or {}
                 pbk = reality.get("publicKey", "")
@@ -253,11 +284,9 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                     f"&fp=chrome"
                 )
 
-            # flow
             if client_data.get("flow"):
                 vless_link += f"&flow={client_data['flow']}"
 
-            # Имя
             vless_link += f"#{email}"
 
             log.info(f"✅ Сформирована VLESS ссылка: {vless_link}")
@@ -268,16 +297,34 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
         return None
 
 async def activate_subscription(user_id: int, days: int):
+    """
+    Универсальная активация:
+    - если панель отдала ссылку → используем её
+    - если панель упала → генерируем локальный токен-заглушку
+    """
     now = int(time.time())
     delta = days * 86400
     with db_conn() as conn:
-        row = conn.execute("SELECT expiry_date, sub_token FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT expiry_date, sub_token FROM users WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
         current_expiry = row["expiry_date"] if row else 0
         token = row["sub_token"] if row and row["sub_token"] else None
         new_expiry = max(current_expiry, now) + delta
+
         if not token:
-            token = await panel_create_client(user_id, days) or f"truba_{uuid.uuid4().hex[:10]}"
-        conn.execute("UPDATE users SET expiry_date = ?, sub_token = ? WHERE user_id = ?", (new_expiry, token, user_id))
+            panel_token = await panel_create_client(user_id, days)
+            if panel_token:
+                token = panel_token
+            else:
+                token = f"truba_{uuid.uuid4().hex[:10]}"
+                log.warning(f"⚠️ Панель недоступна, выдан локальный токен: {token}")
+
+        conn.execute(
+            "UPDATE users SET expiry_date = ?, sub_token = ? WHERE user_id = ?",
+            (new_expiry, token, user_id)
+        )
     return new_expiry, token
 
 # ─────────────────────────────────────────────
@@ -285,13 +332,18 @@ async def activate_subscription(user_id: int, days: int):
 # ─────────────────────────────────────────────
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Купить VPN", callback_data="tariffs"), InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
-        [InlineKeyboardButton(text="🤝 Рефералы", callback_data="ref_program"), InlineKeyboardButton(text="🎟 Промокод", callback_data="promo_enter")],
-        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_tab"), InlineKeyboardButton(text="📖 Инфо", callback_data="info_tab")],
+        [InlineKeyboardButton(text="💎 Купить VPN", callback_data="tariffs"),
+         InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🤝 Рефералы", callback_data="ref_program"),
+         InlineKeyboardButton(text="🎟 Промокод", callback_data="promo_enter")],
+        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_tab"),
+         InlineKeyboardButton(text="📖 Инфо", callback_data="info_tab")],
     ])
 
 def back_kb(target="back"):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]]
+    )
 
 # ─────────────────────────────────────────────
 #  ОСНОВНЫЕ ХЕНДЛЕРЫ
@@ -306,7 +358,10 @@ async def cmd_start(message: types.Message, command: CommandObject):
             r_id = candidate
 
     with db_conn() as conn:
-        existing = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (u_id,)).fetchone()
+        existing = conn.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (u_id,)
+        ).fetchone()
         if not existing:
             conn.execute(
                 "INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
@@ -574,3 +629,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
