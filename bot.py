@@ -177,14 +177,14 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             r = await s.post(f"{base}/login",
                              data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
             resp = await r.json(content_type=None)
-            if not resp.get("success"):
+            if not resp or not resp.get("success"):
                 log.error("Panel login failed: %s", resp)
                 return None
 
             # 2. Список inbound'ов
             r = await s.get(f"{base}/xui/inbound/list")
             data = await r.json(content_type=None)
-            if not data.get("success") or not data.get("obj"):
+            if not data or not data.get("success") or not data.get("obj"):
                 log.error("Panel inbound list failed: %s", data)
                 return None
             inbound_id = data["obj"][0]["id"]
@@ -288,20 +288,16 @@ async def activate_subscription(
             # Обновляем expiryTime в панели
             await panel_update_client_expiry(user_id, new_expiry)
 
-        update_kwargs = {"expiry_date": new_expiry, "sub_token": token}
         if tariff_key:
-            update_kwargs["tariff_key"] = tariff_key
-            update_kwargs["devices"] = devices
-
-        conn.execute(
-            """UPDATE users
-               SET expiry_date = :expiry_date,
-                   sub_token   = :sub_token,
-                   tariff_key  = CASE WHEN :tariff_key != '' THEN :tariff_key ELSE tariff_key END,
-                   devices     = CASE WHEN :tariff_key != '' THEN :devices    ELSE devices    END
-               WHERE user_id = :user_id""",
-            {**update_kwargs, "user_id": user_id},
-        )
+            conn.execute(
+                "UPDATE users SET expiry_date=?, sub_token=?, tariff_key=?, devices=? WHERE user_id=?",
+                (new_expiry, token, tariff_key, devices, user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET expiry_date=?, sub_token=? WHERE user_id=?",
+                (new_expiry, token, user_id),
+            )
     return new_expiry, token
 
 # ─────────────────────────────────────────────
