@@ -149,7 +149,20 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                 log.error("Inbound list error: %s", data)
                 return None
 
-            inbound = data["obj"][0]
+            inbound = next(
+    (i for i in data["obj"] if i["id"] == 2),
+    None
+)
+
+if not inbound:
+    log.error("Inbound with ID=2 not found")
+    return None
+
+log.warning("USING INBOUND: %s", inbound)
+
+if inbound["protocol"] != "vless":
+    log.error("Inbound is NOT VLESS: %s", inbound["protocol"])
+    return None
 
             inbound_id = inbound["id"]
             port = inbound["port"]
