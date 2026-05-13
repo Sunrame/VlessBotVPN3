@@ -148,8 +148,7 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             if not data.get("success") or not data.get("obj"):
                 log.error("Inbound list error: %s", data)
                 return None
-
-            inbound = next(
+                inbound = next(
     (i for i in data["obj"] if i["id"] == 2),
     None
 )
