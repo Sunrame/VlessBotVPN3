@@ -188,18 +188,33 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                 log.error("Panel login failed (status %s): %s", r.status, raw[:300])
                 return None
 
-            # 2. Список inbound'ов
-            r2 = await s.get(f"{base}/xui/API/inbounds")
-            raw2 = await r2.text()
-            log.info("Panel inbound/list status=%s body=%s", r2.status, raw2[:300])
-            try:
-                import json as _json
-                data = _json.loads(raw2)
-            except Exception:
-                data = None
-            if not data or not data.get("success") or not data.get("obj"):
-                log.error("Panel inbound list failed (status %s): %s", r2.status, raw2[:300])
+            # 2. Список inbound'ов — перебираем все известные пути
+            import json as _json
+            data = None
+            INBOUND_PATHS = [
+                "/xui/API/inbounds",
+                "/xui/inbound/list",
+                "/xui/inbounds",
+                "/api/inbounds",
+            ]
+            found_path = None
+            for _path in INBOUND_PATHS:
+                r2 = await s.get(f"{base}{_path}")
+                raw2 = await r2.text()
+                log.info("Trying %s -> status=%s body=%s", _path, r2.status, raw2[:200])
+                if r2.status == 200:
+                    try:
+                        data = _json.loads(raw2)
+                    except Exception:
+                        data = None
+                    if data and data.get("success") and data.get("obj"):
+                        found_path = _path
+                        break
+                    data = None
+            if not data:
+                log.error("Panel inbound list failed on all paths")
                 return None
+            log.info("Inbound list OK via path: %s", found_path)
             inbound_id = data["obj"][0]["id"]
             log.info("Using inbound id=%s", inbound_id)
 
@@ -223,15 +238,24 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
                     }]
                 }),
             }
-            r3 = await s.post(f"{base}/xui/API/inbounds/{inbound_id}/addClient", json=payload)
-            raw3 = await r3.text()
-            log.info("Panel addClient status=%s body=%s", r3.status, raw3[:200])
-            try:
-                add_resp = _json2.loads(raw3)
-            except Exception:
-                add_resp = {}
+            ADD_PATHS = [
+                f"{base}/xui/API/inbounds/{inbound_id}/addClient",
+                f"{base}/xui/inbound/addClient",
+            ]
+            add_resp = {}
+            raw3 = ""
+            for _apath in ADD_PATHS:
+                r3 = await s.post(_apath, json=payload)
+                raw3 = await r3.text()
+                log.info("Panel addClient %s status=%s body=%s", _apath, r3.status, raw3[:200])
+                try:
+                    add_resp = _json2.loads(raw3)
+                except Exception:
+                    add_resp = {}
+                if add_resp.get("success"):
+                    break
             if not add_resp.get("success"):
-                log.error("Panel addClient failed (status %s): %s", r3.status, raw3[:300])
+                log.error("Panel addClient failed on all paths. Last: %s", raw3[:300])
                 return None
 
             # 4. Ссылка подписки
@@ -270,13 +294,25 @@ async def panel_update_client_expiry(user_id: int, new_expiry_ts: int) -> bool:
             if not resp or not resp.get("success"):
                 return False
 
-            r2 = await s.get(f"{base}/xui/API/inbounds")
-            raw2 = await r2.text()
-            try:
-                data = _json.loads(raw2)
-            except Exception:
-                return False
-            if not data or not data.get("success") or not data.get("obj"):
+            INBOUND_PATHS = [
+                "/xui/API/inbounds",
+                "/xui/inbound/list",
+                "/xui/inbounds",
+                "/api/inbounds",
+            ]
+            data = None
+            for _path in INBOUND_PATHS:
+                r2 = await s.get(f"{base}{_path}")
+                raw2 = await r2.text()
+                if r2.status == 200:
+                    try:
+                        data = _json.loads(raw2)
+                    except Exception:
+                        data = None
+                    if data and data.get("success") and data.get("obj"):
+                        break
+                    data = None
+            if not data:
                 return False
 
             for inbound in data["obj"]:
