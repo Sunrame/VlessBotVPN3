@@ -38,7 +38,7 @@ for key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     if val.isdigit():
         ADMIN_IDS.append(int(val))
 
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@vvvvvpppnn")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
@@ -109,7 +109,124 @@ def init_db():
 # ─────────────────────────────────────────────
 #  3X-UI ПАНЕЛЬ: выдача ключа
 # ─────────────────────────────────────────────
+import json
+
 async def panel_create_client(user_id: int, days: int) -> str | None:
+    """
+    Создаёт клиента в 3x-ui и возвращает корректную VLESS ссылку.
+    Поддержка: TCP + REALITY + flow
+    """
+    base = PANEL_URL
+    email = f"user_{user_id}"
+    expire_ms = int((time.time() + days * 86400) * 1000)
+    client_id = str(uuid.uuid4())
+
+    jar = aiohttp.CookieJar(unsafe=True)
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    try:
+        async with aiohttp.ClientSession(
+            cookie_jar=jar,
+            timeout=timeout,
+            connector=aiohttp.TCPConnector(ssl=False)
+        ) as s:
+
+            # 1. Логин
+            r = await s.post(
+                f"{base}/login",
+                data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
+            )
+            resp = await r.json(content_type=None)
+            if not resp.get("success"):
+                log.error("Panel login failed: %s", resp)
+                return None
+
+            # 2. Получаем inbound
+            r = await s.get(f"{base}/xui/inbound/list")
+            data = await r.json(content_type=None)
+
+            if not data.get("success") or not data.get("obj"):
+                log.error("Inbound list error: %s", data)
+                return None
+
+            inbound = data["obj"][0]
+
+            inbound_id = inbound["id"]
+            port = inbound["port"]
+
+            settings_json = json.loads(inbound["settings"])
+            stream_json = json.loads(inbound["streamSettings"])
+
+            # 3. Добавляем клиента
+            flow = ""
+            if settings_json.get("clients"):
+                flow = settings_json["clients"][0].get("flow", "")
+
+            payload = {
+                "id": inbound_id,
+                "settings": json.dumps({
+                    "clients": [{
+                        "id": client_id,
+                        "email": email,
+                        "expiryTime": expire_ms,
+                        "enable": True,
+                        "flow": flow
+                    }]
+                })
+            }
+
+            r = await s.post(f"{base}/xui/inbound/addClient", json=payload)
+            add_resp = await r.json(content_type=None)
+
+            if not add_resp.get("success"):
+                log.error("Add client error: %s", add_resp)
+                return None
+
+            # 4. Формируем VLESS ссылку
+            host = os.environ.get("VPN_HOST")
+            if not host:
+                host = base.replace("https://", "").replace("http://", "")
+
+            security = stream_json.get("security", "none")
+
+            # === REALITY ===
+            if security == "reality":
+                reality = stream_json.get("realitySettings", {})
+
+                public_key = reality.get("publicKey", "")
+                short_id = reality.get("shortIds", [""])[0]
+                server_name = reality.get("serverNames", [""])[0]
+
+                vless_link = (
+                    f"vless://{client_id}@{host}:{port}"
+                    f"?type=tcp"
+                    f"&security=reality"
+                    f"&pbk={public_key}"
+                    f"&sni={server_name}"
+                    f"&sid={short_id}"
+                    f"&fp=chrome"
+                )
+
+                if flow:
+                    vless_link += f"&flow={flow}"
+
+            # === ОБЫЧНЫЙ TCP ===
+            else:
+                vless_link = (
+                    f"vless://{client_id}@{host}:{port}"
+                    f"?type=tcp&security=none"
+                )
+
+                if flow:
+                    vless_link += f"&flow={flow}"
+
+            vless_link += f"#{email}"
+
+            return vless_link
+
+    except Exception as e:
+        log.exception("Panel error: %s", e)
+        return None
     """
     Логинимся в 3x-ui и создаём VLESS-клиента.
     Возвращает ссылку-подписку или None при ошибке.
