@@ -21,14 +21,14 @@ from yookassa import Configuration, Payment
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ─────────────────────────────────────────────
-#  КОНФИГУРАЦИЯ (только из переменных окружения)
+#  КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────
 API_TOKEN      = os.environ["BOT_TOKEN"]
 SHOP_ID        = os.environ["SHOP_ID"]
 YOOKASSA_KEY   = os.environ["YOOKASSA_KEY"]
-PAYMENT_TOKEN  = os.environ.get("PAYMENT_TOKEN", "")   # резервный токен, если нужен
+PAYMENT_TOKEN  = os.environ.get("PAYMENT_TOKEN", "")
 
-PANEL_URL      = os.environ["PANEL_URL"].rstrip("/")    # напр. https://1.2.3.4:2053
+PANEL_URL      = os.environ["PANEL_URL"].rstrip("/")
 PANEL_LOGIN    = os.environ["PANEL_LOGIN"]
 PANEL_PASSWORD = os.environ["PANEL_PASSWORD"]
 SUB_PORT       = os.environ.get("SUB_PORT", "2096")
@@ -73,15 +73,11 @@ logging.basicConfig(
 log = logging.getLogger("trubavpn")
 
 # ─────────────────────────────────────────────
-#  AIOGRAM
+#  AIOGRAM И БД
 # ─────────────────────────────────────────────
 bot    = Bot(token=API_TOKEN)
 dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
-
-# ─────────────────────────────────────────────
-#  БАЗА ДАННЫХ
-# ─────────────────────────────────────────────
 DB = "users.db"
 
 def db_conn():
@@ -108,148 +104,180 @@ def init_db():
         """)
 
 # ─────────────────────────────────────────────
-#  3X-UI ПАНЕЛЬ: выдача ключа
+#  3X-UI ПАНЕЛЬ: ИСПРАВЛЕННАЯ ЛОГИКА
 # ─────────────────────────────────────────────
+def _safe_json_or_dict(raw, label: str):
+    """
+    Универсальный парсер:
+    - если строка → json.loads
+    - если dict → вернуть как есть
+    - иначе → None
+    """
+    if raw is None:
+        log.error(f"❌ {label}: значение None")
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            log.error(f"❌ {label}: пустая строка")
+            return None
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            log.error(f"❌ {label}: ошибка json.loads: {e} | raw={raw!r}")
+            return None
+    log.error(f"❌ {label}: неизвестный тип {type(raw)}")
+    return None
 
 async def panel_create_client(user_id: int, days: int) -> str | None:
-    """
-    Создаёт клиента в 3x-ui и возвращает корректную VLESS ссылку.
-    Поддержка: TCP + REALITY + flow
-    """
     base = PANEL_URL
     email = f"user_{user_id}"
     expire_ms = int((time.time() + days * 86400) * 1000)
     client_id = str(uuid.uuid4())
 
-    jar = aiohttp.CookieJar(unsafe=True)
-    timeout = aiohttp.ClientTimeout(total=15)
-
     try:
         async with aiohttp.ClientSession(
-            cookie_jar=jar,
-            timeout=timeout,
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+            timeout=aiohttp.ClientTimeout(total=15),
             connector=aiohttp.TCPConnector(ssl=False)
         ) as s:
-
-            # 1. Логин
-            r = await s.post(
-                f"{base}/login",
-                data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
-            )
+            # Логин
+            r = await s.post(f"{base}/login", data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
             resp = await r.json(content_type=None)
             if not resp.get("success"):
-                log.error("Panel login failed: %s", resp)
+                log.error(f"❌ Ошибка логина: {resp}")
                 return None
 
-            # 2. Получаем inbound
+            # Список инбаундов
             r = await s.get(f"{base}/xui/inbound/list")
             data = await r.json(content_type=None)
-
             if not data.get("success") or not data.get("obj"):
-                log.error("Inbound list error: %s", data)
+                log.error(f"❌ Не удалось получить список инбаундов: {data}")
                 return None
-            
-            inbound = next((i for i in data["obj"] if i["id"] == 2), None)
+
+            # Автопоиск инбаунда: ID 2 или любой VLESS
+            inbound = next((i for i in data["obj"] if i.get("id") == 2), None)
+            if not inbound:
+                inbound = next((i for i in data["obj"] if i.get("protocol") == "vless"), None)
 
             if not inbound:
-                log.error("Inbound with ID=2 not found")
+                log.error("❌ VLESS инбаунд не найден")
                 return None
 
-            if inbound["protocol"] != "vless":
-                log.error("Inbound is NOT VLESS: %s", inbound["protocol"])
-                return None
+            inbound_id = inbound.get("id")
+            port = inbound.get("port")
 
-            inbound_id = inbound["id"]
-            port = inbound["port"]
-            settings_json = json.loads(inbound["settings"])
-            stream_json = json.loads(inbound["streamSettings"])
+            # DEBUG: посмотреть, что реально приходит
+            log.warning("===== INBOUND DEBUG START =====")
+            log.warning(f"INBOUND RAW: {inbound}")
+            log.warning(f"SETTINGS TYPE: {type(inbound.get('settings'))}")
+            log.warning(f"SETTINGS RAW: {inbound.get('settings')}")
+            log.warning(f"STREAM TYPE: {type(inbound.get('streamSettings'))}")
+            log.warning(f"STREAM RAW: {inbound.get('streamSettings')}")
+            log.warning("===== INBOUND DEBUG END =====")
 
-            # 3. Добавляем клиента
-            flow = ""
-            if settings_json.get("clients"):
-                flow = settings_json["clients"][0].get("flow", "")
+            # Разбор settings
+            current_settings = _safe_json_or_dict(inbound.get("settings"), "settings")
+            if current_settings is None:
+                current_settings = {}
+
+            clients_list = current_settings.get("clients") or []
+
+            client_data = {
+                "id": client_id,
+                "email": email,
+                "expiryTime": expire_ms,
+                "enable": True,
+                "flow": ""
+            }
+
+            # Если в инбаунде уже есть клиенты — берём flow первого
+            if clients_list:
+                try:
+                    client_data["flow"] = clients_list[0].get("flow", "")
+                except Exception as e:
+                    log.error(f"❌ Ошибка чтения flow из clients: {e}")
+
+            # Добавляем нового клиента к существующим, а не затираем
+            new_clients = clients_list + [client_data]
+            new_settings_payload = {
+                **current_settings,
+                "clients": new_clients
+            }
 
             payload = {
                 "id": inbound_id,
-                "settings": json.dumps({
-                    "clients": [{
-                        "id": client_id,
-                        "email": email,
-                        "expiryTime": expire_ms,
-                        "enable": True,
-                        "flow": flow
-                    }]
-                })
+                "settings": json.dumps(new_settings_payload, ensure_ascii=False)
             }
 
             r = await s.post(f"{base}/xui/inbound/addClient", json=payload)
             add_resp = await r.json(content_type=None)
 
             if not add_resp.get("success"):
-                log.error("Add client error: %s", add_resp)
+                log.error(f"❌ Ошибка addClient: {add_resp}")
                 return None
 
-            # 4. Формируем VLESS ссылку
-            host = os.environ.get("VPN_HOST")
-            if not host:
-                host = base.replace("https://", "").replace("http://", "").split(":")[0]
+            # Разбор streamSettings
+            stream_settings = _safe_json_or_dict(inbound.get("streamSettings"), "streamSettings")
+            if stream_settings is None:
+                log.error("❌ streamSettings не разобран, не могу собрать VLESS ссылку")
+                return None
 
-            security = stream_json.get("security", "none")
+            host = os.environ.get("VPN_HOST") or base.split("//")[-1].split(":")[0]
+            security = stream_settings.get("security", "none")
+            network = stream_settings.get("network", "tcp")
 
-            # === REALITY ===
+            vless_link = f"vless://{client_id}@{host}:{port}?type={network}&security={security}"
+
+            # Reality / TLS / WS параметры
             if security == "reality":
-                reality = stream_json.get("realitySettings", {})
-                public_key = reality.get("publicKey", "")
-                short_id = reality.get("shortIds", [""])[0]
-                server_name = reality.get("serverNames", [""])[0]
+                reality = stream_settings.get("realitySettings", {}) or {}
+                pbk = reality.get("publicKey", "")
+                sni = ""
+                sid = ""
+                try:
+                    sni = (reality.get("serverNames") or [""])[0]
+                except Exception:
+                    pass
+                try:
+                    sid = (reality.get("shortIds") or [""])[0]
+                except Exception:
+                    pass
 
-                vless_link = (
-                    f"vless://{client_id}@{host}:{port}"
-                    f"?type=tcp"
-                    f"&security=reality"
-                    f"&pbk={public_key}"
-                    f"&sni={server_name}"
-                    f"&sid={short_id}"
+                vless_link += (
+                    f"&pbk={pbk}"
+                    f"&sni={sni}"
+                    f"&sid={sid}"
                     f"&fp=chrome"
                 )
-            # === ОБЫЧНЫЙ TCP ===
-            else:
-                vless_link = (
-                    f"vless://{client_id}@{host}:{port}"
-                    f"?type=tcp&security=none"
-                )
 
-            if flow:
-                vless_link += f"&flow={flow}"
-            
+            # flow
+            if client_data.get("flow"):
+                vless_link += f"&flow={client_data['flow']}"
+
+            # Имя
             vless_link += f"#{email}"
+
+            log.info(f"✅ Сформирована VLESS ссылка: {vless_link}")
             return vless_link
 
     except Exception as e:
-        log.exception("Panel error: %s", e)
+        log.exception(f"❌ Исключение в panel_create_client: {e}")
         return None
 
 async def activate_subscription(user_id: int, days: int):
     now = int(time.time())
     delta = days * 86400
     with db_conn() as conn:
-        row = conn.execute(
-            "SELECT expiry_date, sub_token FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-
+        row = conn.execute("SELECT expiry_date, sub_token FROM users WHERE user_id = ?", (user_id,)).fetchone()
         current_expiry = row["expiry_date"] if row else 0
         token = row["sub_token"] if row and row["sub_token"] else None
-
         new_expiry = max(current_expiry, now) + delta
-
-        # Если токена ещё нет — создаём клиента в панели
         if not token:
             token = await panel_create_client(user_id, days) or f"truba_{uuid.uuid4().hex[:10]}"
-
-        conn.execute(
-            "UPDATE users SET expiry_date = ?, sub_token = ? WHERE user_id = ?",
-            (new_expiry, token, user_id),
-        )
+        conn.execute("UPDATE users SET expiry_date = ?, sub_token = ? WHERE user_id = ?", (new_expiry, token, user_id))
     return new_expiry, token
 
 # ─────────────────────────────────────────────
@@ -257,27 +285,16 @@ async def activate_subscription(user_id: int, days: int):
 # ─────────────────────────────────────────────
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💎 Купить VPN",   callback_data="tariffs"),
-            InlineKeyboardButton(text="👤 Профиль",      callback_data="profile"),
-        ],
-        [
-            InlineKeyboardButton(text="🤝 Рефералы",     callback_data="ref_program"),
-            InlineKeyboardButton(text="🎟 Промокод",     callback_data="promo_enter"),
-        ],
-        [
-            InlineKeyboardButton(text="🆘 Поддержка",   callback_data="support_tab"),
-            InlineKeyboardButton(text="📖 Инфо",        callback_data="info_tab"),
-        ],
+        [InlineKeyboardButton(text="💎 Купить VPN", callback_data="tariffs"), InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🤝 Рефералы", callback_data="ref_program"), InlineKeyboardButton(text="🎟 Промокод", callback_data="promo_enter")],
+        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_tab"), InlineKeyboardButton(text="📖 Инфо", callback_data="info_tab")],
     ])
 
 def back_kb(target="back"):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]])
 
 # ─────────────────────────────────────────────
-#  /start
+#  ОСНОВНЫЕ ХЕНДЛЕРЫ
 # ─────────────────────────────────────────────
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
@@ -289,355 +306,271 @@ async def cmd_start(message: types.Message, command: CommandObject):
             r_id = candidate
 
     with db_conn() as conn:
-        existing = conn.execute(
-            "SELECT user_id FROM users WHERE user_id = ?", (u_id,)
-        ).fetchone()
+        existing = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (u_id,)).fetchone()
         if not existing:
             conn.execute(
                 "INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
-                (u_id, message.from_user.username, r_id),
+                (u_id, message.from_user.username, r_id)
             )
         else:
             conn.execute(
                 "UPDATE users SET username = ? WHERE user_id = ?",
-                (message.from_user.username, u_id),
+                (message.from_user.username, u_id)
             )
-
     await message.answer(
-        f"🚀 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
-        "Высокоскоростной VPN с простой настройкой.\n"
-        "Выберите действие ниже 👇",
+        f"🚀 Добро пожаловать в {hbold('TrubaVPN')}!",
         reply_markup=main_kb(),
-        parse_mode="HTML",
+        parse_mode="HTML"
     )
 
-# ─────────────────────────────────────────────
-#  ТАРИФЫ
-# ─────────────────────────────────────────────
 @router.callback_query(F.data == "tariffs")
 async def show_tariffs(cb: CallbackQuery):
     btns = [
-        [InlineKeyboardButton(
-            text=f"{v['name']} — {v['price']} ₽",
-            callback_data=f"buy_{k}"
-        )]
+        [InlineKeyboardButton(text=f"{v['name']} — {v['price']} ₽", callback_data=f"buy_{k}")]
         for k, v in TARIFFS.items()
     ]
     btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
     await cb.message.edit_text(
         "🛒 <b>Выберите тариф:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
-        parse_mode="HTML",
+        parse_mode="HTML"
     )
 
-# ─────────────────────────────────────────────
-#  ПЛАТЁЖ: создание
-# ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(cb: CallbackQuery):
     t_key = cb.data.removeprefix("buy_")
     if t_key not in TARIFFS:
-        await cb.answer("Тариф не найден", show_alert=True)
         return
-
     info = TARIFFS[t_key]
     try:
-        payment = Payment.create(
-            {
-                "amount":       {"value": f"{info['price']}.00", "currency": "RUB"},
-                "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
-                "capture":      True,
-                "description":  f"TrubaVPN — {info['name']}",
-                "metadata":     {"user_id": str(cb.from_user.id), "days": str(info["days"])},
-            },
-            str(uuid.uuid4()),
+        payment = Payment.create({
+            "amount": {"value": f"{info['price']}.00", "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
+            "capture": True,
+            "description": f"TrubaVPN — {info['name']}",
+            "metadata": {"user_id": str(cb.from_user.id), "days": str(info["days"])},
+        }, str(uuid.uuid4()))
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить", url=payment.confirmation.confirmation_url)],
+            [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{payment.id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="tariffs")],
+        ])
+        await cb.message.edit_text(
+            f"💳 <b>{info['name']}</b>\nК оплате: <b>{info['price']} ₽</b>",
+            reply_markup=kb,
+            parse_mode="HTML"
         )
     except Exception as e:
-        log.exception("Payment create error: %s", e)
-        await cb.answer("Ошибка создания платежа, попробуйте позже.", show_alert=True)
-        return
+        log.error(f"❌ Ошибка создания платежа: {e}")
+        await cb.answer("Ошибка создания платежа")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить",         url=payment.confirmation.confirmation_url)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{payment.id}")],
-        [InlineKeyboardButton(text="⬅️ Назад",            callback_data="tariffs")],
-    ])
-    await cb.message.edit_text(
-        f"💳 <b>{info['name']}</b>\n"
-        f"ℹ️ {info['desc']}\n\n"
-        f"К оплате: <b>{info['price']} ₽</b>\n\n"
-        "После оплаты нажмите «✅ Проверить оплату».",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-
-# ─────────────────────────────────────────────
-#  ПЛАТЁЖ: проверка
-# ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("check_"))
 async def check_payment(cb: CallbackQuery):
     pay_id = cb.data.removeprefix("check_")
     try:
         payment = Payment.find_one(pay_id)
+        if payment.status != "succeeded":
+            await cb.answer("⏳ Платёж ещё не подтверждён", show_alert=True)
+            return
+        
+        u_id, days = int(payment.metadata["user_id"]), int(payment.metadata["days"])
+        expiry, token = await activate_subscription(u_id, days)
+        
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT referrer_id, has_paid FROM users WHERE user_id = ?",
+                (u_id,)
+            ).fetchone()
+            if row and row["referrer_id"] and row["has_paid"] == 0:
+                await activate_subscription(row["referrer_id"], 7)
+                try:
+                    await bot.send_message(row["referrer_id"], "🎊 Друг оплатил VPN! Вам +7 дней.")
+                except Exception:
+                    pass
+            conn.execute("UPDATE users SET has_paid = 1 WHERE user_id = ?", (u_id,))
+            
+        date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(expiry))
+        await cb.message.edit_text(
+            f"✅ Оплачено!\n📅 До: {date_str}\n🔑 Ключ: {hcode(token)}",
+            parse_mode="HTML",
+            reply_markup=back_kb()
+        )
     except Exception as e:
-        log.exception("Payment find error: %s", e)
-        await cb.answer("Ошибка проверки платежа.", show_alert=True)
-        return
-
-    if payment.status != "succeeded":
-        await cb.answer("⏳ Платёж ещё не подтверждён. Попробуйте через минуту.", show_alert=True)
-        return
-
-    u_id = int(payment.metadata["user_id"])
-    days = int(payment.metadata["days"])
-    expiry, token = await activate_subscription(u_id, days)
-
-    # Реферальный бонус (только при первой покупке)
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT referrer_id, has_paid FROM users WHERE user_id = ?", (u_id,)
-        ).fetchone()
-
-        if row and row["referrer_id"] and row["has_paid"] == 0:
-            ref_id = row["referrer_id"]
-            await activate_subscription(u_id, 7)
-            await activate_subscription(ref_id, 7)
-            try:
-                await bot.send_message(
-                    ref_id,
-                    "🎊 Ваш друг оплатил подписку!\n"
-                    "Вам и ему начислено по <b>+7 дней</b> бонуса.",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
-        conn.execute("UPDATE users SET has_paid = 1 WHERE user_id = ?", (u_id,))
-
-    date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(expiry))
-    await cb.message.edit_text(
-        f"✅ <b>Оплата прошла успешно!</b>\n\n"
-        f"📅 Подписка до: <b>{date_str}</b>\n"
-        f"🔑 Ключ / ссылка подписки:\n{hcode(token)}\n\n"
-        f"📖 Инструкции по подключению — в нашем канале: {CHANNEL_LINK}",
-        parse_mode="HTML",
-        reply_markup=back_kb(),
-    )
+        log.error(f"❌ Ошибка проверки платежа: {e}")
+        await cb.answer("Ошибка проверки")
 
 # ─────────────────────────────────────────────
-#  ПРОМОКОДЫ (FSM)
+#  ПРОМОКОДЫ, ПРОФИЛЬ, РЕФЕРАЛЫ, ИНФО
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "promo_enter")
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
     await state.set_state(PromoState.waiting_code)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel")]
-    ])
     await cb.message.edit_text(
         "🎟 Введите промокод:",
-        reply_markup=kb,
+        reply_markup=back_kb("promo_cancel")
     )
 
 @router.callback_query(F.data == "promo_cancel")
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.edit_text(
-        f"🚀 {hbold('TrubaVPN')} готов к работе!",
-        reply_markup=main_kb(),
-        parse_mode="HTML",
-    )
+    await back_to_main(cb)
 
 @router.message(PromoState.waiting_code)
 async def handle_promo(message: types.Message, state: FSMContext):
     code = message.text.upper().strip()
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT days, uses FROM promos WHERE code = ?", (code,)
+            "SELECT days, uses FROM promos WHERE code = ?",
+            (code,)
         ).fetchone()
-
         if not row:
-            await message.answer(
-                "❌ Неверный или уже использованный промокод.\n"
-                "Попробуйте ещё раз или нажмите «Отмена».",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel")]
-                ])
-            )
+            await message.answer("❌ Неверный код")
             return
-
-        days = row["days"]
-        uses = row["uses"]
-
-        expiry, token = await activate_subscription(message.from_user.id, days)
-
-        if uses <= 1:
+        expiry, _ = await activate_subscription(message.from_user.id, row["days"])
+        if row["uses"] <= 1:
             conn.execute("DELETE FROM promos WHERE code = ?", (code,))
         else:
             conn.execute("UPDATE promos SET uses = uses - 1 WHERE code = ?", (code,))
-
     await state.clear()
-    date_str = time.strftime("%d.%m.%Y", time.localtime(expiry))
     await message.answer(
-        f"✅ Промокод <b>{code}</b> активирован!\n"
-        f"Добавлено дней: <b>{days}</b>\n"
-        f"Подписка до: <b>{date_str}</b>",
-        parse_mode="HTML",
-        reply_markup=main_kb(),
+        f"✅ Активирован! До {time.strftime('%d.%m.%Y', time.localtime(expiry))}",
+        reply_markup=main_kb()
     )
 
-# ─────────────────────────────────────────────
-#  ПРОФИЛЬ
-# ─────────────────────────────────────────────
 @router.callback_query(F.data == "profile")
 async def profile_tab(cb: CallbackQuery):
     with db_conn() as conn:
         row = conn.execute(
             "SELECT expiry_date, sub_token FROM users WHERE user_id = ?",
-            (cb.from_user.id,),
+            (cb.from_user.id,)
         ).fetchone()
-
     now = int(time.time())
     if row and row["expiry_date"] > now:
-        days_left = (row["expiry_date"] - now) // 86400
-        date_str = time.strftime("%d.%m.%Y", time.localtime(row["expiry_date"]))
-        token_line = f"\n🔑 Ключ:\n{hcode(row['sub_token'])}" if row["sub_token"] else ""
         text = (
-            f"👤 <b>Профиль</b>\n\n"
-            f"✅ Подписка активна\n"
-            f"📅 До: <b>{date_str}</b> (осталось {days_left} дн.)"
-            f"{token_line}"
+            f"👤 <b>Профиль</b>\n"
+            f"✅ До: {time.strftime('%d.%m.%Y', time.localtime(row['expiry_date']))}\n"
+            f"🔑 Ключ: {hcode(row['sub_token'])}"
         )
     else:
-        text = (
-            "👤 <b>Профиль</b>\n\n"
-            "❌ Подписка не активна.\n"
-            "Нажмите «💎 Купить VPN» для оформления."
-        )
+        text = "👤 <b>Профиль</b>\n❌ Нет подписки"
+    await cb.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=back_kb()
+    )
 
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb())
-
-# ─────────────────────────────────────────────
-#  РЕФЕРАЛЬНАЯ ПРОГРАММА
-# ─────────────────────────────────────────────
 @router.callback_query(F.data == "ref_program")
 async def ref_program(cb: CallbackQuery):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start={cb.from_user.id}"
-    text = (
-        f"🤝 <b>Реферальная программа</b>\n\n"
-        f"Приглашайте друзей — при первой оплате вы оба получите <b>+7 дней</b>!\n\n"
-        f"🔗 Ваша реферальная ссылка:\n{hcode(link)}"
+    await cb.message.edit_text(
+        f"🤝 Пригласи друга и получи +7 дней!\n🔗 Ссылка: {hcode(link)}",
+        parse_mode="HTML",
+        reply_markup=back_kb()
     )
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb())
 
-# ─────────────────────────────────────────────
-#  ПОДДЕРЖКА
-# ─────────────────────────────────────────────
 @router.callback_query(F.data == "support_tab")
 async def support_tab(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="✍️ Написать менеджеру",
-            url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}"
-        )],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton(text="✍️ Менеджер", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
     ])
-    await cb.message.edit_text(
-        "🆘 <b>Поддержка</b>\n\nЕсть вопросы? Мы на связи!",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    await cb.message.edit_text("🆘 Поддержка на связи!", reply_markup=kb)
 
-# ─────────────────────────────────────────────
-#  ИНФО
-# ─────────────────────────────────────────────
 @router.callback_query(F.data == "info_tab")
 async def info_tab(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Канал с инструкциями",        url=CHANNEL_LINK)],
-        [InlineKeyboardButton(text="📜 Пользовательское соглашение", url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
-        [InlineKeyboardButton(text="🛡 Политика конфиденциальности", url="https://telegra.ph/Politika-obrabotki-04-27")],
-        [InlineKeyboardButton(text="⬅️ Назад",                       callback_data="back")],
+        [InlineKeyboardButton(text="📢 Канал", url=CHANNEL_LINK)],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
     ])
-    await cb.message.edit_text(
-        "📖 <b>Информация и документы:</b>",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    await cb.message.edit_text("📖 Информация о сервисе", reply_markup=kb)
 
-# ─────────────────────────────────────────────
-#  НАЗАД
-# ─────────────────────────────────────────────
 @router.callback_query(F.data == "back")
 async def back_to_main(cb: CallbackQuery):
     await cb.message.edit_text(
-        f"🚀 {hbold('TrubaVPN')} готов к работе!",
+        f"🚀 {hbold('TrubaVPN')} готов!",
         reply_markup=main_kb(),
-        parse_mode="HTML",
+        parse_mode="HTML"
     )
 
 # ─────────────────────────────────────────────
-#  АДМИН КОМАНДЫ
+#  АДМИН-ПАНЕЛЬ
 # ─────────────────────────────────────────────
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
-    if message.from_user.id not in ADMIN_IDS: return
-    if not command.args or len(command.args.split()) < 2:
-        await message.answer("⚠️ Формат: <code>/give username дни</code>", parse_mode="HTML")
+    if message.from_user.id not in ADMIN_IDS:
         return
-
+    if not command.args:
+        return
     parts = command.args.split()
-    target_username = parts[0].lstrip("@")
-    days = int(parts[1]) if parts[1].lstrip("-").isdigit() else 0
-
-    with db_conn() as conn:
-        row = conn.execute("SELECT user_id FROM users WHERE username = ?", (target_username,)).fetchone()
-
-    if not row:
-        await message.answer(f"❌ Пользователь @{target_username} не найден.")
+    if len(parts) < 2:
         return
-
-    expiry, _ = await activate_subscription(row["user_id"], days)
-    date_str = time.strftime("%d.%m.%Y", time.localtime(expiry))
-    await message.answer(f"✅ @{target_username} выдано {days} дней. До {date_str}")
+    target_username, days = parts[0].lstrip("@"), int(parts[1])
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM users WHERE username = ?",
+            (target_username,)
+        ).fetchone()
+    if row:
+        await activate_subscription(row["user_id"], days)
+        await message.answer(f"✅ Выдано {days} дн. для {target_username}")
 
 @router.message(Command("add_promo"))
 async def add_promo(message: types.Message, command: CommandObject):
-    if message.from_user.id not in ADMIN_IDS: return
-    parts = (command.args or "").split()
-    if len(parts) < 2: return
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not command.args:
+        return
+    parts = command.args.split()
+    if len(parts) < 2:
+        return
     code, days = parts[0].upper(), int(parts[1])
     uses = int(parts[2]) if len(parts) >= 3 else 1
     with db_conn() as conn:
-        conn.execute("INSERT OR REPLACE INTO promos (code, days, uses) VALUES (?, ?, ?)", (code, days, uses))
-    await message.answer(f"✅ Промокод {code} на {days} дн. создан.")
+        conn.execute(
+            "INSERT OR REPLACE INTO promos (code, days, uses) VALUES (?, ?, ?)",
+            (code, days, uses)
+        )
+    await message.answer(f"✅ Промо {code} создан")
 
 @router.message(Command("broadcast"))
 async def broadcast_start(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
+    if message.from_user.id not in ADMIN_IDS:
+        return
     await state.set_state(BroadcastState.waiting_text)
-    await message.answer("📢 Введите текст рассылки. /cancel — отмена.")
+    await message.answer("📢 Введите текст рассылки:")
+
+@router.message(BroadcastState.waiting_text)
+async def broadcast_send(message: types.Message, state: FSMContext):
+    await state.clear()
+    with db_conn() as conn:
+        users = conn.execute("SELECT user_id FROM users").fetchall()
+    ok, fail = 0, 0
+    for row in users:
+        try:
+            await bot.send_message(row["user_id"], message.text)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    await message.answer(f"✅ Готово! Успешно: {ok}, Ошибок: {fail}")
 
 @router.message(Command("stats"))
 async def admin_stats(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return
-    now = int(time.time())
+    if message.from_user.id not in ADMIN_IDS:
+        return
     with db_conn() as conn:
         total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        active = conn.execute("SELECT COUNT(*) FROM users WHERE expiry_date > ?", (now,)).fetchone()[0]
-    await message.answer(f"📊 Всего: {total}\n✅ Активно: {active}")
+        active = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE expiry_date > ?",
+            (int(time.time()),)
+        ).fetchone()[0]
+    await message.answer(f"📊 Всего: {total}\n✅ Активных: {active}")
 
-# ─────────────────────────────────────────────
-#  ЗАПУСК
-# ─────────────────────────────────────────────
 async def main():
     init_db()
     dp.include_router(router)
-    log.info("TrubaVPN Bot starting...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Bot stopped.")
+    asyncio.run(main())
