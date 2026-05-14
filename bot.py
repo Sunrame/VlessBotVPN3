@@ -204,10 +204,10 @@ def _sync_login(s: _requests.Session) -> bool:
 
 
 def _sync_get_inbound(s: _requests.Session) -> tuple[dict | None, int, dict]:
-    """Получает нужный inbound через /panel/api/inbounds."""
+    """Получает нужный inbound через /panel/api/inbounds/list."""
     try:
         res = s.get(
-            f"{PANEL_URL}/panel/api/inbounds",
+            f"{PANEL_URL}/panel/api/inbounds/list",
             headers={"X-Requested-With": "XMLHttpRequest"},
             timeout=15,
             verify=False,
