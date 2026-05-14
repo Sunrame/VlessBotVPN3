@@ -40,6 +40,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
 
 SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
+INBOUND_ID      = int(os.environ.get("INBOUND_ID", "1"))  # ID inbound в 3x-ui — поставьте 2 в .env
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
@@ -88,7 +89,6 @@ def init_db():
                 uses INTEGER DEFAULT 1
             );
         """)
-        # Добавить колонку client_uuid если её нет (для старых БД)
         try:
             conn.execute("ALTER TABLE users ADD COLUMN client_uuid TEXT")
         except Exception:
@@ -99,32 +99,19 @@ def init_db():
 # ─────────────────────────────────────────────
 
 def get_panel_base() -> tuple[str, str]:
-    """
-    Разбирает PANEL_URL вида https://1.2.3.4:54321/secret
-    Возвращает (base_url_with_token, host_with_port)
-    """
     parsed = urlparse(PANEL_URL)
-    host_port = parsed.netloc          # 1.2.3.4:54321
+    host_port = parsed.netloc   # 1.2.3.4:54321
     return PANEL_URL, host_port
 
 
 def build_subscription_url(email: str) -> str:
-    """
-    Subscription URL для Happ / v2rayNG.
-    3x-ui с включённым Subscription отдаёт конфиг по адресу:
-      https://ip:port/<security_token>/sub/<email>
-    """
     return f"{PANEL_URL}/sub/{email}"
 
 
 def build_vless_link(client_id: str, host_port: str, port: int,
                      stream: dict, email: str) -> str:
-    """
-    Строим полноценную VLESS-ссылку из параметров streamSettings inbound.
-    Поддерживает Reality и TLS.
-    """
-    security   = stream.get("security", "none")       # reality / tls / none
-    network    = stream.get("network", "tcp")          # tcp / ws / grpc
+    security = stream.get("security", "none")
+    network  = stream.get("network", "tcp")
 
     params: dict[str, str] = {
         "encryption": "none",
@@ -132,37 +119,31 @@ def build_vless_link(client_id: str, host_port: str, port: int,
         "security":   security,
     }
 
-    # ── Reality ──────────────────────────────
     if security == "reality":
         rs = stream.get("realitySettings", {})
-        params["pbk"] = rs.get("publicKey", "")
-        params["sid"] = rs.get("shortIds", [""])[0] if rs.get("shortIds") else ""
-        params["sni"] = rs.get("serverNames", [""])[0] if rs.get("serverNames") else ""
-        params["fp"]  = rs.get("fingerprint", "chrome")
+        params["pbk"]  = rs.get("publicKey", "")
+        params["sid"]  = rs.get("shortIds", [""])[0] if rs.get("shortIds") else ""
+        params["sni"]  = rs.get("serverNames", [""])[0] if rs.get("serverNames") else ""
+        params["fp"]   = rs.get("fingerprint", "chrome")
         params["flow"] = "xtls-rprx-vision"
-
-    # ── TLS ──────────────────────────────────
     elif security == "tls":
-        ts = stream.get("tlsSettings", {})
+        ts  = stream.get("tlsSettings", {})
         sni = ts.get("serverName", "")
         if sni:
             params["sni"] = sni
         params["fp"] = ts.get("fingerprint", "chrome")
 
-    # ── WebSocket ────────────────────────────
     if network == "ws":
-        ws = stream.get("wsSettings", {})
+        ws   = stream.get("wsSettings", {})
         path = ws.get("path", "/")
         host = ws.get("headers", {}).get("Host", "")
         params["path"] = quote(path, safe="/")
         if host:
             params["host"] = host
-
-    # ── gRPC ─────────────────────────────────
     elif network == "grpc":
         grpc = stream.get("grpcSettings", {})
         params["serviceName"] = grpc.get("serviceName", "")
-        params["mode"]        = grpc.get("multiMode", False) and "multi" or "gun"
+        params["mode"]        = "multi" if grpc.get("multiMode") else "gun"
 
     query = "&".join(f"{k}={v}" for k, v in params.items() if v)
     tag   = quote(f"TrubaVPN-{email}", safe="")
@@ -171,18 +152,109 @@ def build_vless_link(client_id: str, host_port: str, port: int,
     return f"vless://{client_id}@{host}:{port}?{query}#{tag}"
 
 
+def format_key_message(expiry: int, vless_link: str, sub_url: str | None) -> str:
+    date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(expiry))
+
+    if vless_link.startswith("PANEL_ERROR_"):
+        return (
+            f"📅 Подписка до: <b>{date_str}</b>\n\n"
+            "⚠️ Ключ временно недоступен — панель не ответила.\n"
+            f"Напишите в поддержку: {SUPPORT_CONTACT}"
+        )
+
+    lines = [f"📅 Подписка до: <b>{date_str}</b>", "", "━━━━━━━━━━━━━━━━━━━━"]
+
+    if sub_url:
+        lines += [
+            "📲 <b>Ссылка на подписку</b> (рекомендуется):",
+            "<i>Импортируйте в Happ / v2rayNG — конфиг обновится автоматически.</i>",
+            hcode(sub_url),
+            "",
+        ]
+
+    lines += [
+        "🔑 <b>VLESS-ключ</b> (вручную):",
+        hcode(vless_link),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📖 Как подключиться: {CHANNEL_LINK}",
+    ]
+
+    return "\n".join(lines)
+
+
 # ─────────────────────────────────────────────
 #  3X-UI PANEL API
 # ─────────────────────────────────────────────
+
+async def _get_inbound(s: aiohttp.ClientSession) -> tuple[dict | None, int, dict]:
+    """
+    Ищет нужный inbound по INBOUND_ID на всех известных эндпоинтах.
+    Возвращает (inbound_dict, port, stream_settings).
+    """
+    inbound_paths = [
+        "/panel/inbound/list",
+        "/panel/api/inbounds",
+        "/xui/API/inbounds",
+        "/xui/inbounds",
+    ]
+
+    for path in inbound_paths:
+        try:
+            r   = await s.get(f"{PANEL_URL}{path}")
+            raw = await r.text()
+            log.info("[Panel] %s → status=%d body=%s", path, r.status, raw[:300])
+
+            if raw.startswith("<!") or not raw:
+                log.info("[Panel] %s → HTML или пустой ответ, пропускаем", path)
+                continue
+
+            data = json.loads(raw)
+
+            inbounds = None
+            if isinstance(data, dict):
+                inbounds = data.get("obj") or data.get("inbounds")
+            elif isinstance(data, list):
+                inbounds = data
+
+            if not inbounds or not isinstance(inbounds, list):
+                log.info("[Panel] %s → inbounds не найдены в ответе", path)
+                continue
+
+            log.info("[Panel] %s → найдено %d inbound(s): ids=%s",
+                     path, len(inbounds), [x.get("id") for x in inbounds])
+
+            # Ищем нужный по INBOUND_ID, fallback — первый
+            ib = next((x for x in inbounds if x.get("id") == INBOUND_ID), None)
+            if not ib:
+                log.warning("[Panel] inbound id=%d не найден среди %s, берём первый",
+                            INBOUND_ID, [x.get("id") for x in inbounds])
+                ib = inbounds[0]
+
+            port       = ib.get("port", 443)
+            raw_stream = ib.get("streamSettings", "{}")
+            stream     = json.loads(raw_stream) if isinstance(raw_stream, str) else (raw_stream or {})
+
+            log.info("[Panel] Используем inbound id=%s port=%s security=%s network=%s",
+                     ib.get("id"), port, stream.get("security"), stream.get("network"))
+            return ib, port, stream
+
+        except json.JSONDecodeError:
+            log.info("[Panel] %s → не JSON", path)
+        except Exception as e:
+            log.info("[Panel] %s → ошибка %s: %s", path, type(e).__name__, e)
+
+    return None, 443, {}
+
 
 async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str | None, str | None]:
     """
     Создаёт VLESS-клиента в 3x-ui.
     Возвращает (vless_link, sub_url, client_uuid) или (None, None, None).
     """
-    email      = f"truba_{user_id}"
-    client_id  = str(uuid.uuid4())
-    expire_ms  = int((time.time() + days * 86400) * 1000)
+    email     = f"truba_{user_id}"
+    client_id = str(uuid.uuid4())
+    expire_ms = int((time.time() + days * 86400) * 1000)
     _, host_port = get_panel_base()
 
     jar     = aiohttp.CookieJar(unsafe=True)
@@ -210,54 +282,13 @@ async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str 
                 return None, None, None
             log.info("[Panel] Login OK")
 
-            # ── GET INBOUNDS ─────────────────────────
-            inbound_paths = [
-                "/panel/inbound/list",
-                "/panel/api/inbounds",
-                "/xui/API/inbounds",
-                "/xui/inbounds",
-            ]
-
-            inbound_id = None
-            port       = 443
-            stream     = {}
-
-            for path in inbound_paths:
-                try:
-                    r   = await s.get(f"{PANEL_URL}{path}")
-                    raw = await r.text()
-
-                    if raw.startswith("<!") or not raw:
-                        continue
-
-                    data = json.loads(raw)
-
-                    inbounds = None
-                    if isinstance(data, dict):
-                        inbounds = data.get("obj") or data.get("inbounds")
-                    elif isinstance(data, list):
-                        inbounds = data
-
-                    if inbounds and isinstance(inbounds, list):
-                        ib         = inbounds[0]
-                        inbound_id = ib.get("id")
-                        port       = ib.get("port", 443)
-                        # Читаем streamSettings для построения правильной ссылки
-                        raw_stream = ib.get("streamSettings", "{}")
-                        if isinstance(raw_stream, str):
-                            stream = json.loads(raw_stream) if raw_stream else {}
-                        else:
-                            stream = raw_stream or {}
-                        log.info("[Panel] Inbound id=%s port=%s security=%s network=%s",
-                                 inbound_id, port,
-                                 stream.get("security"), stream.get("network"))
-                        break
-                except Exception as e:
-                    log.debug("[Panel] %s: %s", path, e)
-
-            if not inbound_id:
-                log.error("[Panel] No inbound found")
+            # ── GET INBOUND ──────────────────────────
+            ib, port, stream = await _get_inbound(s)
+            if not ib:
+                log.error("[Panel] No inbound found ни на одном из путей")
                 return None, None, None
+
+            inbound_id = ib.get("id")
 
             # ── ADD CLIENT ───────────────────────────
             flow = "xtls-rprx-vision" if stream.get("security") == "reality" else ""
@@ -288,9 +319,9 @@ async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str 
                         log.info("[Panel] addClient OK via %s", add_path)
                         add_ok = True
                         break
-                    log.debug("[Panel] addClient %s: %s", add_path, resp)
+                    log.info("[Panel] addClient %s → %s", add_path, resp)
                 except Exception as e:
-                    log.debug("[Panel] addClient %s error: %s", add_path, e)
+                    log.info("[Panel] addClient %s → ошибка: %s", add_path, e)
 
             if not add_ok:
                 log.error("[Panel] addClient failed")
@@ -299,9 +330,7 @@ async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str 
             # ── BUILD LINKS ──────────────────────────
             vless_link = build_vless_link(client_id, host_port, port, stream, email)
             sub_url    = build_subscription_url(email)
-
-            log.info("[Panel] VLESS link built OK")
-            log.info("[Panel] Sub URL: %s", sub_url)
+            log.info("[Panel] VLESS OK | Sub: %s", sub_url)
             return vless_link, sub_url, client_id
 
     except Exception:
@@ -324,44 +353,36 @@ async def panel_extend_client(client_uuid: str, extra_days: int) -> bool:
             if not (await r.json(content_type=None)).get("success"):
                 return False
 
-            paths = ["/panel/inbound/list", "/panel/api/inbounds",
-                     "/xui/API/inbounds", "/xui/inbounds"]
-            for path in paths:
-                try:
-                    r    = await s.get(f"{PANEL_URL}{path}")
-                    data = json.loads(await r.text())
+            ib, _, _ = await _get_inbound(s)
+            if not ib:
+                return False
 
-                    obj_list = (data.get("obj") if isinstance(data, dict)
-                                else data if isinstance(data, list) else [])
+            raw_settings = ib.get("settings", "{}")
+            settings = json.loads(raw_settings) if isinstance(raw_settings, str) else raw_settings
 
-                    for ib in (obj_list or []):
-                        raw_settings = ib.get("settings", "{}")
-                        settings = json.loads(raw_settings) if isinstance(raw_settings, str) else raw_settings
-                        for client in settings.get("clients", []):
-                            if client.get("id") == client_uuid:
-                                now_ms       = int(time.time() * 1000)
-                                current_exp  = client.get("expiryTime", now_ms)
-                                client["expiryTime"] = max(current_exp, now_ms) + extra_days * 86400_000
+            for client in settings.get("clients", []):
+                if client.get("id") == client_uuid:
+                    now_ms            = int(time.time() * 1000)
+                    current_exp       = client.get("expiryTime", now_ms)
+                    client["expiryTime"] = max(current_exp, now_ms) + extra_days * 86_400_000
 
-                                upd_payload = {
-                                    "id":       ib["id"],
-                                    "settings": json.dumps({"clients": [client]}),
-                                }
-                                update_paths = [
-                                    f"/panel/inbound/updateClient/{client_uuid}",
-                                    f"/xui/inbound/updateClient/{client_uuid}",
-                                ]
-                                for up in update_paths:
-                                    try:
-                                        r2   = await s.post(f"{PANEL_URL}{up}", json=upd_payload)
-                                        resp = await r2.json(content_type=None)
-                                        if resp.get("success"):
-                                            log.info("[Panel] Extended client %s", client_uuid)
-                                            return True
-                                    except Exception:
-                                        pass
-                except Exception:
-                    pass
+                    upd_payload = {
+                        "id":       ib["id"],
+                        "settings": json.dumps({"clients": [client]}),
+                    }
+                    for up in [
+                        f"/panel/inbound/updateClient/{client_uuid}",
+                        f"/xui/inbound/updateClient/{client_uuid}",
+                    ]:
+                        try:
+                            r2   = await s.post(f"{PANEL_URL}{up}", json=upd_payload)
+                            resp = await r2.json(content_type=None)
+                            if resp.get("success"):
+                                log.info("[Panel] Extended client %s", client_uuid)
+                                return True
+                        except Exception:
+                            pass
+
     except Exception:
         pass
 
@@ -373,16 +394,12 @@ async def panel_extend_client(client_uuid: str, extra_days: int) -> bool:
 # ─────────────────────────────────────────────
 
 async def activate_subscription(user_id: int, days: int):
-    """
-    Активирует/продлевает подписку.
-    Возвращает (new_expiry, vless_link, sub_url).
-    """
     now   = int(time.time())
     delta = days * 86400
 
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT expiry_date, sub_token, client_uuid FROM users WHERE user_id = ?",
+            "SELECT expiry_date, sub_token, client_uuid FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
 
@@ -390,22 +407,18 @@ async def activate_subscription(user_id: int, days: int):
         token          = row["sub_token"]   if row and row["sub_token"]   else None
         client_uuid    = row["client_uuid"] if row and row["client_uuid"] else None
         new_expiry     = max(current_expiry, now) + delta
-
-        sub_url = None
+        sub_url        = None
 
         if client_uuid:
-            # Клиент уже существует — продлеваем
             ok = await panel_extend_client(client_uuid, days)
             if ok:
-                # sub_url не меняется — он привязан к email
                 email   = f"truba_{user_id}"
                 sub_url = build_subscription_url(email)
             else:
-                log.warning("[Sub] Could not extend client %s, will recreate", client_uuid)
+                log.warning("[Sub] Не удалось продлить клиента %s, пересоздаём", client_uuid)
                 client_uuid = None
 
         if not client_uuid:
-            # Создаём нового клиента
             vless_link, sub_url, client_uuid = await panel_create_client(user_id, days)
             if not vless_link:
                 vless_link  = f"PANEL_ERROR_{uuid.uuid4().hex[:8]}"
@@ -438,42 +451,6 @@ def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
     ])
-
-
-def format_key_message(expiry: int, vless_link: str, sub_url: str | None) -> str:
-    """Формирует красивое сообщение с ключами для пользователя."""
-    date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(expiry))
-
-    if vless_link.startswith("PANEL_ERROR_"):
-        return (
-            f"📅 Подписка до: <b>{date_str}</b>\n\n"
-            "⚠️ Ключ временно недоступен — панель не ответила.\n"
-            f"Напишите в поддержку: {SUPPORT_CONTACT}"
-        )
-
-    lines = [
-        f"📅 Подписка до: <b>{date_str}</b>",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    if sub_url:
-        lines += [
-            "📲 <b>Ссылка на подписку</b> (рекомендуется):",
-            "<i>Импортируйте её в Happ / v2rayNG одним нажатием — конфиг обновится автоматически.</i>",
-            hcode(sub_url),
-            "",
-        ]
-
-    lines += [
-        "🔑 <b>VLESS-ключ</b> (вручную):",
-        hcode(vless_link),
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"📖 Как подключиться: {CHANNEL_LINK}",
-    ]
-
-    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
@@ -581,8 +558,8 @@ async def check_payment(cb: CallbackQuery):
 
         if row and row["referrer_id"] and row["has_paid"] == 0:
             ref_id = row["referrer_id"]
-            await activate_subscription(u_id,    7)
-            await activate_subscription(ref_id,  7)
+            await activate_subscription(u_id,   7)
+            await activate_subscription(ref_id, 7)
             try:
                 await bot.send_message(
                     ref_id,
@@ -670,13 +647,10 @@ async def profile_tab(cb: CallbackQuery):
         date_str  = time.strftime("%d.%m.%Y", time.localtime(row["expiry_date"]))
         token     = row["sub_token"] or ""
 
-        # Ссылка на подписку
         if row["client_uuid"]:
-            email   = f"truba_{cb.from_user.id}"
-            sub_url = build_subscription_url(email)
-            sub_line = (
-                f"\n\n📲 <b>Ссылка на подписку</b> (для Happ):\n{hcode(sub_url)}"
-            )
+            email    = f"truba_{cb.from_user.id}"
+            sub_url  = build_subscription_url(email)
+            sub_line = f"\n\n📲 <b>Ссылка на подписку</b> (для Happ):\n{hcode(sub_url)}"
         else:
             sub_line = ""
 
@@ -736,7 +710,7 @@ async def info_tab(cb: CallbackQuery):
     await cb.message.edit_text(
         "📖 <b>Информация и документы:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Канал с инструкциями",       url=CHANNEL_LINK)],
+            [InlineKeyboardButton(text="📢 Канал с инструкциями",        url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="📜 Пользовательское соглашение",
                                   url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
             [InlineKeyboardButton(text="🛡 Политика конфиденциальности",
@@ -889,7 +863,7 @@ async def admin_stats(message: types.Message):
 async def main():
     init_db()
     dp.include_router(router)
-    log.info("TrubaVPN Bot starting...")
+    log.info("TrubaVPN Bot starting... INBOUND_ID=%d", INBOUND_ID)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
