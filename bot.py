@@ -5,7 +5,7 @@ import time
 import sqlite3
 import asyncio
 import urllib3
-import aiohttp
+import requests as _requests
 import json
 from urllib.parse import quote, urlparse
 
@@ -50,15 +50,6 @@ TARIFFS: dict = {
     "2_dev": {"name": "📱📱 2 устройства",     "price": 179, "days": 30, "desc": "179 ₽ / 30 дней"},
     "5_dev": {"name": "💻 5 устройств",        "price": 349, "days": 30, "desc": "349 ₽ / 30 дней"},
 }
-
-# Все известные пути к списку inbound-ов в разных версиях 3x-ui
-INBOUND_PATHS = [
-    "/panel/API/inbounds",      # 3x-ui v2+ REST API (capital API)
-    "/panel/api/inbounds",      # lowercase fallback
-    "/panel/inbound/list",      # older builds
-    "/xui/API/inbounds",        # legacy xui
-    "/xui/inbounds",            # legacy xui (возвращает HTML без авторизации)
-]
 
 class PromoState(StatesGroup):
     waiting_code = State()
@@ -193,253 +184,177 @@ def format_key_message(expiry: int, vless_link: str, sub_url: str | None) -> str
 
 
 # ─────────────────────────────────────────────
-#  3X-UI PANEL API
+#  3X-UI PANEL API  (sync requests inside executor)
 # ─────────────────────────────────────────────
 
-async def _panel_login(s: aiohttp.ClientSession) -> bool:
-    """
-    Логинится в 3x-ui. allow_redirects=False нужен чтобы куки
-    не терялись при промежуточном 302-редиректе.
-    """
-    login_url = f"{PANEL_URL}/login"
+def _sync_login(s: _requests.Session) -> bool:
     try:
-        r   = await s.post(
-            login_url,
+        res = s.post(
+            f"{PANEL_URL}/login",
             data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD},
-            allow_redirects=False,
+            timeout=15,
+            verify=False,
         )
-        raw = await r.text()
-        log.info("[Panel] Login status=%d body=%s", r.status, raw[:200])
-
-        # Успех — JSON {"success": true}
-        try:
-            resp = json.loads(raw)
-            if resp.get("success"):
-                log.info("[Panel] Login OK (JSON)")
-                return True
-        except Exception:
-            pass
-
-        # Успех — 302/303 редирект (куки уже сохранены в jar)
-        if r.status in (302, 303):
-            log.info("[Panel] Login OK (redirect %d)", r.status)
-            return True
-
-        log.error("[Panel] Login failed: status=%d body=%s", r.status, raw[:300])
-        return False
+        ok = res.status_code == 200 and res.json().get("success")
+        log.info("[Panel] Login → %s", ok)
+        return ok
     except Exception as e:
-        log.exception("[Panel] Login exception: %s", e)
+        log.error("[Panel] Login error: %s", e)
         return False
 
 
-async def _get_inbound(s: aiohttp.ClientSession) -> tuple[dict | None, int, dict]:
-    """
-    Ищет нужный inbound по INBOUND_ID на всех известных эндпоинтах.
-    Возвращает (inbound_dict, port, stream_settings).
-    Должна вызываться с уже авторизованной сессией s.
-    """
-    for path in INBOUND_PATHS:
-        try:
-            r   = await s.get(f"{PANEL_URL}{path}")
-            raw = await r.text()
+def _sync_get_inbound(s: _requests.Session) -> tuple[dict | None, int, dict]:
+    """Получает нужный inbound через /panel/api/inbounds."""
+    try:
+        res = s.get(
+            f"{PANEL_URL}/panel/api/inbounds",
+            headers={"X-Requested-With": "XMLHttpRequest"},
+            timeout=15,
+            verify=False,
+        )
+        log.info("[Panel] GET inbounds → %d | %s", res.status_code, res.text[:200])
+        data = res.json()
 
-            log.info("[Panel] %s → status=%d body_start=%s",
-                     path, r.status, raw[:120].replace("\n", " "))
+        inbounds = None
+        if isinstance(data, list):
+            inbounds = data
+        elif isinstance(data, dict):
+            for key in ("obj", "inbounds", "data"):
+                if isinstance(data.get(key), list):
+                    inbounds = data[key]
+                    break
 
-            # Пропускаем не-200 и HTML-ответы (редирект на логин без авторизации)
-            if r.status != 200:
-                log.info("[Panel] %s → non-200, skipping", path)
-                continue
+        if not inbounds:
+            log.error("[Panel] inbounds not found in response: %s", data)
+            return None, 443, {}
 
-            stripped = raw.lstrip()
-            if stripped.startswith("<") or not stripped:
-                log.info("[Panel] %s → HTML or empty body (session not carried?), skipping", path)
-                continue
+        ib = next((x for x in inbounds if x.get("id") == INBOUND_ID), None)
+        if not ib:
+            log.warning("[Panel] inbound id=%d not found, using first. ids=%s",
+                        INBOUND_ID, [x.get("id") for x in inbounds])
+            ib = inbounds[0]
 
-            # Парсим JSON
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                log.info("[Panel] %s → not valid JSON, skipping", path)
-                continue
+        port       = ib.get("port", 443)
+        raw_stream = ib.get("streamSettings", "{}")
+        stream     = json.loads(raw_stream) if isinstance(raw_stream, str) else (raw_stream or {})
 
-            # Ищем список inbound-ов в разных форматах ответа
-            inbounds = None
-            if isinstance(data, list):
-                inbounds = data
-            elif isinstance(data, dict):
-                # {"success": true, "obj": [...]}  или  {"inbounds": [...]}  или  {"data": [...]}
-                for key in ("obj", "inbounds", "data"):
-                    if isinstance(data.get(key), list):
-                        inbounds = data[key]
-                        break
+        log.info("[Panel] inbound id=%s port=%s security=%s network=%s",
+                 ib.get("id"), port, stream.get("security"), stream.get("network"))
+        return ib, port, stream
 
-            if not inbounds:
-                log.info("[Panel] %s → could not locate inbounds list in: %s",
-                         path, str(data)[:200])
-                continue
-
-            log.info("[Panel] %s → found %d inbound(s), ids=%s",
-                     path, len(inbounds), [x.get("id") for x in inbounds])
-
-            # Ищем нужный по INBOUND_ID, fallback — первый
-            ib = next((x for x in inbounds if x.get("id") == INBOUND_ID), None)
-            if not ib:
-                log.warning(
-                    "[Panel] inbound id=%d not found among %s — using first",
-                    INBOUND_ID, [x.get("id") for x in inbounds],
-                )
-                ib = inbounds[0]
-
-            port       = ib.get("port", 443)
-            raw_stream = ib.get("streamSettings", "{}")
-            stream     = (
-                json.loads(raw_stream)
-                if isinstance(raw_stream, str)
-                else (raw_stream or {})
-            )
-
-            log.info(
-                "[Panel] Using inbound id=%s port=%s security=%s network=%s",
-                ib.get("id"), port,
-                stream.get("security"), stream.get("network"),
-            )
-            return ib, port, stream
-
-        except Exception as e:
-            log.info("[Panel] %s → unexpected error %s: %s", path, type(e).__name__, e)
-
-    log.error("[Panel] _get_inbound: all paths exhausted, inbound not found")
-    return None, 443, {}
+    except Exception as e:
+        log.error("[Panel] _sync_get_inbound error: %s", e)
+        return None, 443, {}
 
 
-async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str | None, str | None]:
-    """
-    Создаёт VLESS-клиента в 3x-ui.
-    Возвращает (vless_link, sub_url, client_uuid) или (None, None, None).
-    """
-    email     = f"truba_{user_id}"
-    client_id = str(uuid.uuid4())
-    expire_ms = int((time.time() + days * 86400) * 1000)
+def _sync_create_client(user_id: int, days: int) -> tuple[str | None, str | None, str | None]:
+    s = _requests.Session()
+    if not _sync_login(s):
+        return None, None, None
+
+    ib, port, stream = _sync_get_inbound(s)
+    if not ib:
+        return None, None, None
+
     _, host_port = get_panel_base()
+    email     = f"truba_{user_id}"
+    client_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_{user_id}"))  # стабильный UUID
+    expire_ms = int((time.time() + days * 86400) * 1000)
+    flow      = "xtls-rprx-vision" if stream.get("security") == "reality" else ""
 
-    jar     = aiohttp.CookieJar(unsafe=True)
-    timeout = aiohttp.ClientTimeout(total=30)
+    client_obj = {
+        "id":         client_id,
+        "email":      email,
+        "expiryTime": expire_ms,
+        "enable":     True,
+        "flow":       flow,
+        "limitIp":    0,
+        "totalGB":    0,
+        "tgId":       str(user_id),
+        "subId":      uuid.uuid4().hex[:12],
+    }
+    payload = {
+        "id":       ib["id"],
+        "settings": json.dumps({"clients": [client_obj]}),
+    }
 
     try:
-        async with aiohttp.ClientSession(
-            cookie_jar=jar, timeout=timeout,
-            connector=aiohttp.TCPConnector(ssl=False),
-        ) as s:
-
-            # ── LOGIN ────────────────────────────────
-            log.info("[Panel] Creating client for user %d", user_id)
-            if not await _panel_login(s):
-                return None, None, None
-
-            # ── GET INBOUND ──────────────────────────
-            ib, port, stream = await _get_inbound(s)
-            if not ib:
-                log.error("[Panel] No inbound found")
-                return None, None, None
-
-            inbound_id = ib.get("id")
-
-            # ── ADD CLIENT ───────────────────────────
-            flow = "xtls-rprx-vision" if stream.get("security") == "reality" else ""
-            client_obj = {
-                "id":         client_id,
-                "email":      email,
-                "expiryTime": expire_ms,
-                "enable":     True,
-                "flow":       flow,
-                "limitIp":    0,
-                "totalGB":    0,
-            }
-            payload = {
-                "id":       inbound_id,
-                "settings": json.dumps({"clients": [client_obj]}),
-            }
-
-            add_paths = [
-                "/panel/inbound/addClient",
-                "/xui/inbound/addClient",
-            ]
-            add_ok = False
-            for add_path in add_paths:
-                try:
-                    r    = await s.post(f"{PANEL_URL}{add_path}", json=payload)
-                    resp = json.loads(await r.text())
-                    if resp.get("success"):
-                        log.info("[Panel] addClient OK via %s", add_path)
-                        add_ok = True
-                        break
-                    log.info("[Panel] addClient %s → %s", add_path, resp)
-                except Exception as e:
-                    log.info("[Panel] addClient %s → ошибка: %s", add_path, e)
-
-            if not add_ok:
-                log.error("[Panel] addClient failed")
-                return None, None, None
-
-            # ── BUILD LINKS ──────────────────────────
-            vless_link = build_vless_link(client_id, host_port, port, stream, email)
-            sub_url    = build_subscription_url(email)
-            log.info("[Panel] VLESS OK | Sub: %s", sub_url)
-            return vless_link, sub_url, client_id
-
-    except Exception:
-        log.exception("[Panel] Unexpected error")
+        res = s.post(
+            f"{PANEL_URL}/panel/api/inbounds/addClient",
+            json=payload,
+            headers={"X-Requested-With": "XMLHttpRequest"},
+            timeout=15,
+            verify=False,
+        )
+        log.info("[Panel] addClient → %d | %s", res.status_code, res.text[:200])
+        resp = res.json()
+        if not resp.get("success") and "already exists" not in res.text:
+            log.error("[Panel] addClient failed: %s", resp)
+            return None, None, None
+    except Exception as e:
+        log.error("[Panel] addClient error: %s", e)
         return None, None, None
+
+    vless_link = build_vless_link(client_id, host_port, port, stream, email)
+    sub_url    = build_subscription_url(email)
+    log.info("[Panel] Client created | sub=%s", sub_url)
+    return vless_link, sub_url, client_id
+
+
+def _sync_extend_client(client_uuid: str, extra_days: int) -> bool:
+    s = _requests.Session()
+    if not _sync_login(s):
+        return False
+
+    ib, _, _ = _sync_get_inbound(s)
+    if not ib:
+        return False
+
+    raw_settings = ib.get("settings", "{}")
+    settings = json.loads(raw_settings) if isinstance(raw_settings, str) else raw_settings
+
+    for client in settings.get("clients", []):
+        if client.get("id") == client_uuid:
+            now_ms               = int(time.time() * 1000)
+            current_exp          = client.get("expiryTime", now_ms)
+            client["expiryTime"] = max(current_exp, now_ms) + extra_days * 86_400_000
+
+            payload = {
+                "id":       ib["id"],
+                "settings": json.dumps({"clients": [client]}),
+            }
+            try:
+                res = s.post(
+                    f"{PANEL_URL}/panel/api/inbounds/updateClient/{client_uuid}",
+                    json=payload,
+                    headers={"X-Requested-With": "XMLHttpRequest"},
+                    timeout=15,
+                    verify=False,
+                )
+                log.info("[Panel] updateClient → %d | %s", res.status_code, res.text[:200])
+                if res.json().get("success"):
+                    return True
+            except Exception as e:
+                log.error("[Panel] updateClient error: %s", e)
+
+    log.error("[Panel] client %s not found in inbound settings", client_uuid)
+    return False
+
+
+# Async-обёртки (запускают sync-функции в threadpool)
+async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str | None, str | None]:
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _sync_create_client, user_id, days
+    )
 
 
 async def panel_extend_client(client_uuid: str, extra_days: int) -> bool:
-    """Продлевает срок действия клиента по его UUID."""
-    jar     = aiohttp.CookieJar(unsafe=True)
-    timeout = aiohttp.ClientTimeout(total=30)
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _sync_extend_client, client_uuid, extra_days
+    )
 
-    try:
-        async with aiohttp.ClientSession(
-            cookie_jar=jar, timeout=timeout,
-            connector=aiohttp.TCPConnector(ssl=False),
-        ) as s:
-            if not await _panel_login(s):
-                return False
 
-            ib, _, _ = await _get_inbound(s)
-            if not ib:
-                return False
-
-            raw_settings = ib.get("settings", "{}")
-            settings = json.loads(raw_settings) if isinstance(raw_settings, str) else raw_settings
-
-            for client in settings.get("clients", []):
-                if client.get("id") == client_uuid:
-                    now_ms            = int(time.time() * 1000)
-                    current_exp       = client.get("expiryTime", now_ms)
-                    client["expiryTime"] = max(current_exp, now_ms) + extra_days * 86_400_000
-
-                    upd_payload = {
-                        "id":       ib["id"],
-                        "settings": json.dumps({"clients": [client]}),
-                    }
-                    for up in [
-                        f"/panel/inbound/updateClient/{client_uuid}",
-                        f"/xui/inbound/updateClient/{client_uuid}",
-                    ]:
-                        try:
-                            r2   = await s.post(f"{PANEL_URL}{up}", json=upd_payload)
-                            resp = await r2.json(content_type=None)
-                            if resp.get("success"):
-                                log.info("[Panel] Extended client %s", client_uuid)
-                                return True
-                        except Exception:
-                            pass
-
-    except Exception:
-        pass
-
-    return False
+    pass  # replaced by sync versions below
 
 
 # ─────────────────────────────────────────────
@@ -889,8 +804,51 @@ async def broadcast_send(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Рассылка завершена.\nОтправлено: {ok} | Ошибок: {fail}")
 
 
-@router.message(Command("stats"))
-async def admin_stats(message: types.Message):
+@router.message(Command("panel_check"))
+async def admin_panel_check(message: types.Message):
+    """Диагностика: перебирает все возможные пути панели и показывает результат."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    await message.answer("🔍 Проверяю пути панели, подождите...")
+
+    test_paths = [
+        "/panel/api/inbounds",
+        "/panel/inbounds",
+        "/panel/API/inbounds",
+        "/panel/inbound/list",
+        "/xui/API/inbounds",
+        "/xui/inbounds",
+        "/api/inbounds",
+    ]
+
+    def _check():
+        lines = []
+        s = _requests.Session()
+        ok = _sync_login(s)
+        lines.append(f"{'✅' if ok else '❌'} Login: {'OK' if ok else 'FAILED'}")
+        for path in test_paths:
+            try:
+                r       = s.get(f"{PANEL_URL}{path}",
+                                headers={"X-Requested-With": "XMLHttpRequest"},
+                                timeout=10, verify=False)
+                snippet = r.text.strip()[:100].replace("\n", " ")
+                is_html = snippet.lstrip().startswith("<")
+                icon    = "🟢" if r.status_code == 200 and not is_html else (
+                          "🟡" if r.status_code == 200 else "🔴")
+                lines.append(f"{icon} {path}\n   → {r.status_code} | {snippet}")
+            except Exception as e:
+                lines.append(f"💥 {path}\n   → {type(e).__name__}: {e}")
+        return lines
+
+    lines = await asyncio.get_event_loop().run_in_executor(None, _check)
+    await message.answer(
+        "<b>Panel diagnostics:</b>\n\n" + "\n\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+
     if message.from_user.id not in ADMIN_IDS:
         return
     now = int(time.time())
