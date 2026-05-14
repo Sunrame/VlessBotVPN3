@@ -196,6 +196,42 @@ def format_key_message(expiry: int, vless_link: str, sub_url: str | None) -> str
 #  3X-UI PANEL API
 # ─────────────────────────────────────────────
 
+async def _panel_login(s: aiohttp.ClientSession) -> bool:
+    """
+    Логинится в 3x-ui. allow_redirects=False нужен чтобы куки
+    не терялись при промежуточном 302-редиректе.
+    """
+    login_url = f"{PANEL_URL}/login"
+    try:
+        r   = await s.post(
+            login_url,
+            data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD},
+            allow_redirects=False,
+        )
+        raw = await r.text()
+        log.info("[Panel] Login status=%d body=%s", r.status, raw[:200])
+
+        # Успех — JSON {"success": true}
+        try:
+            resp = json.loads(raw)
+            if resp.get("success"):
+                log.info("[Panel] Login OK (JSON)")
+                return True
+        except Exception:
+            pass
+
+        # Успех — 302/303 редирект (куки уже сохранены в jar)
+        if r.status in (302, 303):
+            log.info("[Panel] Login OK (redirect %d)", r.status)
+            return True
+
+        log.error("[Panel] Login failed: status=%d body=%s", r.status, raw[:300])
+        return False
+    except Exception as e:
+        log.exception("[Panel] Login exception: %s", e)
+        return False
+
+
 async def _get_inbound(s: aiohttp.ClientSession) -> tuple[dict | None, int, dict]:
     """
     Ищет нужный inbound по INBOUND_ID на всех известных эндпоинтах.
@@ -298,19 +334,8 @@ async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str 
 
             # ── LOGIN ────────────────────────────────
             log.info("[Panel] Creating client for user %d", user_id)
-            r   = await s.post(f"{PANEL_URL}/login",
-                               data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
-            raw = await r.text()
-            try:
-                resp = json.loads(raw)
-            except Exception:
-                log.error("[Panel] Login: invalid JSON: %s", raw[:200])
+            if not await _panel_login(s):
                 return None, None, None
-
-            if not resp.get("success"):
-                log.error("[Panel] Login failed: %s", resp)
-                return None, None, None
-            log.info("[Panel] Login OK")
 
             # ── GET INBOUND ──────────────────────────
             ib, port, stream = await _get_inbound(s)
@@ -378,9 +403,7 @@ async def panel_extend_client(client_uuid: str, extra_days: int) -> bool:
             cookie_jar=jar, timeout=timeout,
             connector=aiohttp.TCPConnector(ssl=False),
         ) as s:
-            r = await s.post(f"{PANEL_URL}/login",
-                             data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD})
-            if not (await r.json(content_type=None)).get("success"):
+            if not await _panel_login(s):
                 return False
 
             ib, _, _ = await _get_inbound(s)
@@ -901,4 +924,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Bot stopped.")
-
