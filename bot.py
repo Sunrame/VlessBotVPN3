@@ -40,7 +40,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
 
 SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
-INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))  # ID inbound в 3x-ui — поставьте 2 в .env
+INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))  # ID inbound в 3x-ui
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
@@ -50,6 +50,15 @@ TARIFFS: dict = {
     "2_dev": {"name": "📱📱 2 устройства",     "price": 179, "days": 30, "desc": "179 ₽ / 30 дней"},
     "5_dev": {"name": "💻 5 устройств",        "price": 349, "days": 30, "desc": "349 ₽ / 30 дней"},
 }
+
+# Все известные пути к списку inbound-ов в разных версиях 3x-ui
+INBOUND_PATHS = [
+    "/panel/API/inbounds",      # 3x-ui v2+ REST API (capital API)
+    "/panel/api/inbounds",      # lowercase fallback
+    "/panel/inbound/list",      # older builds
+    "/xui/API/inbounds",        # legacy xui
+    "/xui/inbounds",            # legacy xui (возвращает HTML без авторизации)
+]
 
 class PromoState(StatesGroup):
     waiting_code = State()
@@ -191,59 +200,80 @@ async def _get_inbound(s: aiohttp.ClientSession) -> tuple[dict | None, int, dict
     """
     Ищет нужный inbound по INBOUND_ID на всех известных эндпоинтах.
     Возвращает (inbound_dict, port, stream_settings).
+    Должна вызываться с уже авторизованной сессией s.
     """
-    inbound_paths = [
-        "/panel/inbound/list",
-        "/panel/api/inbounds",
-        "/xui/API/inbounds",
-        "/xui/inbounds",
-    ]
-
-    for path in inbound_paths:
+    for path in INBOUND_PATHS:
         try:
             r   = await s.get(f"{PANEL_URL}{path}")
             raw = await r.text()
-            log.info("[Panel] %s → status=%d body=%s", path, r.status, raw[:300])
 
-            if raw.startswith("<!") or not raw:
-                log.info("[Panel] %s → HTML или пустой ответ, пропускаем", path)
+            log.info("[Panel] %s → status=%d body_start=%s",
+                     path, r.status, raw[:120].replace("\n", " "))
+
+            # Пропускаем не-200 и HTML-ответы (редирект на логин без авторизации)
+            if r.status != 200:
+                log.info("[Panel] %s → non-200, skipping", path)
                 continue
 
-            data = json.loads(raw)
+            stripped = raw.lstrip()
+            if stripped.startswith("<") or not stripped:
+                log.info("[Panel] %s → HTML or empty body (session not carried?), skipping", path)
+                continue
 
+            # Парсим JSON
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                log.info("[Panel] %s → not valid JSON, skipping", path)
+                continue
+
+            # Ищем список inbound-ов в разных форматах ответа
             inbounds = None
-            if isinstance(data, dict):
-                inbounds = data.get("obj") or data.get("inbounds")
-            elif isinstance(data, list):
+            if isinstance(data, list):
                 inbounds = data
+            elif isinstance(data, dict):
+                # {"success": true, "obj": [...]}  или  {"inbounds": [...]}  или  {"data": [...]}
+                for key in ("obj", "inbounds", "data"):
+                    if isinstance(data.get(key), list):
+                        inbounds = data[key]
+                        break
 
-            if not inbounds or not isinstance(inbounds, list):
-                log.info("[Panel] %s → inbounds не найдены в ответе", path)
+            if not inbounds:
+                log.info("[Panel] %s → could not locate inbounds list in: %s",
+                         path, str(data)[:200])
                 continue
 
-            log.info("[Panel] %s → найдено %d inbound(s): ids=%s",
+            log.info("[Panel] %s → found %d inbound(s), ids=%s",
                      path, len(inbounds), [x.get("id") for x in inbounds])
 
             # Ищем нужный по INBOUND_ID, fallback — первый
             ib = next((x for x in inbounds if x.get("id") == INBOUND_ID), None)
             if not ib:
-                log.warning("[Panel] inbound id=%d не найден среди %s, берём первый",
-                            INBOUND_ID, [x.get("id") for x in inbounds])
+                log.warning(
+                    "[Panel] inbound id=%d not found among %s — using first",
+                    INBOUND_ID, [x.get("id") for x in inbounds],
+                )
                 ib = inbounds[0]
 
             port       = ib.get("port", 443)
             raw_stream = ib.get("streamSettings", "{}")
-            stream     = json.loads(raw_stream) if isinstance(raw_stream, str) else (raw_stream or {})
+            stream     = (
+                json.loads(raw_stream)
+                if isinstance(raw_stream, str)
+                else (raw_stream or {})
+            )
 
-            log.info("[Panel] Используем inbound id=%s port=%s security=%s network=%s",
-                     ib.get("id"), port, stream.get("security"), stream.get("network"))
+            log.info(
+                "[Panel] Using inbound id=%s port=%s security=%s network=%s",
+                ib.get("id"), port,
+                stream.get("security"), stream.get("network"),
+            )
             return ib, port, stream
 
-        except json.JSONDecodeError:
-            log.info("[Panel] %s → не JSON", path)
         except Exception as e:
-            log.info("[Panel] %s → ошибка %s: %s", path, type(e).__name__, e)
+            log.info("[Panel] %s → unexpected error %s: %s", path, type(e).__name__, e)
 
+    log.error("[Panel] _get_inbound: all paths exhausted, inbound not found")
     return None, 443, {}
 
 
@@ -285,7 +315,7 @@ async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str 
             # ── GET INBOUND ──────────────────────────
             ib, port, stream = await _get_inbound(s)
             if not ib:
-                log.error("[Panel] No inbound found ни на одном из путей")
+                log.error("[Panel] No inbound found")
                 return None, None, None
 
             inbound_id = ib.get("id")
@@ -870,4 +900,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Bot stopped.") 
+        log.info("Bot stopped.")
