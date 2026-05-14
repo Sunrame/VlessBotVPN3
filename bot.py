@@ -40,7 +40,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
 
 SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
-INBOUND_ID      = int(os.environ.get("INBOUND_ID", "1"))  # ID inbound в 3x-ui — поставьте 2 в .env
+INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))  # ID inbound в 3x-ui — поставьте 2 в .env
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
