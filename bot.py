@@ -125,7 +125,7 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             # GET INBOUNDS - try multiple paths
             # PANEL_URL contains security token, so /panel/inbounds should work
             inbound_paths = [
-                "/panel/inbounds",
+                "/panel/inbound/list",  # правильный endpoint v2.9.4
                 "/panel/api/inbounds",
                 "/xui/API/inbounds",
                 "/xui/inbounds",
@@ -187,6 +187,7 @@ async def panel_create_client(user_id: int, days: int) -> str | None:
             }
             
             add_paths = [
+                "/panel/inbound/addClient",  # v2.9.4
                 "/xui/inbound/addClient",
                 f"/xui/inbound/{inbound_id}/addClient",
             ]
