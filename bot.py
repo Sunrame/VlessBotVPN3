@@ -38,7 +38,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     if _val.isdigit():
         ADMIN_IDS.append(int(_val))
  
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@vvvvvpppnn")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))
  
@@ -59,9 +59,8 @@ TARIFFS: dict = {
         "days":    30,
         "devices": 1,
         "desc": (
-            "🔒 Безлимитный трафик\n"
-            "🌐 Высокая скорость\n"
-            "📱 Подключение на 1 устройстве"
+            "🔒 Безлимитный трафик\n\n"
+            "🌐 Высокая скорость"
         ),
     },
     "2_dev": {
@@ -70,9 +69,8 @@ TARIFFS: dict = {
         "days":    30,
         "devices": 2,
         "desc": (
-            "🔒 Безлимитный трафик\n"
-            "🌐 Высокая скорость\n"
-            "📱 Подключение на 2 устройствах"
+            "🔒 Безлимитный трафик\n\n"
+            "🌐 Высокая скорость"
         ),
     },
     "5_dev": {
@@ -81,9 +79,8 @@ TARIFFS: dict = {
         "days":    30,
         "devices": 5,
         "desc": (
-            "🔒 Безлимитный трафик\n"
-            "🌐 Высокая скорость\n"
-            "💻 Подключение на 5 устройствах"
+            "🔒 Безлимитный трафик\n\n"
+            "🌐 Высокая скорость"
         ),
     },
 }
@@ -487,7 +484,7 @@ def main_kb():
         [InlineKeyboardButton(text="💳 Купить VPN",   callback_data="tariffs"),
          InlineKeyboardButton(text="👤 Профиль",      callback_data="profile")],
         [InlineKeyboardButton(text="🤝 Рефералы",     callback_data="ref_program"),
-         InlineKeyboardButton(text="🏷 Промокод",     callback_data="promo_enter")],
+         InlineKeyboardButton(text="📞 Промокод",     callback_data="promo_enter")],
         [InlineKeyboardButton(text="💬 Поддержка",    callback_data="support_tab"),
          InlineKeyboardButton(text="ℹ️ Инфо",         callback_data="info_tab")],
     ])
@@ -571,7 +568,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
                          (message.from_user.username, u_id))
  
     await message.answer(
-        f"🌐 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
+        f"🌏 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
         "Высокоскоростной VPN с простой настройкой.\n"
         "Выберите действие:",
         reply_markup=main_kb(), parse_mode="HTML",
@@ -581,7 +578,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
 @router.callback_query(F.data == "back")
 async def back_to_main(cb: CallbackQuery):
     await cb.message.edit_text(
-        f"🔒 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
+        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
         reply_markup=main_kb(), parse_mode="HTML",
     )
  
@@ -734,7 +731,7 @@ async def check_payment(cb: CallbackQuery):
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
     await state.set_state(PromoState.waiting_code)
     await cb.message.edit_text(
-        "🏷 <b>Введите промокод:</b>",
+        "📞 <b>Введите промокод:</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✕ Отмена", callback_data="promo_cancel")]
@@ -746,7 +743,7 @@ async def promo_enter(cb: CallbackQuery, state: FSMContext):
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text(
-        f"🔒 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
+        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
         reply_markup=main_kb(), parse_mode="HTML",
     )
  
@@ -792,7 +789,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
         await state.set_state(PromoState.choosing_tariff)
         await state.update_data(promo_code=code, promo_days=days, promo_uses=uses)
         await message.answer(
-            f"🏷 Промокод <b>{code}</b> даёт бесплатную подписку на <b>{days} дней</b>!\n\n"
+            f"📞 Промокод <b>{code}</b> даёт бесплатную подписку на <b>{days} дней</b>!\n\n"
             "Выберите тариф:",
             parse_mode="HTML",
             reply_markup=free_tariff_kb(code),
@@ -935,9 +932,9 @@ async def info_tab(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Канал с инструкциями",          url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
+                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
             [InlineKeyboardButton(text="🔐 Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-04-27")],
+                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
             [InlineKeyboardButton(text="← Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
@@ -1228,7 +1225,7 @@ async def admin_genpromo_handle(message: types.Message, state: FSMContext):
  
     await message.answer(
         f"✅ Промокод создан:\n\n"
-        f"🏷 Код: <code>{code}</code>\n"
+        f"📞 Код: <code>{code}</code>\n"
         f"Тип: {type_label}\n"
         f"Дней: <b>{days}</b> · Использований: <b>{uses}</b>",
         parse_mode="HTML",
@@ -1248,7 +1245,7 @@ async def admin_list_promos(message: types.Message):
         await message.answer("Активных промокодов нет.")
         return
  
-    lines = ["🏷 <b>Активные промокоды:</b>\n"]
+    lines = ["📞 <b>Активные промокоды:</b>\n"]
     for r in rows:
         ptype = r["promo_type"] or "days"
         if ptype == "free_tariff":
