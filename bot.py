@@ -438,40 +438,44 @@ async def panel_extend_client(client_uuid: str, extra_days: int, limit_ip: int |
 async def activate_subscription(user_id: int, days: int, limit_ip: int = 0):
     now   = int(time.time())
     delta = days * 86400
- 
+
+    # Читаем состояние из БД отдельным коннектом
     with db_conn() as conn:
         row = conn.execute(
             "SELECT expiry_date, sub_token, client_uuid FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
- 
-        current_expiry = row["expiry_date"] if row else 0
-        token          = row["sub_token"]   if row and row["sub_token"]   else None
-        client_uuid    = row["client_uuid"] if row and row["client_uuid"] else None
-        new_expiry     = max(current_expiry, now) + delta
-        sub_url        = None
- 
-        if client_uuid:
-            ok = await panel_extend_client(client_uuid, days, limit_ip if limit_ip else None)
-            if ok:
-                sub_url = build_subscription_url(f"truba_{user_id}")
-            else:
-                log.warning("[Sub] Could not extend %s, recreating", client_uuid)
-                client_uuid = None
- 
-        if not client_uuid:
-            vless_link, sub_url, client_uuid = await panel_create_client(user_id, days, limit_ip)
-            if not vless_link:
-                vless_link  = f"PANEL_ERROR_{uuid.uuid4().hex[:8]}"
-                sub_url     = None
-                client_uuid = None
-            token = vless_link
- 
+
+    current_expiry = row["expiry_date"] if row else 0
+    token          = row["sub_token"]   if row and row["sub_token"]   else None
+    client_uuid    = row["client_uuid"] if row and row["client_uuid"] else None
+    new_expiry     = max(current_expiry, now) + delta
+    sub_url        = None
+
+    # Запросы к панели — вне db_conn, чтобы не держать соединение открытым
+    if client_uuid:
+        ok = await panel_extend_client(client_uuid, days, limit_ip if limit_ip else None)
+        if ok:
+            sub_url = build_subscription_url(f"truba_{user_id}")
+        else:
+            log.warning("[Sub] Could not extend %s, recreating", client_uuid)
+            client_uuid = None
+
+    if not client_uuid:
+        vless_link, sub_url, client_uuid = await panel_create_client(user_id, days, limit_ip)
+        if not vless_link:
+            vless_link  = f"PANEL_ERROR_{uuid.uuid4().hex[:8]}"
+            sub_url     = None
+            client_uuid = None
+        token = vless_link
+
+    # Сохраняем результат
+    with db_conn() as conn:
         conn.execute(
             "UPDATE users SET expiry_date=?, sub_token=?, client_uuid=? WHERE user_id=?",
             (new_expiry, token, client_uuid, user_id),
         )
- 
+
     return new_expiry, token, sub_url
  
  
