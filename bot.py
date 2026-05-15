@@ -59,8 +59,9 @@ TARIFFS: dict = {
         "days":    30,
         "devices": 1,
         "desc": (
-            "🔒 Безлимитный трафик\n\n"
-            "🌐 Высокая скорость"
+            "🔒 Безлимитный трафик\n"
+            "🌐 Высокая скорость\n"
+            "📱 Подключение на 1 устройстве"
         ),
     },
     "2_dev": {
@@ -69,8 +70,9 @@ TARIFFS: dict = {
         "days":    30,
         "devices": 2,
         "desc": (
-            "🔒 Безлимитный трафик\n\n"
-            "🌐 Высокая скорость"
+            "🔒 Безлимитный трафик\n"
+            "🌐 Высокая скорость\n"
+            "📱 Подключение на 2 устройствах"
         ),
     },
     "5_dev": {
@@ -79,8 +81,9 @@ TARIFFS: dict = {
         "days":    30,
         "devices": 5,
         "desc": (
-            "🔒 Безлимитный трафик\n\n"
-            "🌐 Высокая скорость"
+            "🔒 Безлимитный трафик\n"
+            "🌐 Высокая скорость\n"
+            "💻 Подключение на 5 устройствах"
         ),
     },
 }
@@ -438,44 +441,40 @@ async def panel_extend_client(client_uuid: str, extra_days: int, limit_ip: int |
 async def activate_subscription(user_id: int, days: int, limit_ip: int = 0):
     now   = int(time.time())
     delta = days * 86400
-
-    # Читаем состояние из БД отдельным коннектом
+ 
     with db_conn() as conn:
         row = conn.execute(
             "SELECT expiry_date, sub_token, client_uuid FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
-
-    current_expiry = row["expiry_date"] if row else 0
-    token          = row["sub_token"]   if row and row["sub_token"]   else None
-    client_uuid    = row["client_uuid"] if row and row["client_uuid"] else None
-    new_expiry     = max(current_expiry, now) + delta
-    sub_url        = None
-
-    # Запросы к панели — вне db_conn, чтобы не держать соединение открытым
-    if client_uuid:
-        ok = await panel_extend_client(client_uuid, days, limit_ip if limit_ip else None)
-        if ok:
-            sub_url = build_subscription_url(f"truba_{user_id}")
-        else:
-            log.warning("[Sub] Could not extend %s, recreating", client_uuid)
-            client_uuid = None
-
-    if not client_uuid:
-        vless_link, sub_url, client_uuid = await panel_create_client(user_id, days, limit_ip)
-        if not vless_link:
-            vless_link  = f"PANEL_ERROR_{uuid.uuid4().hex[:8]}"
-            sub_url     = None
-            client_uuid = None
-        token = vless_link
-
-    # Сохраняем результат
-    with db_conn() as conn:
+ 
+        current_expiry = row["expiry_date"] if row else 0
+        token          = row["sub_token"]   if row and row["sub_token"]   else None
+        client_uuid    = row["client_uuid"] if row and row["client_uuid"] else None
+        new_expiry     = max(current_expiry, now) + delta
+        sub_url        = None
+ 
+        if client_uuid:
+            ok = await panel_extend_client(client_uuid, days, limit_ip if limit_ip else None)
+            if ok:
+                sub_url = build_subscription_url(f"truba_{user_id}")
+            else:
+                log.warning("[Sub] Could not extend %s, recreating", client_uuid)
+                client_uuid = None
+ 
+        if not client_uuid:
+            vless_link, sub_url, client_uuid = await panel_create_client(user_id, days, limit_ip)
+            if not vless_link:
+                vless_link  = f"PANEL_ERROR_{uuid.uuid4().hex[:8]}"
+                sub_url     = None
+                client_uuid = None
+            token = vless_link
+ 
         conn.execute(
             "UPDATE users SET expiry_date=?, sub_token=?, client_uuid=? WHERE user_id=?",
             (new_expiry, token, client_uuid, user_id),
         )
-
+ 
     return new_expiry, token, sub_url
  
  
@@ -488,7 +487,7 @@ def main_kb():
         [InlineKeyboardButton(text="💳 Купить VPN",   callback_data="tariffs"),
          InlineKeyboardButton(text="👤 Профиль",      callback_data="profile")],
         [InlineKeyboardButton(text="🤝 Рефералы",     callback_data="ref_program"),
-         InlineKeyboardButton(text="📞 Промокод",     callback_data="promo_enter")],
+         InlineKeyboardButton(text="🏷 Промокод",     callback_data="promo_enter")],
         [InlineKeyboardButton(text="💬 Поддержка",    callback_data="support_tab"),
          InlineKeyboardButton(text="ℹ️ Инфо",         callback_data="info_tab")],
     ])
@@ -572,7 +571,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
                          (message.from_user.username, u_id))
  
     await message.answer(
-        f"🌏 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
+        f"🌐 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
         "Высокоскоростной VPN с простой настройкой.\n"
         "Выберите действие:",
         reply_markup=main_kb(), parse_mode="HTML",
@@ -582,7 +581,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
 @router.callback_query(F.data == "back")
 async def back_to_main(cb: CallbackQuery):
     await cb.message.edit_text(
-        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
+        f"🔒 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
         reply_markup=main_kb(), parse_mode="HTML",
     )
  
@@ -735,7 +734,7 @@ async def check_payment(cb: CallbackQuery):
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
     await state.set_state(PromoState.waiting_code)
     await cb.message.edit_text(
-        "📞 <b>Введите промокод:</b>",
+        "🏷 <b>Введите промокод:</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✕ Отмена", callback_data="promo_cancel")]
@@ -747,7 +746,7 @@ async def promo_enter(cb: CallbackQuery, state: FSMContext):
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text(
-        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
+        f"🔒 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
         reply_markup=main_kb(), parse_mode="HTML",
     )
  
@@ -793,7 +792,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
         await state.set_state(PromoState.choosing_tariff)
         await state.update_data(promo_code=code, promo_days=days, promo_uses=uses)
         await message.answer(
-            f"📞 Промокод <b>{code}</b> даёт бесплатную подписку на <b>{days} дней</b>!\n\n"
+            f"🏷 Промокод <b>{code}</b> даёт бесплатную подписку на <b>{days} дней</b>!\n\n"
             "Выберите тариф:",
             parse_mode="HTML",
             reply_markup=free_tariff_kb(code),
@@ -847,13 +846,13 @@ async def profile_tab(cb: CallbackQuery):
             "SELECT expiry_date, sub_token, client_uuid, tariff_key, limit_ip FROM users WHERE user_id=?",
             (cb.from_user.id,)
         ).fetchone()
-
+ 
     now = int(time.time())
     if row and row["expiry_date"] > now:
         days_left = (row["expiry_date"] - now) // 86400
         date_str  = time.strftime("%d.%m.%Y", time.localtime(row["expiry_date"]))
         token     = row["sub_token"] or ""
-
+ 
         t_key = row["tariff_key"] if row["tariff_key"] else None
         if t_key and t_key in TARIFFS:
             t_info    = TARIFFS[t_key]
@@ -864,21 +863,21 @@ async def profile_tab(cb: CallbackQuery):
             limit_ip    = row["limit_ip"] if row["limit_ip"] else 0
             dev_label   = DEVICE_OPTIONS.get(limit_ip, f"{limit_ip} устр.")
             tariff_line = f"\nТариф: <b>{dev_label}</b>" if limit_ip else ""
-
+ 
         if row["client_uuid"]:
             email    = f"truba_{cb.from_user.id}"
             sub_url  = build_subscription_url(email)
             sub_line = f"\n\n🌐 <b>Ссылка на подписку:</b>\n{hcode(sub_url)}"
         else:
             sub_line = ""
-
+ 
         if token.startswith("vless://"):
             key_line = f"\n\n🔑 <b>VLESS-ключ:</b>\n{hcode(token)}"
         elif token.startswith("PANEL_ERROR_"):
             key_line = "\n\n⚠️ Ключ не был выдан — обратитесь в поддержку."
         else:
             key_line = f"\n\n🔑 Ключ:\n{hcode(token)}" if token else ""
-
+ 
         text = (
             f"👤 <b>Профиль</b>\n\n"
             f"✅ Подписка активна · до <b>{date_str}</b>\n"
@@ -893,7 +892,7 @@ async def profile_tab(cb: CallbackQuery):
             "Подписка не активна.\n"
             "Нажмите «💳 Купить VPN» для оформления."
         )
-
+ 
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb())
  
  
@@ -1229,7 +1228,7 @@ async def admin_genpromo_handle(message: types.Message, state: FSMContext):
  
     await message.answer(
         f"✅ Промокод создан:\n\n"
-        f"📞 Код: <code>{code}</code>\n"
+        f"🏷 Код: <code>{code}</code>\n"
         f"Тип: {type_label}\n"
         f"Дней: <b>{days}</b> · Использований: <b>{uses}</b>",
         parse_mode="HTML",
@@ -1249,7 +1248,7 @@ async def admin_list_promos(message: types.Message):
         await message.answer("Активных промокодов нет.")
         return
  
-    lines = ["📞 <b>Активные промокоды:</b>\n"]
+    lines = ["🏷 <b>Активные промокоды:</b>\n"]
     for r in rows:
         ptype = r["promo_type"] or "days"
         if ptype == "free_tariff":
