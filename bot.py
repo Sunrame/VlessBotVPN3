@@ -46,10 +46,46 @@ Configuration.configure(SHOP_ID, YOOKASSA_KEY)
  
 # Базовые тарифы (цена за 1 месяц)
 TARIFFS: dict = {
-    "trial": {"name": "Пробный",        "price": 10,  "days": 1,  "desc": "Тестовый доступ на 24 часа", "trial": True},
-    "1_dev": {"name": "1 устройство",   "price": 99,  "days": 30, "desc": "Подключение на 1 устройстве"},
-    "2_dev": {"name": "2 устройства",   "price": 179, "days": 30, "desc": "Подключение на 2 устройствах"},
-    "5_dev": {"name": "5 устройств",    "price": 349, "days": 30, "desc": "Подключение на 5 устройствах"},
+    "trial": {
+        "name":  "Пробный",
+        "price": 10,
+        "days":  1,
+        "desc":  "Тестовый доступ на 24 часа",
+        "trial": True,
+    },
+    "1_dev": {
+        "name":    "1 устройство",
+        "price":   99,
+        "days":    30,
+        "devices": 1,
+        "desc": (
+            "🔒 Безлимитный трафик\n"
+            "🌐 Высокая скорость\n"
+            "📱 Подключение на 1 устройстве"
+        ),
+    },
+    "2_dev": {
+        "name":    "2 устройства",
+        "price":   179,
+        "days":    30,
+        "devices": 2,
+        "desc": (
+            "🔒 Безлимитный трафик\n"
+            "🌐 Высокая скорость\n"
+            "📱 Подключение на 2 устройствах"
+        ),
+    },
+    "5_dev": {
+        "name":    "5 устройств",
+        "price":   349,
+        "days":    30,
+        "devices": 5,
+        "desc": (
+            "🔒 Безлимитный трафик\n"
+            "🌐 Высокая скорость\n"
+            "💻 Подключение на 5 устройствах"
+        ),
+    },
 }
  
 # Скидки по периодам
@@ -127,10 +163,11 @@ def init_db():
                 conn.execute(f"ALTER TABLE promos ADD COLUMN {col_def}")
             except Exception:
                 pass
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN client_uuid TEXT")
-        except Exception:
-            pass
+        for user_col in ("client_uuid TEXT", "tariff_key TEXT", "limit_ip INTEGER DEFAULT 0"):
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {user_col}")
+            except Exception:
+                pass
  
 # ─────────────────────────────────────────────
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -450,7 +487,7 @@ def main_kb():
         [InlineKeyboardButton(text="💳 Купить VPN",   callback_data="tariffs"),
          InlineKeyboardButton(text="👤 Профиль",      callback_data="profile")],
         [InlineKeyboardButton(text="🤝 Рефералы",     callback_data="ref_program"),
-         InlineKeyboardButton(text="🎟 Промокод",     callback_data="promo_enter")],
+         InlineKeyboardButton(text="🏷 Промокод",     callback_data="promo_enter")],
         [InlineKeyboardButton(text="💬 Поддержка",    callback_data="support_tab"),
          InlineKeyboardButton(text="ℹ️ Инфо",         callback_data="info_tab")],
     ])
@@ -584,7 +621,7 @@ async def process_buy(cb: CallbackQuery):
         return
  
     await cb.message.edit_text(
-        f"📦 <b>{info['name']}</b>\n"
+        f"<b>{info['name']}</b>\n\n"
         f"{info['desc']}\n\n"
         "Выберите период подписки:",
         reply_markup=months_kb(t_key),
@@ -612,8 +649,10 @@ async def _show_payment_page(cb: CallbackQuery, t_key: str, months: int):
             "capture":      True,
             "description":  f"TrubaVPN — {info['name']} / {month_label}",
             "metadata":     {
-                "user_id": str(cb.from_user.id),
-                "days":    str(days),
+                "user_id":    str(cb.from_user.id),
+                "days":       str(days),
+                "tariff_key": t_key,
+                "limit_ip":   str(TARIFFS[t_key].get("devices", 0)),
             },
         }, str(uuid.uuid4()))
     except Exception as e:
@@ -627,7 +666,7 @@ async def _show_payment_page(cb: CallbackQuery, t_key: str, months: int):
         [InlineKeyboardButton(text="← Назад",             callback_data=f"buy_{t_key}")],
     ])
     await cb.message.edit_text(
-        f"📦 <b>{info['name']}</b>  ·  {month_label}\n"
+        f"<b>{info['name']}</b>  ·  {month_label}\n\n"
         f"{info['desc']}\n\n"
         f"💰 К оплате: <b>{price} ₽</b>\n\n"
         "После оплаты нажмите «Проверить оплату».",
@@ -672,7 +711,13 @@ async def check_payment(cb: CallbackQuery):
             except Exception:
                 pass
  
-        conn.execute("UPDATE users SET has_paid=1 WHERE user_id=?", (u_id,))
+        # Сохраняем tariff_key и limit_ip из метаданных платежа
+        t_key_meta = payment.metadata.get("tariff_key", "")
+        l_ip_meta  = int(payment.metadata.get("limit_ip", "0"))
+        conn.execute(
+            "UPDATE users SET has_paid=1, tariff_key=?, limit_ip=? WHERE user_id=?",
+            (t_key_meta or None, l_ip_meta, u_id),
+        )
  
     key_msg = format_key_message(expiry, token, sub_url)
     await cb.message.edit_text(
@@ -689,7 +734,7 @@ async def check_payment(cb: CallbackQuery):
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
     await state.set_state(PromoState.waiting_code)
     await cb.message.edit_text(
-        "🎟 <b>Введите промокод:</b>",
+        "🏷 <b>Введите промокод:</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✕ Отмена", callback_data="promo_cancel")]
@@ -747,7 +792,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
         await state.set_state(PromoState.choosing_tariff)
         await state.update_data(promo_code=code, promo_days=days, promo_uses=uses)
         await message.answer(
-            f"🎟 Промокод <b>{code}</b> даёт бесплатную подписку на <b>{days} дней</b>!\n\n"
+            f"🏷 Промокод <b>{code}</b> даёт бесплатную подписку на <b>{days} дней</b>!\n\n"
             "Выберите тариф:",
             parse_mode="HTML",
             reply_markup=free_tariff_kb(code),
@@ -798,34 +843,46 @@ async def handle_free_tariff_choice(cb: CallbackQuery, state: FSMContext):
 async def profile_tab(cb: CallbackQuery):
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT expiry_date, sub_token, client_uuid FROM users WHERE user_id=?",
+            "SELECT expiry_date, sub_token, client_uuid, tariff_key, limit_ip FROM users WHERE user_id=?",
             (cb.from_user.id,)
         ).fetchone()
- 
+
     now = int(time.time())
     if row and row["expiry_date"] > now:
         days_left = (row["expiry_date"] - now) // 86400
         date_str  = time.strftime("%d.%m.%Y", time.localtime(row["expiry_date"]))
         token     = row["sub_token"] or ""
- 
+
+        t_key = row["tariff_key"] if row["tariff_key"] else None
+        if t_key and t_key in TARIFFS:
+            t_info    = TARIFFS[t_key]
+            devices   = t_info.get("devices", 0)
+            dev_label = f"{devices} устр." if devices else "без лимита"
+            tariff_line = f"\nТариф: <b>{t_info['name']}</b> · {dev_label}"
+        else:
+            limit_ip    = row["limit_ip"] if row["limit_ip"] else 0
+            dev_label   = DEVICE_OPTIONS.get(limit_ip, f"{limit_ip} устр.")
+            tariff_line = f"\nТариф: <b>{dev_label}</b>" if limit_ip else ""
+
         if row["client_uuid"]:
             email    = f"truba_{cb.from_user.id}"
             sub_url  = build_subscription_url(email)
             sub_line = f"\n\n🌐 <b>Ссылка на подписку:</b>\n{hcode(sub_url)}"
         else:
             sub_line = ""
- 
+
         if token.startswith("vless://"):
             key_line = f"\n\n🔑 <b>VLESS-ключ:</b>\n{hcode(token)}"
         elif token.startswith("PANEL_ERROR_"):
             key_line = "\n\n⚠️ Ключ не был выдан — обратитесь в поддержку."
         else:
             key_line = f"\n\n🔑 Ключ:\n{hcode(token)}" if token else ""
- 
+
         text = (
             f"👤 <b>Профиль</b>\n\n"
             f"✅ Подписка активна · до <b>{date_str}</b>\n"
             f"Осталось: <b>{days_left} дн.</b>"
+            f"{tariff_line}"
             f"{sub_line}"
             f"{key_line}"
         )
@@ -835,7 +892,7 @@ async def profile_tab(cb: CallbackQuery):
             "Подписка не активна.\n"
             "Нажмите «💳 Купить VPN» для оформления."
         )
- 
+
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb())
  
  
@@ -849,7 +906,8 @@ async def ref_program(cb: CallbackQuery):
     link = f"https://t.me/{me.username}?start={cb.from_user.id}"
     await cb.message.edit_text(
         f"🤝 <b>Реферальная программа</b>\n\n"
-        f"Пригласите друга — при его первой оплате вы оба получите <b>+7 дней</b>.\n\n"
+        "Поделитесь ссылкой с другом. Когда он оплатит любой тариф — "
+        "вы оба автоматически получите <b>+7 дней</b> к своим подпискам.\n\n"
         f"Ваша реферальная ссылка:\n{hcode(link)}",
         parse_mode="HTML", reply_markup=back_kb(),
     )
@@ -1170,7 +1228,7 @@ async def admin_genpromo_handle(message: types.Message, state: FSMContext):
  
     await message.answer(
         f"✅ Промокод создан:\n\n"
-        f"🎟 Код: <code>{code}</code>\n"
+        f"🏷 Код: <code>{code}</code>\n"
         f"Тип: {type_label}\n"
         f"Дней: <b>{days}</b> · Использований: <b>{uses}</b>",
         parse_mode="HTML",
@@ -1190,7 +1248,7 @@ async def admin_list_promos(message: types.Message):
         await message.answer("Активных промокодов нет.")
         return
  
-    lines = ["🎟 <b>Активные промокоды:</b>\n"]
+    lines = ["🏷 <b>Активные промокоды:</b>\n"]
     for r in rows:
         ptype = r["promo_type"] or "days"
         if ptype == "free_tariff":
@@ -1232,7 +1290,7 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
     await state.update_data(broadcast_text=message.text)
     await state.set_state(BroadcastState.confirm)
  
-    preview_text = f"<b>TrubaVPN:</b>\n\n{message.text}"
+    preview_text = message.text
     await message.answer(
         f"👁 <b>Предпросмотр:</b>\n\n{preview_text}\n\n"
         "Подтвердите рассылку:",
@@ -1260,7 +1318,7 @@ async def broadcast_confirm(cb: CallbackQuery, state: FSMContext):
  
     await cb.message.edit_text("📢 Рассылка запущена...")
  
-    full_text = f"<b>TrubaVPN:</b>\n\n{text_body}"
+    full_text = text_body
     with db_conn() as conn:
         users = conn.execute("SELECT user_id FROM users").fetchall()
  
