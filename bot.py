@@ -28,7 +28,7 @@ API_TOKEN      = os.environ["BOT_TOKEN"]
 SHOP_ID        = os.environ["SHOP_ID"]
 YOOKASSA_KEY   = os.environ["YOOKASSA_KEY"]
 
-PANEL_URL      = os.environ["PANEL_URL"].rstrip("/")   # https://ip:port/token
+PANEL_URL      = os.environ["PANEL_URL"].rstrip("/")
 PANEL_LOGIN    = os.environ["PANEL_LOGIN"]
 PANEL_PASSWORD = os.environ["PANEL_PASSWORD"]
 
@@ -40,22 +40,42 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
 
 SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
-INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))  # ID inbound в 3x-ui
+INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
+# Базовые цены за 1 месяц (в рублях)
 TARIFFS: dict = {
-    "trial": {"name": "🆓 Пробный (1 день)",  "price": 10,  "days": 1,  "desc": "Тестовый доступ на 24 часа"},
-    "1_dev": {"name": "📱 1 устройство",       "price": 99,  "days": 30, "desc": "99 ₽ / 30 дней"},
-    "2_dev": {"name": "📱📱 2 устройства",     "price": 179, "days": 30, "desc": "179 ₽ / 30 дней"},
-    "5_dev": {"name": "💻 5 устройств",        "price": 349, "days": 30, "desc": "349 ₽ / 30 дней"},
+    "trial": {"name": "Пробный (1 день)",  "price": 10,  "days": 1,  "desc": "Тестовый доступ на 24 часа", "trial": True},
+    "1_dev": {"name": "1 устройство",       "price": 99,  "days": 30, "desc": "до 1 устройства"},
+    "2_dev": {"name": "2 устройства",       "price": 179, "days": 30, "desc": "до 2 устройств"},
+    "5_dev": {"name": "5 устройств",        "price": 349, "days": 30, "desc": "до 5 устройств"},
 }
+
+# Множители скидок по месяцам
+MONTH_OPTIONS = {
+    1:  {"label": "1 месяц",   "multiplier": 1.0},
+    3:  {"label": "3 месяца",  "multiplier": 2.7},   # ~10% скидка
+    6:  {"label": "6 месяцев", "multiplier": 5.1},   # ~15% скидка
+    12: {"label": "1 год",     "multiplier": 9.6},   # ~20% скидка
+}
+
 
 class PromoState(StatesGroup):
     waiting_code = State()
 
 class BroadcastState(StatesGroup):
     waiting_text = State()
+
+# ── НОВЫЕ СТЕЙТЫ ──────────────────────────────
+class AdminKeyState(StatesGroup):
+    waiting_username = State()
+    waiting_days     = State()
+
+class AdminPromoState(StatesGroup):
+    waiting_input = State()
+
+# ─────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("trubavpn")
@@ -100,7 +120,7 @@ def init_db():
 
 def get_panel_base() -> tuple[str, str]:
     parsed = urlparse(PANEL_URL)
-    host_port = parsed.netloc   # 1.2.3.4:54321
+    host_port = parsed.netloc
     return PANEL_URL, host_port
 
 
@@ -157,34 +177,45 @@ def format_key_message(expiry: int, vless_link: str, sub_url: str | None) -> str
 
     if vless_link.startswith("PANEL_ERROR_"):
         return (
-            f"📅 Подписка до: <b>{date_str}</b>\n\n"
-            "⚠️ Ключ временно недоступен — панель не ответила.\n"
+            f"Подписка до: <b>{date_str}</b>\n\n"
+            f"Ключ временно недоступен — панель не ответила.\n"
             f"Напишите в поддержку: {SUPPORT_CONTACT}"
         )
 
-    lines = [f"📅 Подписка до: <b>{date_str}</b>", "", "━━━━━━━━━━━━━━━━━━━━"]
+    lines = [f"Подписка до: <b>{date_str}</b>", "", "━━━━━━━━━━━━━━━━━━━━"]
 
     if sub_url:
         lines += [
-            "📲 <b>Ссылка на подписку</b> (рекомендуется):",
+            "<b>Ссылка на подписку</b> (рекомендуется):",
             "<i>Импортируйте в Happ / v2rayNG — конфиг обновится автоматически.</i>",
             hcode(sub_url),
             "",
         ]
 
     lines += [
-        "🔑 <b>VLESS-ключ</b> (вручную):",
+        "<b>VLESS-ключ</b> (вручную):",
         hcode(vless_link),
         "",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"📖 Как подключиться: {CHANNEL_LINK}",
+        f"Как подключиться: {CHANNEL_LINK}",
     ]
 
     return "\n".join(lines)
 
 
+def calc_price(base_price: int, months: int) -> int:
+    """Рассчитать итоговую цену с учётом скидки."""
+    multiplier = MONTH_OPTIONS[months]["multiplier"]
+    return round(base_price * multiplier)
+
+
+def calc_days(base_days: int, months: int) -> int:
+    """Рассчитать количество дней."""
+    return base_days * months
+
+
 # ─────────────────────────────────────────────
-#  3X-UI PANEL API  (sync requests inside executor)
+#  3X-UI PANEL API
 # ─────────────────────────────────────────────
 
 def _sync_login(s: _requests.Session) -> bool:
@@ -192,11 +223,10 @@ def _sync_login(s: _requests.Session) -> bool:
         res = s.post(
             f"{PANEL_URL}/login",
             data={"username": PANEL_LOGIN, "password": PANEL_PASSWORD},
-            timeout=15,
-            verify=False,
+            timeout=15, verify=False,
         )
         ok = res.status_code == 200 and res.json().get("success")
-        log.info("[Panel] Login → %s", ok)
+        log.info("[Panel] Login -> %s", ok)
         return ok
     except Exception as e:
         log.error("[Panel] Login error: %s", e)
@@ -204,15 +234,13 @@ def _sync_login(s: _requests.Session) -> bool:
 
 
 def _sync_get_inbound(s: _requests.Session) -> tuple[dict | None, int, dict]:
-    """Получает нужный inbound через /panel/api/inbounds/list."""
     try:
         res = s.get(
             f"{PANEL_URL}/panel/api/inbounds/list",
             headers={"X-Requested-With": "XMLHttpRequest"},
-            timeout=15,
-            verify=False,
+            timeout=15, verify=False,
         )
-        log.info("[Panel] GET inbounds → %d | %s", res.status_code, res.text[:200])
+        log.info("[Panel] GET inbounds -> %d | %s", res.status_code, res.text[:200])
         data = res.json()
 
         inbounds = None
@@ -230,16 +258,13 @@ def _sync_get_inbound(s: _requests.Session) -> tuple[dict | None, int, dict]:
 
         ib = next((x for x in inbounds if x.get("id") == INBOUND_ID), None)
         if not ib:
-            log.warning("[Panel] inbound id=%d not found, using first. ids=%s",
-                        INBOUND_ID, [x.get("id") for x in inbounds])
+            log.warning("[Panel] inbound id=%d not found, using first.", INBOUND_ID)
             ib = inbounds[0]
 
         port       = ib.get("port", 443)
         raw_stream = ib.get("streamSettings", "{}")
         stream     = json.loads(raw_stream) if isinstance(raw_stream, str) else (raw_stream or {})
 
-        log.info("[Panel] inbound id=%s port=%s security=%s network=%s",
-                 ib.get("id"), port, stream.get("security"), stream.get("network"))
         return ib, port, stream
 
     except Exception as e:
@@ -258,7 +283,7 @@ def _sync_create_client(user_id: int, days: int) -> tuple[str | None, str | None
 
     _, host_port = get_panel_base()
     email     = f"truba_{user_id}"
-    client_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_{user_id}"))  # стабильный UUID
+    client_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"truba_{user_id}"))
     expire_ms = int((time.time() + days * 86400) * 1000)
     flow      = "xtls-rprx-vision" if stream.get("security") == "reality" else ""
 
@@ -283,10 +308,9 @@ def _sync_create_client(user_id: int, days: int) -> tuple[str | None, str | None
             f"{PANEL_URL}/panel/api/inbounds/addClient",
             json=payload,
             headers={"X-Requested-With": "XMLHttpRequest"},
-            timeout=15,
-            verify=False,
+            timeout=15, verify=False,
         )
-        log.info("[Panel] addClient → %d | %s", res.status_code, res.text[:200])
+        log.info("[Panel] addClient -> %d | %s", res.status_code, res.text[:200])
         resp = res.json()
         if not resp.get("success") and "already exists" not in res.text:
             log.error("[Panel] addClient failed: %s", resp)
@@ -297,7 +321,6 @@ def _sync_create_client(user_id: int, days: int) -> tuple[str | None, str | None
 
     vless_link = build_vless_link(client_id, host_port, port, stream, email)
     sub_url    = build_subscription_url(email)
-    log.info("[Panel] Client created | sub=%s", sub_url)
     return vless_link, sub_url, client_id
 
 
@@ -328,10 +351,9 @@ def _sync_extend_client(client_uuid: str, extra_days: int) -> bool:
                     f"{PANEL_URL}/panel/api/inbounds/updateClient/{client_uuid}",
                     json=payload,
                     headers={"X-Requested-With": "XMLHttpRequest"},
-                    timeout=15,
-                    verify=False,
+                    timeout=15, verify=False,
                 )
-                log.info("[Panel] updateClient → %d | %s", res.status_code, res.text[:200])
+                log.info("[Panel] updateClient -> %d | %s", res.status_code, res.text[:200])
                 if res.json().get("success"):
                     return True
             except Exception as e:
@@ -341,7 +363,6 @@ def _sync_extend_client(client_uuid: str, extra_days: int) -> bool:
     return False
 
 
-# Async-обёртки (запускают sync-функции в threadpool)
 async def panel_create_client(user_id: int, days: int) -> tuple[str | None, str | None, str | None]:
     return await asyncio.get_event_loop().run_in_executor(
         None, _sync_create_client, user_id, days
@@ -352,9 +373,6 @@ async def panel_extend_client(client_uuid: str, extra_days: int) -> bool:
     return await asyncio.get_event_loop().run_in_executor(
         None, _sync_extend_client, client_uuid, extra_days
     )
-
-
-    pass  # replaced by sync versions below
 
 
 # ─────────────────────────────────────────────
@@ -383,7 +401,7 @@ async def activate_subscription(user_id: int, days: int):
                 email   = f"truba_{user_id}"
                 sub_url = build_subscription_url(email)
             else:
-                log.warning("[Sub] Не удалось продлить клиента %s, пересоздаём", client_uuid)
+                log.warning("[Sub] Could not extend client %s, recreating", client_uuid)
                 client_uuid = None
 
         if not client_uuid:
@@ -405,25 +423,45 @@ async def activate_subscription(user_id: int, days: int):
 # ─────────────────────────────────────────────
 #  KEYBOARDS
 # ─────────────────────────────────────────────
+
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Купить VPN",  callback_data="tariffs"),
-         InlineKeyboardButton(text="👤 Профиль",     callback_data="profile")],
-        [InlineKeyboardButton(text="🤝 Рефералы",    callback_data="ref_program"),
-         InlineKeyboardButton(text="🎟 Промокод",    callback_data="promo_enter")],
-        [InlineKeyboardButton(text="🆘 Поддержка",   callback_data="support_tab"),
-         InlineKeyboardButton(text="📖 Инфо",        callback_data="info_tab")],
+        [InlineKeyboardButton(text="Купить VPN",  callback_data="tariffs"),
+         InlineKeyboardButton(text="Профиль",     callback_data="profile")],
+        [InlineKeyboardButton(text="Рефералы",    callback_data="ref_program"),
+         InlineKeyboardButton(text="Промокод",    callback_data="promo_enter")],
+        [InlineKeyboardButton(text="Поддержка",   callback_data="support_tab"),
+         InlineKeyboardButton(text="Инфо",        callback_data="info_tab")],
     ])
 
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
+        [InlineKeyboardButton(text="Назад", callback_data="back")]
     ])
 
+def months_kb(tariff_key: str):
+    """Клавиатура выбора количества месяцев для тарифа."""
+    info = TARIFFS[tariff_key]
+    base = info["price"]
+    rows = []
+    for months, opt in MONTH_OPTIONS.items():
+        total = calc_price(base, months)
+        label = f"{opt['label']} — {total} руб."
+        if months > 1:
+            per_month = round(total / months)
+            label += f" ({per_month}/мес.)"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"buym_{tariff_key}_{months}"
+        )])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="tariffs")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 # ─────────────────────────────────────────────
-#  HANDLERS
+#  HANDLERS — ГЛАВНОЕ МЕНЮ
 # ─────────────────────────────────────────────
+
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
     u_id = message.from_user.id
@@ -445,22 +483,37 @@ async def cmd_start(message: types.Message, command: CommandObject):
                          (message.from_user.username, u_id))
 
     await message.answer(
-        f"🚀 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
+        f"Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
         "Высокоскоростной VPN с простой настройкой.\n"
-        "Выберите действие ниже 👇",
+        "Выберите действие ниже:",
         reply_markup=main_kb(), parse_mode="HTML",
     )
 
 
+@router.callback_query(F.data == "back")
+async def back_to_main(cb: CallbackQuery):
+    await cb.message.edit_text(
+        f"{hbold('TrubaVPN')} — быстрый и надёжный VPN.",
+        reply_markup=main_kb(), parse_mode="HTML",
+    )
+
+
+# ─────────────────────────────────────────────
+#  ТАРИФЫ И ОПЛАТА
+# ─────────────────────────────────────────────
+
 @router.callback_query(F.data == "tariffs")
 async def show_tariffs(cb: CallbackQuery):
-    btns = [
-        [InlineKeyboardButton(text=f"{v['name']} — {v['price']} ₽", callback_data=f"buy_{k}")]
-        for k, v in TARIFFS.items()
-    ]
-    btns.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
+    btns = []
+    for k, v in TARIFFS.items():
+        if v.get("trial"):
+            label = f"{v['name']} — {v['price']} руб."
+        else:
+            label = f"{v['name']} — от {v['price']} руб./мес."
+        btns.append([InlineKeyboardButton(text=label, callback_data=f"buy_{k}")])
+    btns.append([InlineKeyboardButton(text="Назад", callback_data="back")])
     await cb.message.edit_text(
-        "🛒 <b>Выберите тариф:</b>",
+        "<b>Выберите тариф:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
         parse_mode="HTML",
     )
@@ -474,13 +527,46 @@ async def process_buy(cb: CallbackQuery):
         return
 
     info = TARIFFS[t_key]
+
+    # Пробный тариф — сразу к оплате без выбора месяцев
+    if info.get("trial"):
+        await _show_payment_page(cb, t_key, 1)
+        return
+
+    # Показываем выбор количества месяцев
+    await cb.message.edit_text(
+        f"<b>{info['name']}</b>\n"
+        f"{info['desc']}\n\n"
+        "Выберите период подписки:",
+        reply_markup=months_kb(t_key),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("buym_"))
+async def process_buy_months(cb: CallbackQuery):
+    _, t_key, months_str = cb.data.split("_", 2)
+    months = int(months_str)
+    await _show_payment_page(cb, t_key, months)
+
+
+async def _show_payment_page(cb: CallbackQuery, t_key: str, months: int):
+    info  = TARIFFS[t_key]
+    days  = calc_days(info["days"], months)
+    price = calc_price(info["price"], months) if not info.get("trial") else info["price"]
+
+    month_label = MONTH_OPTIONS.get(months, {}).get("label", f"{months} мес.")
+
     try:
         payment = Payment.create({
-            "amount":       {"value": f"{info['price']}.00", "currency": "RUB"},
+            "amount":       {"value": f"{price}.00", "currency": "RUB"},
             "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
             "capture":      True,
-            "description":  f"TrubaVPN — {info['name']}",
-            "metadata":     {"user_id": str(cb.from_user.id), "days": str(info["days"])},
+            "description":  f"TrubaVPN — {info['name']} / {month_label}",
+            "metadata":     {
+                "user_id": str(cb.from_user.id),
+                "days":    str(days),
+            },
         }, str(uuid.uuid4()))
     except Exception as e:
         log.exception("Payment create error: %s", e)
@@ -488,15 +574,15 @@ async def process_buy(cb: CallbackQuery):
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить",         url=payment.confirmation.confirmation_url)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{payment.id}")],
-        [InlineKeyboardButton(text="⬅️ Назад",            callback_data="tariffs")],
+        [InlineKeyboardButton(text="Оплатить",         url=payment.confirmation.confirmation_url)],
+        [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_{payment.id}")],
+        [InlineKeyboardButton(text="Назад",            callback_data=f"buy_{t_key}")],
     ])
     await cb.message.edit_text(
-        f"💳 <b>{info['name']}</b>\n"
-        f"ℹ️ {info['desc']}\n\n"
-        f"К оплате: <b>{info['price']} ₽</b>\n\n"
-        "После оплаты нажмите «✅ Проверить оплату».",
+        f"<b>{info['name']}</b> / {month_label}\n"
+        f"{info['desc']}\n\n"
+        f"К оплате: <b>{price} руб.</b>\n\n"
+        "После оплаты нажмите «Проверить оплату».",
         reply_markup=kb, parse_mode="HTML",
     )
 
@@ -512,7 +598,7 @@ async def check_payment(cb: CallbackQuery):
         return
 
     if payment.status != "succeeded":
-        await cb.answer("⏳ Платёж ещё не подтверждён. Попробуйте через минуту.", show_alert=True)
+        await cb.answer("Платёж ещё не подтверждён. Попробуйте через минуту.", show_alert=True)
         return
 
     u_id = int(payment.metadata["user_id"])
@@ -531,7 +617,7 @@ async def check_payment(cb: CallbackQuery):
             try:
                 await bot.send_message(
                     ref_id,
-                    "🎊 Ваш друг оплатил подписку!\n"
+                    "Ваш друг оплатил подписку!\n"
                     "Вам и ему начислено по <b>+7 дней</b> бонуса.",
                     parse_mode="HTML",
                 )
@@ -542,18 +628,22 @@ async def check_payment(cb: CallbackQuery):
 
     key_msg = format_key_message(expiry, token, sub_url)
     await cb.message.edit_text(
-        f"✅ <b>Оплата прошла успешно!</b>\n\n{key_msg}",
+        f"<b>Оплата прошла успешно!</b>\n\n{key_msg}",
         parse_mode="HTML", reply_markup=back_kb(),
     )
 
+
+# ─────────────────────────────────────────────
+#  ПРОМОКОД
+# ─────────────────────────────────────────────
 
 @router.callback_query(F.data == "promo_enter")
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
     await state.set_state(PromoState.waiting_code)
     await cb.message.edit_text(
-        "🎟 Введите промокод:",
+        "Введите промокод:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel")]
+            [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")]
         ]),
     )
 
@@ -562,7 +652,7 @@ async def promo_enter(cb: CallbackQuery, state: FSMContext):
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text(
-        f"🚀 {hbold('TrubaVPN')} готов к работе!",
+        f"{hbold('TrubaVPN')} — быстрый и надёжный VPN.",
         reply_markup=main_kb(), parse_mode="HTML",
     )
 
@@ -577,9 +667,9 @@ async def handle_promo(message: types.Message, state: FSMContext):
 
         if not row:
             await message.answer(
-                "❌ Неверный или уже использованный промокод.\nПопробуйте ещё раз:",
+                "Неверный или уже использованный промокод.\nПопробуйте ещё раз:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel")]
+                    [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")]
                 ]),
             )
             return
@@ -596,10 +686,14 @@ async def handle_promo(message: types.Message, state: FSMContext):
     await state.clear()
     key_msg = format_key_message(expiry, token, sub_url)
     await message.answer(
-        f"✅ Промокод <b>{code}</b> активирован! Добавлено <b>{days}</b> дн.\n\n{key_msg}",
+        f"Промокод <b>{code}</b> активирован! Добавлено <b>{days}</b> дн.\n\n{key_msg}",
         parse_mode="HTML", reply_markup=main_kb(),
     )
 
+
+# ─────────────────────────────────────────────
+#  ПРОФИЛЬ
+# ─────────────────────────────────────────────
 
 @router.callback_query(F.data == "profile")
 async def profile_tab(cb: CallbackQuery):
@@ -618,42 +712,46 @@ async def profile_tab(cb: CallbackQuery):
         if row["client_uuid"]:
             email    = f"truba_{cb.from_user.id}"
             sub_url  = build_subscription_url(email)
-            sub_line = f"\n\n📲 <b>Ссылка на подписку</b> (для Happ):\n{hcode(sub_url)}"
+            sub_line = f"\n\n<b>Ссылка на подписку</b> (для Happ):\n{hcode(sub_url)}"
         else:
             sub_line = ""
 
         if token.startswith("vless://"):
-            key_line = f"\n\n🔑 <b>VLESS-ключ</b>:\n{hcode(token)}"
+            key_line = f"\n\n<b>VLESS-ключ:</b>\n{hcode(token)}"
         elif token.startswith("PANEL_ERROR_"):
-            key_line = "\n\n⚠️ Ключ не был выдан, обратитесь в поддержку."
+            key_line = "\n\nКлюч не был выдан, обратитесь в поддержку."
         else:
-            key_line = f"\n\n🔑 Ключ:\n{hcode(token)}" if token else ""
+            key_line = f"\n\nКлюч:\n{hcode(token)}" if token else ""
 
         text = (
-            f"👤 <b>Профиль</b>\n\n"
-            f"✅ Подписка активна\n"
-            f"📅 До: <b>{date_str}</b> (осталось {days_left} дн.)"
+            f"<b>Профиль</b>\n\n"
+            f"Подписка активна\n"
+            f"До: <b>{date_str}</b> (осталось {days_left} дн.)"
             f"{sub_line}"
             f"{key_line}"
         )
     else:
         text = (
-            "👤 <b>Профиль</b>\n\n"
-            "❌ Подписка не активна.\n"
-            "Нажмите «💎 Купить VPN» для оформления."
+            "<b>Профиль</b>\n\n"
+            "Подписка не активна.\n"
+            "Нажмите «Купить VPN» для оформления."
         )
 
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb())
 
+
+# ─────────────────────────────────────────────
+#  РЕФЕРАЛЫ / ПОДДЕРЖКА / ИНФО
+# ─────────────────────────────────────────────
 
 @router.callback_query(F.data == "ref_program")
 async def ref_program(cb: CallbackQuery):
     me   = await bot.get_me()
     link = f"https://t.me/{me.username}?start={cb.from_user.id}"
     await cb.message.edit_text(
-        f"🤝 <b>Реферальная программа</b>\n\n"
+        f"<b>Реферальная программа</b>\n\n"
         f"Приглашайте друзей — при первой оплате вы оба получите <b>+7 дней</b>!\n\n"
-        f"🔗 Ваша ссылка:\n{hcode(link)}",
+        f"Ваша ссылка:\n{hcode(link)}",
         parse_mode="HTML", reply_markup=back_kb(),
     )
 
@@ -661,13 +759,13 @@ async def ref_program(cb: CallbackQuery):
 @router.callback_query(F.data == "support_tab")
 async def support_tab(cb: CallbackQuery):
     await cb.message.edit_text(
-        "🆘 <b>Поддержка</b>\n\nЕсть вопросы? Мы на связи!",
+        "<b>Поддержка</b>\n\nЕсть вопросы? Мы на связи!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="✍️ Написать менеджеру",
+                text="Написать менеджеру",
                 url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}",
             )],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
+            [InlineKeyboardButton(text="Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
     )
@@ -676,37 +774,30 @@ async def support_tab(cb: CallbackQuery):
 @router.callback_query(F.data == "info_tab")
 async def info_tab(cb: CallbackQuery):
     await cb.message.edit_text(
-        "📖 <b>Информация и документы:</b>",
+        "<b>Информация и документы:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Канал с инструкциями",        url=CHANNEL_LINK)],
-            [InlineKeyboardButton(text="📜 Пользовательское соглашение",
+            [InlineKeyboardButton(text="Канал с инструкциями",        url=CHANNEL_LINK)],
+            [InlineKeyboardButton(text="Пользовательское соглашение",
                                   url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
-            [InlineKeyboardButton(text="🛡 Политика конфиденциальности",
+            [InlineKeyboardButton(text="Политика конфиденциальности",
                                   url="https://telegra.ph/Politika-obrabotki-04-27")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
+            [InlineKeyboardButton(text="Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
     )
 
 
-@router.callback_query(F.data == "back")
-async def back_to_main(cb: CallbackQuery):
-    await cb.message.edit_text(
-        f"🚀 {hbold('TrubaVPN')} готов к работе!",
-        reply_markup=main_kb(), parse_mode="HTML",
-    )
-
-
 # ─────────────────────────────────────────────
-#  ADMIN КОМАНДЫ
+#  ADMIN — /give (выдать ключ пользователю)
 # ─────────────────────────────────────────────
+
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
     parts = (command.args or "").split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("⚠️ Формат: <code>/give username дни</code>", parse_mode="HTML")
+        await message.answer("Формат: <code>/give username дни</code>", parse_mode="HTML")
         return
 
     target_username = parts[0].lstrip("@")
@@ -718,7 +809,7 @@ async def admin_give(message: types.Message, command: CommandObject):
         ).fetchone()
 
     if not row:
-        await message.answer(f"❌ Пользователь @{target_username} не найден.", parse_mode="HTML")
+        await message.answer(f"Пользователь @{target_username} не найден.", parse_mode="HTML")
         return
 
     target_id              = row["user_id"]
@@ -726,19 +817,96 @@ async def admin_give(message: types.Message, command: CommandObject):
     date_str               = time.strftime("%d.%m.%Y", time.localtime(expiry))
 
     await message.answer(
-        f"✅ @{target_username} выдано <b>{days}</b> дней.\nДо: <b>{date_str}</b>",
+        f"@{target_username} выдано <b>{days}</b> дней.\nДо: <b>{date_str}</b>",
         parse_mode="HTML",
     )
     try:
         key_msg = format_key_message(expiry, token, sub_url)
         await bot.send_message(
             target_id,
-            f"🎁 Администратор выдал вам <b>{days}</b> дней подписки!\n\n{key_msg}",
+            f"Администратор выдал вам <b>{days}</b> дней подписки!\n\n{key_msg}",
             parse_mode="HTML",
         )
     except Exception:
         pass
 
+
+# ─────────────────────────────────────────────
+#  ADMIN — /genkey (генерация ключа через меню)
+# ─────────────────────────────────────────────
+
+@router.message(Command("genkey"))
+async def admin_genkey_start(message: types.Message, state: FSMContext):
+    """Интерактивная генерация и выдача ключа."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminKeyState.waiting_username)
+    await message.answer(
+        "<b>Генерация ключа</b>\n\nВведите username пользователя (без @):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminKeyState.waiting_username)
+async def admin_genkey_username(message: types.Message, state: FSMContext):
+    username = message.text.strip().lstrip("@")
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM users WHERE username=?", (username,)
+        ).fetchone()
+
+    if not row:
+        await message.answer(f"Пользователь @{username} не найден. Введите другой username:")
+        return
+
+    await state.update_data(target_id=row["user_id"], target_username=username)
+    await state.set_state(AdminKeyState.waiting_days)
+    await message.answer(
+        f"Пользователь: @{username}\n\nСколько дней выдать?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="30 дней",  callback_data="gk_30"),
+             InlineKeyboardButton(text="60 дней",  callback_data="gk_60")],
+            [InlineKeyboardButton(text="90 дней",  callback_data="gk_90"),
+             InlineKeyboardButton(text="365 дней", callback_data="gk_365")],
+            [InlineKeyboardButton(text="Отмена",   callback_data="gk_cancel")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("gk_"))
+async def admin_genkey_days(cb: CallbackQuery, state: FSMContext):
+    if cb.data == "gk_cancel":
+        await state.clear()
+        await cb.message.edit_text("Отменено.")
+        return
+
+    days = int(cb.data.removeprefix("gk_"))
+    data = await state.get_data()
+    target_id       = data["target_id"]
+    target_username = data["target_username"]
+    await state.clear()
+
+    expiry, token, sub_url = await activate_subscription(target_id, days)
+    date_str = time.strftime("%d.%m.%Y", time.localtime(expiry))
+
+    await cb.message.edit_text(
+        f"@{target_username} выдано <b>{days}</b> дней.\nДо: <b>{date_str}</b>",
+        parse_mode="HTML",
+    )
+    try:
+        key_msg = format_key_message(expiry, token, sub_url)
+        await bot.send_message(
+            target_id,
+            f"Администратор выдал вам <b>{days}</b> дней подписки!\n\n{key_msg}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
+#  ADMIN — /add_promo и /genpromo (генерация промокодов)
+# ─────────────────────────────────────────────
 
 @router.message(Command("add_promo"))
 async def add_promo(message: types.Message, command: CommandObject):
@@ -747,7 +915,7 @@ async def add_promo(message: types.Message, command: CommandObject):
     parts = (command.args or "").split()
     if len(parts) < 2 or not parts[1].isdigit():
         await message.answer(
-            "⚠️ Формат: <code>/add_promo КОД ДНИ [использований]</code>\n"
+            "Формат: <code>/add_promo КОД ДНИ [использований]</code>\n"
             "Пример: <code>/add_promo SUMMER30 30 100</code>",
             parse_mode="HTML",
         )
@@ -764,30 +932,149 @@ async def add_promo(message: types.Message, command: CommandObject):
         )
 
     await message.answer(
-        f"✅ Промокод <code>{code}</code> создан.\n"
+        f"Промокод <code>{code}</code> создан.\n"
         f"Даёт: <b>{days}</b> дней | Использований: <b>{uses}</b>",
         parse_mode="HTML",
     )
 
+
+@router.message(Command("genpromo"))
+async def admin_genpromo(message: types.Message, state: FSMContext):
+    """Интерактивная генерация промокода через меню."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminPromoState.waiting_input)
+    await message.answer(
+        "<b>Генерация промокода</b>\n\n"
+        "Введите параметры в формате:\n"
+        "<code>КОД ДНИ ИСПОЛЬЗОВАНИЙ</code>\n\n"
+        "Примеры:\n"
+        "<code>PROMO30 30 1</code> — одноразовый на 30 дней\n"
+        "<code>SUMMER 7 100</code> — 100 использований по 7 дней\n\n"
+        "Или введите только дни для авто-генерации кода:\n"
+        "<code>30 50</code> — случайный код на 30 дней, 50 использований",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminPromoState.waiting_input)
+async def admin_genpromo_handle(message: types.Message, state: FSMContext):
+    await state.clear()
+    parts = message.text.strip().split()
+
+    # Авто-генерация кода если первый аргумент — число
+    if parts[0].isdigit():
+        code = uuid.uuid4().hex[:8].upper()
+        days = int(parts[0])
+        uses = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 1
+    else:
+        if len(parts) < 2 or not parts[1].isdigit():
+            await message.answer(
+                "Неверный формат. Попробуйте снова: /genpromo",
+                parse_mode="HTML",
+            )
+            return
+        code = parts[0].upper()
+        days = int(parts[1])
+        uses = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
+
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO promos (code, days, uses) VALUES (?,?,?)",
+            (code, days, uses),
+        )
+
+    await message.answer(
+        f"Промокод создан:\n\n"
+        f"Код: <code>{code}</code>\n"
+        f"Дней: <b>{days}</b>\n"
+        f"Использований: <b>{uses}</b>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("list_promos"))
+async def admin_list_promos(message: types.Message):
+    """Список активных промокодов."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    with db_conn() as conn:
+        rows = conn.execute("SELECT code, days, uses FROM promos ORDER BY days DESC").fetchall()
+
+    if not rows:
+        await message.answer("Активных промокодов нет.")
+        return
+
+    lines = ["<b>Активные промокоды:</b>\n"]
+    for r in rows:
+        lines.append(f"<code>{r['code']}</code> — {r['days']} дн., {r['uses']} исп.")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
+#  ADMIN — /broadcast (рассылка)
+# ─────────────────────────────────────────────
 
 @router.message(Command("broadcast"))
 async def broadcast_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(BroadcastState.waiting_text)
-    await message.answer("📢 Введите текст рассылки (HTML поддерживается).\n/cancel — отмена.")
+    await message.answer(
+        "<b>Рассылка</b>\n\n"
+        "Введите текст сообщения (поддерживается HTML-разметка).\n"
+        "Отправьте /cancel для отмены.",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("cancel"), BroadcastState.waiting_text)
 async def broadcast_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Рассылка отменена.")
+    await message.answer("Рассылка отменена.")
 
 
 @router.message(BroadcastState.waiting_text)
 async def broadcast_send(message: types.Message, state: FSMContext):
     await state.clear()
-    text = f"📢 <b>Рассылка от TrubaVPN:</b>\n\n{message.text}"
+
+    # Предпросмотр перед отправкой
+    preview_text = f"<b>TrubaVPN:</b>\n\n{message.text}"
+    await message.answer(
+        f"Предпросмотр:\n\n{preview_text}\n\n"
+        "Подтвердите рассылку:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Разослать всем", callback_data=f"bc_confirm")],
+            [InlineKeyboardButton(text="Отмена",         callback_data="bc_cancel")],
+        ]),
+    )
+    # Сохраняем текст во временное хранилище через FSM
+    from aiogram.fsm.context import FSMContext as _FSM
+    # Используем data в боте напрямую (простой способ через хранилище)
+    await dp.storage.set_data(
+        key=types.StorageKey(bot_id=bot.id, chat_id=message.chat.id, user_id=message.from_user.id),
+        data={"broadcast_text": message.text},
+    )
+
+
+@router.callback_query(F.data == "bc_confirm")
+async def broadcast_confirm(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+
+    raw = await dp.storage.get_data(
+        key=types.StorageKey(bot_id=bot.id, chat_id=cb.message.chat.id, user_id=cb.from_user.id)
+    )
+    text_body = raw.get("broadcast_text", "")
+    if not text_body:
+        await cb.answer("Текст не найден.", show_alert=True)
+        return
+
+    await cb.message.edit_text("Рассылка запущена...")
+
+    full_text = f"<b>TrubaVPN:</b>\n\n{text_body}"
 
     with db_conn() as conn:
         users = conn.execute("SELECT user_id FROM users").fetchall()
@@ -795,22 +1082,58 @@ async def broadcast_send(message: types.Message, state: FSMContext):
     ok, fail = 0, 0
     for row in users:
         try:
-            await bot.send_message(row["user_id"], text, parse_mode="HTML")
+            await bot.send_message(row["user_id"], full_text, parse_mode="HTML")
             ok += 1
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
 
-    await message.answer(f"✅ Рассылка завершена.\nОтправлено: {ok} | Ошибок: {fail}")
+    await cb.message.edit_text(
+        f"Рассылка завершена.\nОтправлено: <b>{ok}</b> | Ошибок: <b>{fail}</b>",
+        parse_mode="HTML",
+    )
 
+
+@router.callback_query(F.data == "bc_cancel")
+async def broadcast_cancel_cb(cb: CallbackQuery):
+    await cb.message.edit_text("Рассылка отменена.")
+
+
+# ─────────────────────────────────────────────
+#  ADMIN — /stats
+# ─────────────────────────────────────────────
+
+@router.message(Command("stats"))
+async def admin_stats(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    now = int(time.time())
+    with db_conn() as conn:
+        total  = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM users WHERE expiry_date>?", (now,)).fetchone()[0]
+        paid   = conn.execute("SELECT COUNT(*) FROM users WHERE has_paid=1").fetchone()[0]
+        promos = conn.execute("SELECT COUNT(*) FROM promos").fetchone()[0]
+
+    await message.answer(
+        f"<b>Статистика TrubaVPN</b>\n\n"
+        f"Всего пользователей: <b>{total}</b>\n"
+        f"Активных подписок: <b>{active}</b>\n"
+        f"Когда-либо платили: <b>{paid}</b>\n"
+        f"Активных промокодов: <b>{promos}</b>",
+        parse_mode="HTML",
+    )
+
+
+# ─────────────────────────────────────────────
+#  ADMIN — /panel_check (диагностика панели)
+# ─────────────────────────────────────────────
 
 @router.message(Command("panel_check"))
 async def admin_panel_check(message: types.Message):
-    """Диагностика: перебирает все возможные пути панели и показывает результат."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    await message.answer("🔍 Проверяю пути панели, подождите...")
+    await message.answer("Проверяю пути панели, подождите...")
 
     test_paths = [
         "/panel/api/inbounds",
@@ -826,7 +1149,7 @@ async def admin_panel_check(message: types.Message):
         lines = []
         s = _requests.Session()
         ok = _sync_login(s)
-        lines.append(f"{'✅' if ok else '❌'} Login: {'OK' if ok else 'FAILED'}")
+        lines.append(f"{'OK' if ok else 'FAIL'} Login")
         for path in test_paths:
             try:
                 r       = s.get(f"{PANEL_URL}{path}",
@@ -834,11 +1157,11 @@ async def admin_panel_check(message: types.Message):
                                 timeout=10, verify=False)
                 snippet = r.text.strip()[:100].replace("\n", " ")
                 is_html = snippet.lstrip().startswith("<")
-                icon    = "🟢" if r.status_code == 200 and not is_html else (
-                          "🟡" if r.status_code == 200 else "🔴")
-                lines.append(f"{icon} {path}\n   → {r.status_code} | {snippet}")
+                icon    = "OK" if r.status_code == 200 and not is_html else (
+                          "PARTIAL" if r.status_code == 200 else "FAIL")
+                lines.append(f"{icon} {path} -> {r.status_code} | {snippet}")
             except Exception as e:
-                lines.append(f"💥 {path}\n   → {type(e).__name__}: {e}")
+                lines.append(f"ERR {path} -> {type(e).__name__}: {e}")
         return lines
 
     lines = await asyncio.get_event_loop().run_in_executor(None, _check)
@@ -848,22 +1171,24 @@ async def admin_panel_check(message: types.Message):
     )
 
 
+# ─────────────────────────────────────────────
+#  ADMIN — /help (список команд)
+# ─────────────────────────────────────────────
 
+@router.message(Command("admin"))
+async def admin_help(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    now = int(time.time())
-    with db_conn() as conn:
-        total  = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        active = conn.execute("SELECT COUNT(*) FROM users WHERE expiry_date>?", (now,)).fetchone()[0]
-        paid   = conn.execute("SELECT COUNT(*) FROM users WHERE has_paid=1").fetchone()[0]
-        promos = conn.execute("SELECT COUNT(*) FROM promos").fetchone()[0]
-
     await message.answer(
-        f"📊 <b>Статистика TrubaVPN</b>\n\n"
-        f"👥 Всего пользователей: <b>{total}</b>\n"
-        f"✅ Активных подписок:   <b>{active}</b>\n"
-        f"💳 Когда-либо платили: <b>{paid}</b>\n"
-        f"🎟 Активных промокодов: <b>{promos}</b>",
+        "<b>Команды администратора:</b>\n\n"
+        "<code>/give username дни</code> — выдать дни пользователю\n"
+        "<code>/genkey</code> — интерактивная выдача ключа\n"
+        "<code>/add_promo КОД ДНИ [исп.]</code> — создать промокод\n"
+        "<code>/genpromo</code> — интерактивная генерация промокода\n"
+        "<code>/list_promos</code> — список промокодов\n"
+        "<code>/broadcast</code> — рассылка всем пользователям\n"
+        "<code>/stats</code> — статистика бота\n"
+        "<code>/panel_check</code> — диагностика панели",
         parse_mode="HTML",
     )
 
@@ -871,6 +1196,7 @@ async def admin_panel_check(message: types.Message):
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
+
 async def main():
     init_db()
     dp.include_router(router)
