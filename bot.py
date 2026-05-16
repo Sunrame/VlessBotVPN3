@@ -581,6 +581,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
  
 @router.callback_query(F.data == "back")
 async def back_to_main(cb: CallbackQuery):
+    await cb.answer()
     await cb.message.edit_text(
         f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
         reply_markup=main_kb(), parse_mode="HTML",
@@ -593,6 +594,7 @@ async def back_to_main(cb: CallbackQuery):
  
 @router.callback_query(F.data == "tariffs")
 async def show_tariffs(cb: CallbackQuery):
+    await cb.answer()
     btns = []
     for k, v in TARIFFS.items():
         if v.get("trial"):
@@ -610,6 +612,7 @@ async def show_tariffs(cb: CallbackQuery):
  
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(cb: CallbackQuery):
+    await cb.answer()
     t_key = cb.data.removeprefix("buy_")
     if t_key not in TARIFFS:
         await cb.answer("Тариф не найден.", show_alert=True)
@@ -632,8 +635,10 @@ async def process_buy(cb: CallbackQuery):
  
 @router.callback_query(F.data.startswith("buym_"))
 async def process_buy_months(cb: CallbackQuery):
-    _, t_key, months_str = cb.data.split("_", 2)
-    months = int(months_str)
+    # формат: buym_{t_key}_{months}, где months — последний сегмент
+    parts     = cb.data.removeprefix("buym_").rsplit("_", 1)
+    t_key     = parts[0]
+    months    = int(parts[1])
     await _show_payment_page(cb, t_key, months)
  
  
@@ -733,6 +738,7 @@ async def check_payment(cb: CallbackQuery):
  
 @router.callback_query(F.data == "promo_enter")
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
     await state.set_state(PromoState.waiting_code)
     await cb.message.edit_text(
         "📞 <b>Введите промокод:</b>",
@@ -745,6 +751,7 @@ async def promo_enter(cb: CallbackQuery, state: FSMContext):
  
 @router.callback_query(F.data == "promo_cancel")
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
     await state.clear()
     await cb.message.edit_text(
         f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
@@ -812,6 +819,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
  
 @router.callback_query(F.data.startswith("pfree_"))
 async def handle_free_tariff_choice(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
     _, t_key, promo_code = cb.data.split("_", 2)
  
     data = await state.get_data()
@@ -842,6 +850,7 @@ async def handle_free_tariff_choice(cb: CallbackQuery, state: FSMContext):
  
 @router.callback_query(F.data == "profile")
 async def profile_tab(cb: CallbackQuery):
+    await cb.answer()
     with db_conn() as conn:
         row = conn.execute(
             "SELECT expiry_date, sub_token, client_uuid, tariff_key, limit_ip FROM users WHERE user_id=?",
@@ -903,6 +912,7 @@ async def profile_tab(cb: CallbackQuery):
  
 @router.callback_query(F.data == "ref_program")
 async def ref_program(cb: CallbackQuery):
+    await cb.answer()
     me   = await bot.get_me()
     link = f"https://t.me/{me.username}?start={cb.from_user.id}"
     await cb.message.edit_text(
@@ -916,6 +926,7 @@ async def ref_program(cb: CallbackQuery):
  
 @router.callback_query(F.data == "support_tab")
 async def support_tab(cb: CallbackQuery):
+    await cb.answer()
     await cb.message.edit_text(
         "💬 <b>Поддержка</b>\n\nЕсть вопросы? Мы на связи.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -931,6 +942,7 @@ async def support_tab(cb: CallbackQuery):
  
 @router.callback_query(F.data == "info_tab")
 async def info_tab(cb: CallbackQuery):
+    await cb.answer()
     await cb.message.edit_text(
         "ℹ️ <b>Информация:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
