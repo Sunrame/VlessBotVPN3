@@ -38,7 +38,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     if _val.isdigit():
         ADMIN_IDS.append(int(_val))
  
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@vvvvvpppnn")
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))
  
@@ -1457,13 +1457,125 @@ async def admin_help(message: types.Message):
  
  
 # ─────────────────────────────────────────────
+#  СИНХРОНИЗАЦИЯ С ПАНЕЛЬЮ ПРИ СТАРТЕ
+# ─────────────────────────────────────────────
+
+def _sync_fetch_panel_clients() -> dict:
+    """Возвращает словарь {email: client_dict} всех клиентов из inbound."""
+    s = _requests.Session()
+    if not _sync_login(s):
+        return {}
+    ib, _, _ = _sync_get_inbound(s)
+    if not ib:
+        return {}
+    raw = ib.get("settings", "{}")
+    settings = json.loads(raw) if isinstance(raw, str) else raw
+    return {c.get("email", ""): c for c in settings.get("clients", []) if c.get("email")}
+
+
+async def sync_db_with_panel():
+    """При старте сверяет БД с панелью: восстанавливает client_uuid и sub_token."""
+    log.info("[Sync] Starting DB sync with panel...")
+    try:
+        panel_clients = await asyncio.get_event_loop().run_in_executor(
+            None, _sync_fetch_panel_clients
+        )
+    except Exception as e:
+        log.error("[Sync] Failed: %s", e)
+        return
+
+    def _get_stream():
+        s = _requests.Session()
+        _sync_login(s)
+        _, port, stream = _sync_get_inbound(s)
+        return port, stream
+
+    try:
+        port, stream = await asyncio.get_event_loop().run_in_executor(None, _get_stream)
+    except Exception:
+        port, stream = 443, {}
+
+    _, host_port = get_panel_base()
+
+    with db_conn() as conn:
+        users = conn.execute(
+            "SELECT user_id, client_uuid, sub_token FROM users WHERE expiry_date > ?",
+            (int(time.time()),)
+        ).fetchall()
+
+    fixed = 0
+    for row in users:
+        user_id     = row["user_id"]
+        client_uuid = row["client_uuid"]
+        sub_token   = row["sub_token"]
+        email       = f"truba_{user_id}"
+        pc          = panel_clients.get(email)
+        if not pc:
+            continue
+        panel_uuid = pc.get("id", "")
+        if not panel_uuid:
+            continue
+        if panel_uuid != client_uuid or not sub_token or (sub_token or "").startswith("PANEL_ERROR_"):
+            vless_link = build_vless_link(panel_uuid, host_port, port, stream, email)
+            with db_conn() as conn:
+                conn.execute(
+                    "UPDATE users SET client_uuid=?, sub_token=? WHERE user_id=?",
+                    (panel_uuid, vless_link, user_id),
+                )
+            log.info("[Sync] Restored user %d", user_id)
+            fixed += 1
+
+    log.info("[Sync] Done. Fixed %d users.", fixed)
+
+
+# ─────────────────────────────────────────────
+#  ФОНОВАЯ ЗАДАЧА: уведомления за день до конца
+# ─────────────────────────────────────────────
+
+async def expiry_notifier():
+    """Каждые 6 часов уведомляет тех, у кого подписка истекает через ~24 часа."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            now       = int(time.time())
+            window_lo = now + 23 * 3600
+            window_hi = now + 25 * 3600
+            with db_conn() as conn:
+                users = conn.execute(
+                    "SELECT user_id FROM users WHERE expiry_date >= ? AND expiry_date <= ?",
+                    (window_lo, window_hi)
+                ).fetchall()
+            for row in users:
+                try:
+                    await bot.send_message(
+                        row["user_id"],
+                        "⏳ <b>Напоминание</b>\n\n"
+                        "Ваша подписка истекает через <b>~24 часа</b>.\n"
+                        "Продлите её, чтобы не потерять доступ.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💳 Продлить подписку", callback_data="tariffs")]
+                        ]),
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.05)
+            log.info("[Notifier] Notified %d users about expiry.", len(users))
+        except Exception as e:
+            log.error("[Notifier] Error: %s", e)
+        await asyncio.sleep(6 * 3600)
+
+
+# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
- 
+
 async def main():
     init_db()
     dp.include_router(router)
     log.info("TrubaVPN Bot starting... INBOUND_ID=%d", INBOUND_ID)
+    asyncio.create_task(sync_db_with_panel())
+    asyncio.create_task(expiry_notifier())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
  
 if __name__ == "__main__":
