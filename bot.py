@@ -38,8 +38,9 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     if _val.isdigit():
         ADMIN_IDS.append(int(_val))
  
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@vvvvvpppnn")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
+CHANNEL_ID      = os.environ.get("CHANNEL_ID", "@Truba_VPN")  # @username или -100...
 INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))
  
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
@@ -104,6 +105,25 @@ DEVICE_OPTIONS = {
 }
  
  
+# ─────────────────────────────────────────────
+#  ПРОВЕРКА ПОДПИСКИ НА КАНАЛ
+# ─────────────────────────────────────────────
+
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status not in ("left", "kicked")
+    except Exception:
+        return True
+
+
+def sub_required_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_LINK)],
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
+    ])
+
+
 class PromoState(StatesGroup):
     waiting_code    = State()
     choosing_tariff = State()
@@ -352,6 +372,11 @@ def _sync_create_client(user_id: int, days: int, limit_ip: int = 0) -> tuple[str
         "tgId":       str(user_id),
         "subId":      uuid.uuid4().hex[:12],
     }
+    # Пытаемся добавить username из БД для удобства в панели
+    with db_conn() as _conn:
+        _urow = _conn.execute("SELECT username FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if _urow and _urow["username"]:
+            client_obj["remark"] = f"@{_urow['username']}"
     payload = {
         "id":       ib["id"],
         "settings": json.dumps({"clients": [client_obj]}),
@@ -571,14 +596,37 @@ async def cmd_start(message: types.Message, command: CommandObject):
             conn.execute("UPDATE users SET username=? WHERE user_id=?",
                          (message.from_user.username, u_id))
  
+    if not await is_subscribed(u_id):
+        await message.answer(
+            f"🌏 {hbold('TrubaVPN')}\n\n"
+            "Чтобы пользоваться ботом, подпишитесь на наш канал.\n"
+            "Там вы найдёте инструкции по подключению и новости.",
+            reply_markup=sub_required_kb(), parse_mode="HTML",
+        )
+        return
+
     await message.answer(
         f"🌏 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
         "Высокоскоростной VPN с простой настройкой.\n"
         "Выберите действие:",
         reply_markup=main_kb(), parse_mode="HTML",
     )
- 
- 
+
+
+@router.callback_query(F.data == "check_sub")
+async def check_sub_callback(cb: CallbackQuery):
+    await cb.answer()
+    if not await is_subscribed(cb.from_user.id):
+        await cb.answer("Вы ещё не подписаны. Подпишитесь и попробуйте ещё раз.", show_alert=True)
+        return
+    await cb.message.edit_text(
+        f"🌏 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
+        "Высокоскоростной VPN с простой настройкой.\n"
+        "Выберите действие:",
+        reply_markup=main_kb(), parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data == "back")
 async def back_to_main(cb: CallbackQuery):
     await cb.answer()
@@ -1383,6 +1431,49 @@ async def admin_stats(message: types.Message):
  
  
 # ─────────────────────────────────────────────
+#  ADMIN — /subs
+# ─────────────────────────────────────────────
+
+@router.message(Command("subs"))
+async def admin_subs(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    now = int(time.time())
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT user_id, username, expiry_date, tariff_key, limit_ip "
+            "FROM users WHERE expiry_date > ? ORDER BY expiry_date DESC",
+            (now,)
+        ).fetchall()
+
+    if not rows:
+        await message.answer("Активных подписчиков нет.")
+        return
+
+    lines = [f"👥 <b>Активные подписчики ({len(rows)}):</b>\n"]
+    for r in rows:
+        days_left = (r["expiry_date"] - now) // 86400
+        name = f"@{r['username']}" if r["username"] else f"id{r['user_id']}"
+        t_key = r["tariff_key"]
+        if t_key and t_key in TARIFFS:
+            tariff_label = TARIFFS[t_key]["name"]
+        else:
+            limit = r["limit_ip"] or 0
+            tariff_label = DEVICE_OPTIONS.get(limit, f"{limit} устр.")
+        lines.append(f"{name} — {tariff_label}, {days_left} дн.")
+
+    # Разбиваем на части по 50 строк чтобы не превысить лимит Telegram
+    chunk = []
+    for line in lines:
+        chunk.append(line)
+        if len(chunk) >= 51:
+            await message.answer("\n".join(chunk), parse_mode="HTML")
+            chunk = []
+    if chunk:
+        await message.answer("\n".join(chunk), parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
 #  ADMIN — /panel_check
 # ─────────────────────────────────────────────
  
@@ -1451,6 +1542,7 @@ async def admin_help(message: types.Message):
         "📢 <b>Прочее:</b>\n"
         "<code>/broadcast</code> — рассылка всем\n"
         "<code>/stats</code> — статистика\n"
+        "<code>/subs</code> — список активных подписчиков\n"
         "<code>/panel_check</code> — диагностика панели",
         parse_mode="HTML",
     )
