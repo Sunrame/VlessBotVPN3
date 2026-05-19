@@ -473,14 +473,17 @@ async def activate_subscription(user_id: int, days: int, limit_ip: int = 0):
     # Читаем состояние из БД отдельным коннектом
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT expiry_date, sub_token, client_uuid FROM users WHERE user_id=?",
+            "SELECT expiry_date, sub_token, client_uuid, sub_id FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
 
     current_expiry = row["expiry_date"] if row else 0
     token          = row["sub_token"]   if row and row["sub_token"]   else None
     client_uuid    = row["client_uuid"] if row and row["client_uuid"] else None
-    saved_sub_id   = row["sub_id"]      if row and row["sub_id"]      else None
+    try:
+        saved_sub_id = row["sub_id"] if row else None
+    except (IndexError, KeyError):
+        saved_sub_id = None
     new_expiry     = max(current_expiry, now) + delta
     sub_url        = None
 
@@ -913,7 +916,7 @@ async def profile_tab(cb: CallbackQuery):
     await cb.answer()
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT expiry_date, sub_token, client_uuid, tariff_key, limit_ip FROM users WHERE user_id=?",
+            "SELECT expiry_date, sub_token, client_uuid, tariff_key, limit_ip, sub_id FROM users WHERE user_id=?",
             (cb.from_user.id,)
         ).fetchone()
 
@@ -935,7 +938,10 @@ async def profile_tab(cb: CallbackQuery):
             tariff_line = f"\nТариф: <b>{dev_label}</b>" if limit_ip else ""
 
         if row["client_uuid"]:
-            _sub_id  = row["sub_id"] if row["sub_id"] else f"truba_{cb.from_user.id}"
+            try:
+                _sub_id = row["sub_id"] if row["sub_id"] else f"truba_{cb.from_user.id}"
+            except (IndexError, KeyError):
+                _sub_id = f"truba_{cb.from_user.id}"
             sub_url  = build_subscription_url(_sub_id)
             sub_line = f"\n\n🌐 <b>Ссылка на подписку:</b>\n{hcode(sub_url)}"
         else:
@@ -1603,7 +1609,7 @@ async def sync_db_with_panel():
 
     with db_conn() as conn:
         users = conn.execute(
-            "SELECT user_id, client_uuid, sub_token FROM users WHERE expiry_date > ?",
+            "SELECT user_id, client_uuid, sub_token, sub_id FROM users WHERE expiry_date > ?",
             (int(time.time()),)
         ).fetchall()
 
