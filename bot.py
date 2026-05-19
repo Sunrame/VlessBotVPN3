@@ -38,7 +38,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     if _val.isdigit():
         ADMIN_IDS.append(int(_val))
 
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@vvvvvpppnn")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 INBOUND_ID      = int(os.environ.get("INBOUND_ID", "2"))
 
@@ -897,9 +897,9 @@ async def info_tab(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📖 Канал с инструкциями",          url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="📄 Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
+                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
             [InlineKeyboardButton(text="🔐 Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-04-27")],
+                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
