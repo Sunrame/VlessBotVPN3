@@ -44,10 +44,10 @@ Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 #  ТАРИФЫ
 # ─────────────────────────────────────────────
 TARIFFS: dict = {
-    "trial": {"name": "Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
-    "1_dev": {"name": "1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
-    "2_dev": {"name": "2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
-    "5_dev": {"name": "5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
+    "trial": {"name": "🆓 Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
+    "1_dev": {"name": "📱 1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
+    "2_dev": {"name": "📱📱 2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
+    "5_dev": {"name": "🖥️ 5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
 }
 
 MONTH_OPTIONS = {
@@ -231,18 +231,16 @@ async def marzban_get_user(user_id: int) -> dict | None:
         return None
 
 async def marzban_get_online_ips(user_id: int) -> list:
-    """Возвращает список IP которые сейчас онлайн у пользователя."""
-    try:
-        async with httpx.AsyncClient(verify=False) as client:
-            r = await client.get(
-                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}/online",
-                headers=await marz_headers(), timeout=10,
-            )
-            if r.status_code == 200:
-                return r.json() or []
-            return []
-    except Exception:
+    """Проверяет был ли пользователь онлайн в последние 3 минуты."""
+    user = await marzban_get_user(user_id)
+    if not user:
         return []
+    now        = int(time.time())
+    online_at  = user.get("online_at") or 0
+    if online_at > (now - 180):
+        last = time.strftime("%H:%M:%S", time.localtime(online_at))
+        return [f"онлайн (последний раз: {last})"]
+    return []
 
 async def marzban_create_user(user_id: int, days: int, limit_ip: int = 0) -> dict | None:
     expire_ts = int(time.time()) + days * 86400
@@ -1189,9 +1187,9 @@ async def info_tab(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="→ Канал с инструкциями", url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="→ Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
+                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
             [InlineKeyboardButton(text="→ Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+                                  url="https://telegra.ph/Politika-obrabotki-04-27")],
             [InlineKeyboardButton(text="← Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
@@ -1797,43 +1795,44 @@ async def admin_online(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     await message.answer("⏳ Запрашиваю онлайн пользователей...")
-    try:
-        async with httpx.AsyncClient(verify=False) as client:
-            r = await client.get(
-                f"{MARZBAN_URL}/api/users/online",
-                headers=await marz_headers(), timeout=15,
-            )
-            if r.status_code != 200:
-                await message.answer(f"❌ Marzban вернул {r.status_code}")
-                return
-            data    = r.json()
-            unames  = data if isinstance(data, list) else data.get("users", [])
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+    now = int(time.time())
+
+    # В Marzban 0.8.x нет /api/users/online
+    # Используем поле online_at — если оно свежее (< 3 мин назад), пользователь онлайн
+    all_users = await marzban_get_all_users()
+    ONLINE_THRESHOLD = 180  # 3 минуты
+
+    online = [
+        u for u in all_users
+        if u.get("username", "").startswith("truba_")
+        and (u.get("online_at") or 0) > (now - ONLINE_THRESHOLD)
+    ]
+
+    if not online:
+        await message.answer(
+            "🔌 <b>Сейчас никто не подключён</b>\n\n"
+            "<i>Пользователь считается онлайн если был активен в последние 3 минуты.</i>",
+            parse_mode="HTML",
+        )
         return
 
-    # Фильтруем только наших (truba_)
-    our = [u for u in unames if u.startswith("truba_")]
-
-    if not our:
-        await message.answer("🔌 Сейчас никто не подключён.")
-        return
-
-    lines = [f"🟢 <b>Онлайн прямо сейчас: {len(our)} чел.</b>\n"]
-    for uname in our[:30]:
-        uid = uname.replace("truba_", "")
-        # Ищем TG username
+    lines = [f"🟢 <b>Онлайн прямо сейчас: {len(online)} чел.</b>\n"]
+    for u in online[:30]:
+        uid      = u["username"].replace("truba_", "")
+        last_seen = time.strftime("%H:%M:%S", time.localtime(u.get("online_at", 0)))
+        used_gb  = round((u.get("used_traffic") or 0) / 1024**3, 2)
         async with pool.acquire() as conn:
             db_row = await conn.fetchrow(
                 "SELECT username FROM users WHERE user_id=$1",
-                int(uid) if uid.isdigit() else 0
+                int(uid) if uid.isdigit() else 0,
             )
         tg = f"@{db_row['username']}" if db_row and db_row["username"] else f"ID:{uid}"
-        lines.append(f"• {tg}")
+        lines.append(f"• {tg} · {last_seen} · {used_gb}GB")
 
-    if len(our) > 30:
-        lines.append(f"\n... и ещё {len(our) - 30}")
+    if len(online) > 30:
+        lines.append(f"\n... и ещё {len(online) - 30}")
 
+    lines.append("\n<i>Обновляется каждый раз при вызове /online</i>")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 # ─────────────────────────────────────────────
@@ -1956,15 +1955,11 @@ async def admin_check(message: types.Message, command: CommandObject):
             f"🔹 Трафик: <b>{used_gb} GB</b>",
         ]
 
-        # Онлайн устройства
+        # Онлайн статус
         if online_ips:
-            lines.append(f"🔹 Сейчас онлайн: <b>{len(online_ips)} уст.</b>")
-            for i, ip in enumerate(online_ips[:5], 1):
-                lines.append(f"   {i}. <code>{ip}</code>")
-            if len(online_ips) > 5:
-                lines.append(f"   ... и ещё {len(online_ips) - 5}")
+            lines.append(f"🟢 <b>Сейчас онлайн</b> · {online_ips[0]}")
         else:
-            lines.append(f"🔹 Сейчас онлайн: <b>0 уст.</b>")
+            lines.append(f"⚫️ Сейчас офлайн")
         if full_sub:
             lines += ["", f"🌐 Подписка:\n{hcode(full_sub)}"]
     else:
