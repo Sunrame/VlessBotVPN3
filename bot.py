@@ -230,6 +230,20 @@ async def marzban_get_user(user_id: int) -> dict | None:
         log.error("[Marzban] get_user: %s", e)
         return None
 
+async def marzban_get_online_ips(user_id: int) -> list:
+    """Возвращает список IP которые сейчас онлайн у пользователя."""
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            r = await client.get(
+                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}/online",
+                headers=await marz_headers(), timeout=10,
+            )
+            if r.status_code == 200:
+                return r.json() or []
+            return []
+    except Exception:
+        return []
+
 async def marzban_create_user(user_id: int, days: int, limit_ip: int = 0) -> dict | None:
     expire_ts = int(time.time()) + days * 86400
     payload = {
@@ -1175,9 +1189,9 @@ async def info_tab(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="→ Канал с инструкциями", url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="→ Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
+                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
             [InlineKeyboardButton(text="→ Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-04-27")],
+                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
             [InlineKeyboardButton(text="← Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
@@ -1496,23 +1510,330 @@ async def admin_stats(message: types.Message):
     )
 
 # ─────────────────────────────────────────────
-#  ADMIN — /tickets
+#  ADMIN — /tickets  (умный просмотр)
 # ─────────────────────────────────────────────
+
+def tickets_list_kb(tickets: list, page: int = 0, filter_: str = "open") -> InlineKeyboardMarkup:
+    """Клавиатура со списком тикетов постранично."""
+    PAGE_SIZE = 5
+    now       = int(time.time())
+    rows      = []
+
+    page_tickets = tickets[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    for t in page_tickets:
+        uid   = t["user_id"]
+        uname = f"@{t['username']}" if t["username"] else f"ID:{uid}"
+        age_h = (now - t["updated_at"]) // 3600
+        # Метка давности
+        if age_h >= 48:
+            age_label = f"⚠️{age_h//24}д"
+        elif age_h >= 24:
+            age_label = f"🕐{age_h//24}д"
+        else:
+            age_label = f"🕐{age_h}ч"
+        rows.append([InlineKeyboardButton(
+            text=f"#{t['id']} {uname} {age_label}",
+            callback_data=f"tview_{t['id']}"
+        )])
+
+    # Навигация
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"tpage_{filter_}_{page-1}"))
+    total_pages = (len(tickets) + PAGE_SIZE - 1) // PAGE_SIZE
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="tnoop"))
+    if (page + 1) * PAGE_SIZE < len(tickets):
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"tpage_{filter_}_{page+1}"))
+    if nav:
+        rows.append(nav)
+
+    # Фильтры
+    rows.append([
+        InlineKeyboardButton(text="🟢 Открытые" if filter_ == "open" else "Открытые",
+                             callback_data="tfilter_open"),
+        InlineKeyboardButton(text="⚫️ Старые (48ч+)" if filter_ == "old" else "Старые (48ч+)",
+                             callback_data="tfilter_old"),
+        InlineKeyboardButton(text="✅ Закрытые" if filter_ == "closed" else "Закрытые",
+                             callback_data="tfilter_closed"),
+    ])
+
+    # Массовые действия (только для открытых/старых)
+    if filter_ in ("open", "old"):
+        rows.append([
+            InlineKeyboardButton(text="🗑 Закрыть все старые (48ч+)",
+                                 callback_data="tclose_old"),
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _get_tickets(filter_: str) -> list:
+    now = int(time.time())
+    async with pool.acquire() as conn:
+        if filter_ == "open":
+            rows = await conn.fetch(
+                "SELECT id, user_id, username, created_at, updated_at, status "
+                "FROM support_tickets WHERE status='open' ORDER BY updated_at ASC"
+            )
+        elif filter_ == "old":
+            cutoff = now - 48 * 3600
+            rows = await conn.fetch(
+                "SELECT id, user_id, username, created_at, updated_at, status "
+                "FROM support_tickets WHERE status='open' AND updated_at<$1 ORDER BY updated_at ASC",
+                cutoff,
+            )
+        else:  # closed
+            rows = await conn.fetch(
+                "SELECT id, user_id, username, created_at, updated_at, status "
+                "FROM support_tickets WHERE status='closed' ORDER BY updated_at DESC LIMIT 30"
+            )
+    return [dict(r) for r in rows]
+
+
+def _tickets_header(tickets: list, filter_: str) -> str:
+    now     = int(time.time())
+    count   = len(tickets)
+    old_cnt = sum(1 for t in tickets if (now - t["updated_at"]) >= 48 * 3600)
+
+    label = {"open": "🟢 Открытые", "old": "⚠️ Старые (48ч+)", "closed": "✅ Закрытые"}.get(filter_, filter_)
+    header = f"🎫 <b>Тикеты — {label}</b>\n"
+    header += f"Всего: <b>{count}</b>"
+    if filter_ == "open" and old_cnt:
+        header += f" · ⚠️ Забытых (48ч+): <b>{old_cnt}</b>"
+    return header
+
+
 @router.message(Command("tickets"))
 async def admin_tickets(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, user_id, username, created_at FROM support_tickets "
-            "WHERE status='open' ORDER BY created_at DESC LIMIT 10"
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    tickets = await _get_tickets("open")
+    if not tickets:
+        await message.answer("🎉 Открытых тикетов нет!")
+        return
+    await message.answer(
+        _tickets_header(tickets, "open"),
+        parse_mode="HTML",
+        reply_markup=tickets_list_kb(tickets, 0, "open"),
+    )
+
+
+@router.callback_query(F.data.startswith("tfilter_"))
+async def tickets_filter(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    filter_  = cb.data.removeprefix("tfilter_")
+    tickets  = await _get_tickets(filter_)
+    if not tickets:
+        labels = {"open": "открытых", "old": "старых", "closed": "закрытых"}
+        await cb.message.edit_text(
+            f"🎉 Нет {labels.get(filter_, '')} тикетов!",
+            reply_markup=tickets_list_kb([], 0, filter_),
         )
-    if not rows:
-        await message.answer("Открытых тикетов нет. 🎉"); return
-    lines = ["🎫 <b>Открытые тикеты:</b>\n"]
-    for r in rows:
-        uname = f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}"
-        date  = time.strftime("%d.%m %H:%M", time.localtime(r["created_at"]))
-        lines.append(f"#{r['id']} · {uname} · {date}")
+        return
+    await cb.message.edit_text(
+        _tickets_header(tickets, filter_),
+        parse_mode="HTML",
+        reply_markup=tickets_list_kb(tickets, 0, filter_),
+    )
+
+
+@router.callback_query(F.data.startswith("tpage_"))
+async def tickets_page(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    _, filter_, page_str = cb.data.split("_", 2)
+    page    = int(page_str)
+    tickets = await _get_tickets(filter_)
+    await cb.message.edit_text(
+        _tickets_header(tickets, filter_),
+        parse_mode="HTML",
+        reply_markup=tickets_list_kb(tickets, page, filter_),
+    )
+
+
+@router.callback_query(F.data == "tnoop")
+async def tickets_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+@router.callback_query(F.data == "tclose_old")
+async def tickets_close_old(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    now    = int(time.time())
+    cutoff = now - 48 * 3600
+    async with pool.acquire() as conn:
+        old_tickets = await conn.fetch(
+            "SELECT id, user_id FROM support_tickets "
+            "WHERE status='open' AND updated_at<$1", cutoff,
+        )
+        count = len(old_tickets)
+        await conn.execute(
+            "UPDATE support_tickets SET status='closed', updated_at=$1 "
+            "WHERE status='open' AND updated_at<$2",
+            now, cutoff,
+        )
+
+    # Уведомляем пользователей
+    for t in old_tickets:
+        try:
+            await bot.send_message(
+                t["user_id"],
+                "✅ Ваше обращение было автоматически закрыто в связи с отсутствием активности.\n"
+                "Если вопрос остался — напишите снова.",
+            )
+        except Exception:
+            pass
+
+    tickets = await _get_tickets("open")
+    await cb.message.edit_text(
+        f"✅ Закрыто <b>{count}</b> старых тикетов.\n\n" + _tickets_header(tickets, "open"),
+        parse_mode="HTML",
+        reply_markup=tickets_list_kb(tickets, 0, "open"),
+    )
+
+
+@router.callback_query(F.data.startswith("tview_"))
+async def ticket_view(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    ticket_id = int(cb.data.removeprefix("tview_"))
+    now       = int(time.time())
+
+    async with pool.acquire() as conn:
+        ticket = await conn.fetchrow(
+            "SELECT * FROM support_tickets WHERE id=$1", ticket_id
+        )
+        messages = await conn.fetch(
+            "SELECT is_admin, text, sent_at FROM support_messages "
+            "WHERE ticket_id=$1 ORDER BY sent_at ASC LIMIT 10",
+            ticket_id,
+        )
+
+    if not ticket:
+        await cb.answer("Тикет не найден.", show_alert=True)
+        return
+
+    uname    = f"@{ticket['username']}" if ticket["username"] else f"ID:{ticket['user_id']}"
+    age_h    = (now - ticket["updated_at"]) // 3600
+    created  = time.strftime("%d.%m.%Y %H:%M", time.localtime(ticket["created_at"]))
+    updated  = time.strftime("%d.%m.%Y %H:%M", time.localtime(ticket["updated_at"]))
+    status   = "🟢 Открыт" if ticket["status"] == "open" else "✅ Закрыт"
+
+    # Предупреждение о давности
+    age_warn = ""
+    if age_h >= 48:
+        age_warn = f"\n⚠️ <b>Последняя активность {age_h//24} дн. назад — возможно забытый!</b>"
+
+    lines = [
+        f"🎫 <b>Тикет #{ticket_id}</b>",
+        f"👤 {uname}",
+        f"📅 Создан: {created}",
+        f"🔄 Обновлён: {updated}",
+        f"Статус: {status}{age_warn}",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<b>Переписка:</b>",
+    ]
+
+    for msg in messages:
+        prefix  = "🔧 <b>Поддержка</b>" if msg["is_admin"] else f"👤 {uname}"
+        msg_dt  = time.strftime("%d.%m %H:%M", time.localtime(msg["sent_at"]))
+        # Обрезаем длинные сообщения
+        text    = msg["text"][:200] + "..." if len(msg["text"]) > 200 else msg["text"]
+        lines.append(f"\n{prefix} [{msg_dt}]:\n{text}")
+
+    if len(messages) == 10:
+        lines.append("\n<i>... показаны последние 10 сообщений</i>")
+
+    # Кнопки действий
+    kb_rows = []
+    if ticket["status"] == "open":
+        kb_rows.append([
+            InlineKeyboardButton(text="💬 Ответить",
+                                 callback_data=f"sreply_{ticket_id}_{ticket['user_id']}"),
+            InlineKeyboardButton(text="📋 Шаблон",
+                                 callback_data=f"stmpl_{ticket_id}_{ticket['user_id']}"),
+        ])
+        kb_rows.append([
+            InlineKeyboardButton(text="✅ Закрыть тикет",
+                                 callback_data=f"sclose_{ticket_id}"),
+        ])
+    kb_rows.append([
+        InlineKeyboardButton(text="⬅️ К списку", callback_data="tback_open"),
+    ])
+
+    await cb.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+
+
+@router.callback_query(F.data.startswith("tback_"))
+async def ticket_back_to_list(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    filter_  = cb.data.removeprefix("tback_")
+    tickets  = await _get_tickets(filter_)
+    await cb.message.edit_text(
+        _tickets_header(tickets, filter_) if tickets else "🎉 Тикетов нет!",
+        parse_mode="HTML",
+        reply_markup=tickets_list_kb(tickets, 0, filter_),
+    )
+
+# ─────────────────────────────────────────────
+#  ADMIN — /online — кто сейчас подключён
+# ─────────────────────────────────────────────
+@router.message(Command("online"))
+async def admin_online(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer("⏳ Запрашиваю онлайн пользователей...")
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            r = await client.get(
+                f"{MARZBAN_URL}/api/users/online",
+                headers=await marz_headers(), timeout=15,
+            )
+            if r.status_code != 200:
+                await message.answer(f"❌ Marzban вернул {r.status_code}")
+                return
+            data    = r.json()
+            unames  = data if isinstance(data, list) else data.get("users", [])
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+        return
+
+    # Фильтруем только наших (truba_)
+    our = [u for u in unames if u.startswith("truba_")]
+
+    if not our:
+        await message.answer("🔌 Сейчас никто не подключён.")
+        return
+
+    lines = [f"🟢 <b>Онлайн прямо сейчас: {len(our)} чел.</b>\n"]
+    for uname in our[:30]:
+        uid = uname.replace("truba_", "")
+        # Ищем TG username
+        async with pool.acquire() as conn:
+            db_row = await conn.fetchrow(
+                "SELECT username FROM users WHERE user_id=$1",
+                int(uid) if uid.isdigit() else 0
+            )
+        tg = f"@{db_row['username']}" if db_row and db_row["username"] else f"ID:{uid}"
+        lines.append(f"• {tg}")
+
+    if len(our) > 30:
+        lines.append(f"\n... и ещё {len(our) - 30}")
+
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 # ─────────────────────────────────────────────
@@ -1535,9 +1856,10 @@ async def admin_help(message: types.Message):
         "👤 <b>Подписки:</b>\n"
         "<code>/give username дни [устройств]</code>\n"
         "<code>/genkey</code> — интерактивно\n"
-        "<code>/check username|id</code> — инфо о клиенте\n"
+        "<code>/check username|id</code> — инфо о клиенте + онлайн уст.\n"
         "<code>/take username|id</code> — забрать подписку\n"
-        "<code>/subs</code> — список всех подписчиков\n\n"
+        "<code>/subs</code> — список всех подписчиков\n"
+        "<code>/online</code> — кто сейчас подключён\n\n"
         "🎟 <b>Промокоды:</b>\n"
         "<code>/add_promo КОД ДНИ [исп.]</code>\n"
         "<code>/add_promo КОД ДНИ [исп.] free:ТАРИФ</code>\n"
@@ -1588,7 +1910,8 @@ async def admin_check(message: types.Message, command: CommandObject):
     username = db_row["username"] or "—"
 
     # Получаем из Marzban
-    marz_user = await marzban_get_user(user_id)
+    marz_user  = await marzban_get_user(user_id)
+    online_ips = await marzban_get_online_ips(user_id)
 
     # Платежи из БД
     async with pool.acquire() as conn:
@@ -1632,6 +1955,16 @@ async def admin_check(message: types.Message, command: CommandObject):
             f"🔹 До: <b>{date_str}</b> ({days_left} дн.)",
             f"🔹 Трафик: <b>{used_gb} GB</b>",
         ]
+
+        # Онлайн устройства
+        if online_ips:
+            lines.append(f"🔹 Сейчас онлайн: <b>{len(online_ips)} уст.</b>")
+            for i, ip in enumerate(online_ips[:5], 1):
+                lines.append(f"   {i}. <code>{ip}</code>")
+            if len(online_ips) > 5:
+                lines.append(f"   ... и ещё {len(online_ips) - 5}")
+        else:
+            lines.append(f"🔹 Сейчас онлайн: <b>0 уст.</b>")
         if full_sub:
             lines += ["", f"🌐 Подписка:\n{hcode(full_sub)}"]
     else:
