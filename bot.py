@@ -230,17 +230,63 @@ async def marzban_get_user(user_id: int) -> dict | None:
         log.error("[Marzban] get_user: %s", e)
         return None
 
+def parse_online_at(value) -> int:
+    """Конвертирует online_at из Marzban в unix timestamp."""
+    if not value:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        from datetime import timezone
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
 async def marzban_get_online_ips(user_id: int) -> list:
     """Проверяет был ли пользователь онлайн в последние 3 минуты."""
     user = await marzban_get_user(user_id)
     if not user:
         return []
-    now        = int(time.time())
-    online_at  = user.get("online_at") or 0
+    now       = int(time.time())
+    online_at = parse_online_at(user.get("online_at"))
     if online_at > (now - 180):
         last = time.strftime("%H:%M:%S", time.localtime(online_at))
         return [f"онлайн (последний раз: {last})"]
     return []
+
+async def marzban_get_active_sessions(username: str) -> int:
+    """Получает количество активных сессий (устройств) пользователя."""
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            # Пробуем endpoint активных сессий
+            r = await client.get(
+                f"{MARZBAN_URL}/api/user/{username}/active-sessions",
+                headers=await marz_headers(), timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    return len(data)
+                return data.get("total", 0)
+
+            # Fallback: пробуем /sessions
+            r2 = await client.get(
+                f"{MARZBAN_URL}/api/user/{username}/sessions",
+                headers=await marz_headers(), timeout=10,
+            )
+            if r2.status_code == 200:
+                data = r2.json()
+                if isinstance(data, list):
+                    return len(data)
+                return data.get("total", 0)
+
+            return -1  # API не поддерживается
+    except Exception as e:
+        log.error("[Marzban] get_active_sessions: %s", e)
+        return -1
 
 async def marzban_create_user(user_id: int, days: int, limit_ip: int = 0) -> dict | None:
     expire_ts = int(time.time()) + days * 86400
@@ -839,10 +885,23 @@ async def profile_tab(cb: CallbackQuery):
         sub_url   = user.get("subscription_url", "")
         full_sub  = sub_url if sub_url.startswith("http") else f"{MARZBAN_URL}{sub_url}"
         sub_line  = f"\n\n🌐 <b>Ссылка на подписку:</b>\n{hcode(full_sub)}" if full_sub else ""
+        ip_limit  = user.get("ip_limit", 0)
+        dev_label = DEVICE_OPTIONS.get(ip_limit, f"{ip_limit} уст.")
+
+        # Активные сессии
+        active_sess = await marzban_get_active_sessions(marz_username(cb.from_user.id))
+        if active_sess >= 0:
+            limit_str = f"из {ip_limit}" if ip_limit > 0 else ""
+            sess_line = f"\n📱 Подключено сейчас: <b>{active_sess} уст.</b> {limit_str}"
+        else:
+            sess_line = f"\n📱 Тариф: <b>{dev_label}</b>"
+
         text = (
             f"👤 <b>Профиль</b>\n\n"
             f"✅ Подписка активна · до <b>{date_str}</b>\n"
-            f"⏳ Осталось: <b>{days_left} дн.</b>{sub_line}"
+            f"⏳ Осталось: <b>{days_left} дн.</b>"
+            f"{sess_line}"
+            f"{sub_line}"
         )
     else:
         text = (
@@ -1187,9 +1246,9 @@ async def info_tab(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="→ Канал с инструкциями", url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="→ Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
+                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
             [InlineKeyboardButton(text="→ Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-04-27")],
+                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
             [InlineKeyboardButton(text="← Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
@@ -1805,7 +1864,7 @@ async def admin_online(message: types.Message):
     online = [
         u for u in all_users
         if u.get("username", "").startswith("truba_")
-        and (u.get("online_at") or 0) > (now - ONLINE_THRESHOLD)
+        and parse_online_at(u.get("online_at")) > (now - ONLINE_THRESHOLD)
     ]
 
     if not online:
@@ -1819,7 +1878,7 @@ async def admin_online(message: types.Message):
     lines = [f"🟢 <b>Онлайн прямо сейчас: {len(online)} чел.</b>\n"]
     for u in online[:30]:
         uid      = u["username"].replace("truba_", "")
-        last_seen = time.strftime("%H:%M:%S", time.localtime(u.get("online_at", 0)))
+        last_seen = time.strftime("%H:%M:%S", time.localtime(parse_online_at(u.get("online_at", 0))))
         used_gb  = round((u.get("used_traffic") or 0) / 1024**3, 2)
         async with pool.acquire() as conn:
             db_row = await conn.fetchrow(
@@ -1909,8 +1968,9 @@ async def admin_check(message: types.Message, command: CommandObject):
     username = db_row["username"] or "—"
 
     # Получаем из Marzban
-    marz_user  = await marzban_get_user(user_id)
-    online_ips = await marzban_get_online_ips(user_id)
+    marz_user    = await marzban_get_user(user_id)
+    online_ips   = await marzban_get_online_ips(user_id)
+    active_sess  = await marzban_get_active_sessions(marz_username(user_id)) if marz_user else -1
 
     # Платежи из БД
     async with pool.acquire() as conn:
@@ -1960,6 +2020,15 @@ async def admin_check(message: types.Message, command: CommandObject):
             lines.append(f"🟢 <b>Сейчас онлайн</b> · {online_ips[0]}")
         else:
             lines.append(f"⚫️ Сейчас офлайн")
+
+        # Активные сессии (устройства)
+        if active_sess >= 0:
+            limit_label = f"из {ip_limit}" if ip_limit > 0 else "без лимита"
+            emoji = "🔴" if ip_limit > 0 and active_sess >= ip_limit else "🟡" if active_sess > 0 else "⚫️"
+            lines.append(f"{emoji} Активных устройств: <b>{active_sess}</b> ({limit_label})")
+        else:
+            # API не поддерживается — показываем только онлайн статус по online_at
+            lines.append(f"📱 Лимит устройств: <b>{dev_label}</b>")
         if full_sub:
             lines += ["", f"🌐 Подписка:\n{hcode(full_sub)}"]
     else:
