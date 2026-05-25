@@ -44,10 +44,10 @@ Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 #  ТАРИФЫ
 # ─────────────────────────────────────────────
 TARIFFS: dict = {
-    "trial": {"name": "Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
-    "1_dev": {"name": "1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
-    "2_dev": {"name": "2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
-    "5_dev": {"name": "5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
+    "trial": {"name": "🆓 Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
+    "1_dev": {"name": "📱 1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
+    "2_dev": {"name": "📱📱 2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
+    "5_dev": {"name": "🖥️ 5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
 }
 
 MONTH_OPTIONS = {
@@ -1246,9 +1246,9 @@ async def info_tab(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="→ Канал с инструкциями", url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="→ Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
+                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
             [InlineKeyboardButton(text="→ Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+                                  url="https://telegra.ph/Politika-obrabotki-04-27")],
             [InlineKeyboardButton(text="← Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
@@ -1939,6 +1939,125 @@ async def admin_help(message: types.Message):
 # ─────────────────────────────────────────────
 #  ADMIN — /check username|id — инфо о клиенте
 # ─────────────────────────────────────────────
+def _check_kb(user_id: int, ip_limit: int) -> InlineKeyboardMarkup:
+    """Клавиатура для /check с редактированием лимита устройств."""
+    limit_rows = []
+    row = []
+    for limit, label in DEVICE_OPTIONS.items():
+        mark = "✅ " if limit == ip_limit else ""
+        row.append(InlineKeyboardButton(
+            text=f"{mark}{label}",
+            callback_data=f"setlim_{user_id}_{limit}"
+        ))
+        if len(row) == 3:
+            limit_rows.append(row); row = []
+    if row:
+        limit_rows.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 +30 дней", callback_data=f"quickgive_{user_id}_30"),
+         InlineKeyboardButton(text="🎁 +7 дней",  callback_data=f"quickgive_{user_id}_7")],
+        *limit_rows,
+        [InlineKeyboardButton(text="🚫 Забрать подписку", callback_data=f"quicktake_{user_id}")],
+    ])
+
+
+async def _build_check_text(user_id: int, username: str, db_row, now: int) -> tuple[str, int]:
+    """Строит текст /check. Возвращает (текст, ip_limit)."""
+    marz_user = await marzban_get_user(user_id)
+
+    async with pool.acquire() as conn:
+        payments = await conn.fetch(
+            "SELECT amount, tariff_key, days, is_trial, created_at FROM payments "
+            "WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5", user_id,
+        )
+        ref_count    = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id=$1", user_id)
+        ticket_count = await conn.fetchval("SELECT COUNT(*) FROM support_tickets WHERE user_id=$1", user_id)
+
+    lines = [
+        f"👤 <b>Клиент: @{username}</b> (ID: <code>{user_id}</code>)\n",
+        f"💳 Платил: {'✅ Да' if db_row['has_paid'] else '❌ Нет'}",
+        f"👥 Рефералов: <b>{ref_count}</b>  🎫 Тикетов: <b>{ticket_count}</b>",
+    ]
+
+    ip_limit = 0
+
+    if marz_user:
+        expire    = marz_user.get("expire", 0)
+        days_left = max(0, (expire - now) // 86400)
+        date_str  = time.strftime("%d.%m.%Y", time.localtime(expire)) if expire else "∞"
+        used_gb   = round((marz_user.get("used_traffic") or 0) / 1024**3, 2)
+        ip_limit  = marz_user.get("ip_limit", 0)
+        status    = "✅ Активна" if (expire or 0) > now else "❌ Истекла"
+        dev_label = DEVICE_OPTIONS.get(ip_limit, f"{ip_limit} уст.")
+        sub_url   = marz_user.get("subscription_url", "")
+        full_sub  = sub_url if sub_url.startswith("http") else f"{MARZBAN_URL}{sub_url}"
+        online_at = parse_online_at(marz_user.get("online_at"))
+        is_online = online_at > (now - 180)
+
+        lines += [
+            "",
+            f"📡 <b>Подписка:</b> {status}",
+            f"📅 До: <b>{date_str}</b> ({days_left} дн.)",
+            f"📊 Трафик: <b>{used_gb} GB</b>",
+        ]
+
+        # Онлайн / офлайн
+        if is_online:
+            last = time.strftime("%H:%M:%S", time.localtime(online_at))
+            lines.append(f"🟢 <b>Онлайн</b> (последняя активность: {last})")
+        else:
+            if online_at:
+                last = time.strftime("%d.%m %H:%M", time.localtime(online_at))
+                lines.append(f"⚫️ Офлайн (был: {last})")
+            else:
+                lines.append(f"⚫️ Офлайн (не подключался)")
+
+        # Устройства — IP из Marzban
+        # Marzban хранит список IP в поле node_ips или ips (зависит от версии)
+        raw_ips: list = (
+            marz_user.get("node_ips") or
+            marz_user.get("ips") or
+            []
+        )
+
+        lines.append("")
+        lines.append(f"📱 <b>Устройства</b> (лимит: {dev_label}):")
+
+        if raw_ips:
+            for ip_entry in raw_ips[:10]:
+                # ip_entry может быть строкой или dict с полями ip, node_name
+                if isinstance(ip_entry, dict):
+                    ip_addr   = ip_entry.get("ip", "?")
+                    node_name = ip_entry.get("node_name") or ip_entry.get("node", "")
+                    node_part = f" [{node_name}]" if node_name else ""
+                else:
+                    ip_addr   = str(ip_entry)
+                    node_part = ""
+                lines.append(f"  • <code>{ip_addr}</code>{node_part}")
+            if len(raw_ips) > 10:
+                lines.append(f"  ... и ещё {len(raw_ips) - 10}")
+        else:
+            lines.append("  <i>IP адреса не доступны в этой версии Marzban</i>")
+            lines.append(f"  <i>(онлайн статус определяется по online_at)</i>")
+
+        if full_sub:
+            lines += ["", f"🌐 <code>{full_sub}</code>"]
+    else:
+        lines.append("\n📡 <b>Подписки в Marzban нет</b>")
+
+    if payments:
+        lines += ["", "💳 <b>Платежи (последние 5):</b>"]
+        for p in payments:
+            dt         = time.strftime("%d.%m.%Y", time.localtime(p["created_at"]))
+            t_name     = TARIFFS.get(p["tariff_key"] or "", {}).get("name", p["tariff_key"] or "—")
+            trial_mark = " (триал)" if p["is_trial"] else ""
+            lines.append(f"  • {dt} · {p['amount']:.0f}₽ · {t_name}{trial_mark}")
+
+    lines += ["", "📱 <b>Изменить лимит устройств:</b>"]
+    return "\n".join(lines), ip_limit
+
+
 @router.message(Command("check"))
 async def admin_check(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
@@ -1953,102 +2072,62 @@ async def admin_check(message: types.Message, command: CommandObject):
     target = command.args.strip().lstrip("@")
     now    = int(time.time())
 
-    # Ищем в БД
     async with pool.acquire() as conn:
-        if target.isdigit():
-            db_row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", int(target))
-        else:
-            db_row = await conn.fetchrow("SELECT * FROM users WHERE username=$1", target)
+        db_row = await conn.fetchrow(
+            "SELECT * FROM users WHERE user_id=$1" if target.isdigit() else
+            "SELECT * FROM users WHERE username=$1",
+            int(target) if target.isdigit() else target,
+        )
 
     if not db_row:
-        await message.answer(f"❌ Пользователь <code>{target}</code> не найден в БД.", parse_mode="HTML")
+        await message.answer(f"❌ Пользователь <code>{target}</code> не найден.", parse_mode="HTML")
         return
 
     user_id  = db_row["user_id"]
-    username = db_row["username"] or "—"
+    username = db_row["username"] or str(user_id)
 
-    # Получаем из Marzban
-    marz_user    = await marzban_get_user(user_id)
-    online_ips   = await marzban_get_online_ips(user_id)
-    active_sess  = await marzban_get_active_sessions(marz_username(user_id)) if marz_user else -1
+    text, ip_limit = await _build_check_text(user_id, username, db_row, now)
+    await message.answer(text, parse_mode="HTML", reply_markup=_check_kb(user_id, ip_limit))
 
-    # Платежи из БД
+
+# Изменение лимита устройств прямо из /check
+@router.callback_query(F.data.startswith("setlim_"))
+async def set_ip_limit(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    parts    = cb.data.split("_")
+    user_id  = int(parts[1])
+    new_limit = int(parts[2])
+
+    # Обновляем в Marzban
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            r = await client.put(
+                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}",
+                json={"ip_limit": new_limit},
+                headers=await marz_headers(), timeout=15,
+            )
+            r.raise_for_status()
+    except Exception as e:
+        await cb.answer(f"Ошибка: {e}", show_alert=True)
+        return
+
+    dev_label = DEVICE_OPTIONS.get(new_limit, f"{new_limit} уст.")
+    await cb.answer(f"✅ Лимит изменён: {dev_label}", show_alert=True)
+
+    # Обновляем сообщение
+    now = int(time.time())
     async with pool.acquire() as conn:
-        payments = await conn.fetch(
-            "SELECT amount, tariff_key, days, is_trial, created_at FROM payments "
-            "WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5",
-            user_id,
-        )
-        ref_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE referrer_id=$1", user_id
-        )
-        ticket_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM support_tickets WHERE user_id=$1", user_id
-        )
-
-    # Формируем ответ
-    lines = [
-        f"👤 <b>Информация о клиенте</b>\n",
-        f"🔹 TG: @{username} (ID: <code>{user_id}</code>)",
-        f"🔹 Платил: {'✅ Да' if db_row['has_paid'] else '❌ Нет'}",
-        f"🔹 Рефералов приглашено: <b>{ref_count}</b>",
-        f"🔹 Тикетов поддержки: <b>{ticket_count}</b>",
-        "",
-    ]
-
-    if marz_user:
-        expire    = marz_user.get("expire", 0)
-        days_left = max(0, (expire - now) // 86400)
-        date_str  = time.strftime("%d.%m.%Y", time.localtime(expire)) if expire else "∞"
-        used_gb   = round((marz_user.get("used_traffic") or 0) / 1024**3, 2)
-        ip_limit  = marz_user.get("ip_limit", 0)
-        status    = "✅ Активна" if (expire or 0) > now else "❌ Истекла"
-        dev_label = DEVICE_OPTIONS.get(ip_limit, f"{ip_limit} уст.")
-        sub_url   = marz_user.get("subscription_url", "")
-        full_sub  = sub_url if sub_url.startswith("http") else f"{MARZBAN_URL}{sub_url}"
-
-        lines += [
-            f"📡 <b>Подписка в Marzban:</b>",
-            f"🔹 Статус: {status}",
-            f"🔹 Тариф: {dev_label}",
-            f"🔹 До: <b>{date_str}</b> ({days_left} дн.)",
-            f"🔹 Трафик: <b>{used_gb} GB</b>",
-        ]
-
-        # Онлайн статус
-        if online_ips:
-            lines.append(f"🟢 <b>Сейчас онлайн</b> · {online_ips[0]}")
-        else:
-            lines.append(f"⚫️ Сейчас офлайн")
-
-        # Активные сессии (устройства)
-        if active_sess >= 0:
-            limit_label = f"из {ip_limit}" if ip_limit > 0 else "без лимита"
-            emoji = "🔴" if ip_limit > 0 and active_sess >= ip_limit else "🟡" if active_sess > 0 else "⚫️"
-            lines.append(f"{emoji} Активных устройств: <b>{active_sess}</b> ({limit_label})")
-        else:
-            # API не поддерживается — показываем только онлайн статус по online_at
-            lines.append(f"📱 Лимит устройств: <b>{dev_label}</b>")
-        if full_sub:
-            lines += ["", f"🌐 Подписка:\n{hcode(full_sub)}"]
-    else:
-        lines.append("📡 <b>Подписки в Marzban нет</b>")
-
-    if payments:
-        lines += ["", "💳 <b>Последние платежи:</b>"]
-        for p in payments:
-            dt       = time.strftime("%d.%m.%Y", time.localtime(p["created_at"]))
-            t_name   = TARIFFS.get(p["tariff_key"] or "", {}).get("name", p["tariff_key"] or "—")
-            trial_mark = " (триал)" if p["is_trial"] else ""
-            lines.append(f"  • {dt} · {p['amount']:.0f}₽ · {t_name}{trial_mark}")
-
-    # Кнопки быстрых действий
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Выдать 30 дней", callback_data=f"quickgive_{user_id}_30"),
-         InlineKeyboardButton(text="🎁 Выдать 7 дней",  callback_data=f"quickgive_{user_id}_7")],
-        [InlineKeyboardButton(text="🚫 Забрать подписку", callback_data=f"quicktake_{user_id}")],
-    ])
-    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        db_row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+    if db_row:
+        username = db_row["username"] or str(user_id)
+        text, ip_limit = await _build_check_text(user_id, username, db_row, now)
+        try:
+            await cb.message.edit_text(text, parse_mode="HTML",
+                                       reply_markup=_check_kb(user_id, ip_limit))
+        except Exception:
+            pass
 
 @router.callback_query(F.data.startswith("quickgive_"))
 async def quick_give(cb: CallbackQuery):
