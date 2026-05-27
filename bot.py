@@ -25,7 +25,8 @@ SHOP_ID      = os.environ["SHOP_ID"]
 YOOKASSA_KEY = os.environ["YOOKASSA_KEY"]
 DATABASE_URL    = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
 REMNAWAVE_URL   = os.environ["REMNAWAVE_URL"].rstrip("/")
-REMNAWAVE_TOKEN = os.environ["REMNAWAVE_TOKEN"]
+REMNAWAVE_TOKEN      = os.environ["REMNAWAVE_TOKEN"]
+REMNAWAVE_SQUAD_UUID = os.environ.get("REMNAWAVE_SQUAD_UUID", "")
 
 ADMIN_IDS: list[int] = []
 for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
@@ -33,7 +34,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     if _val.isdigit():
         ADMIN_IDS.append(int(_val))
 
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@vvvvvpppnn")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 CHANNEL_ID      = os.environ.get("CHANNEL_ID", "@Truba_VPN")
 
@@ -43,10 +44,10 @@ Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 #  ТАРИФЫ
 # ─────────────────────────────────────────────
 TARIFFS: dict = {
-    "trial": {"name": "Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
-    "1_dev": {"name": "1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
-    "2_dev": {"name": "2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
-    "5_dev": {"name": "5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
+    "trial": {"name": "🆓 Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
+    "1_dev": {"name": "📱 1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
+    "2_dev": {"name": "📱📱 2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
+    "5_dev": {"name": "🖥️ 5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
 }
 
 MONTH_OPTIONS = {
@@ -200,58 +201,69 @@ def marz_username(user_id: int) -> str:
     return f"truba_{user_id}"
 
 async def marzban_get_user(user_id: int) -> dict | None:
-    """Получает пользователя из Remnawave по username."""
+    """Получает пользователя из Remnawave по username через GET /api/users?username=xxx."""
     try:
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.get(
-                f"{REMNAWAVE_URL}/api/users/username/{marz_username(user_id)}",
+                f"{REMNAWAVE_URL}/api/users",
+                params={"username": marz_username(user_id), "size": 1},
                 headers=rw_headers(), timeout=15,
             )
             if r.status_code == 404:
                 return None
             r.raise_for_status()
             data = r.json()
-            return _rw_to_marz(data.get("response", data))
+            resp = data.get("response", data)
+            users = resp.get("users", []) if isinstance(resp, dict) else []
+            # Ищем точное совпадение по username
+            for u in users:
+                if u.get("username") == marz_username(user_id):
+                    return _rw_to_marz(u)
+            return None
     except Exception as e:
         log.error("[Remnawave] get_user: %s", e)
         return None
 
 def _rw_to_marz(u: dict) -> dict:
-    """Приводит ответ Remnawave к формату, который ожидает остальной код (как Marzban)."""
+    """Приводит ответ Remnawave к формату, который ожидает остальной код (как Marzban).
+    
+    Реальный формат ответа Remnawave:
+    {
+        "uuid": "...", "shortUuid": "n_dJKpQFNTq_CeKQ", "username": "truba_xxx",
+        "status": "ACTIVE", "expireAt": "2026-07-18T21:29:40.000Z",
+        "hwidDeviceLimit": null, "subscriptionUrl": "https://sub.domain/shortUuid",
+        "activeInternalSquads": [],
+        "userTraffic": {"usedTrafficBytes": 0, "onlineAt": null, ...}
+    }
+    """
     if not u:
         return u
-    # expire: Remnawave хранит expireAt в ISO или ms — нормализуем в unix timestamp
-    expire_raw = u.get("expireAt") or u.get("expire")
+
+    # expire: ISO строка -> unix timestamp
+    expire_raw = u.get("expireAt")
     expire_ts  = 0
     if expire_raw:
-        if isinstance(expire_raw, (int, float)):
-            # может быть в миллисекундах
-            expire_ts = int(expire_raw // 1000) if expire_raw > 1e10 else int(expire_raw)
-        else:
-            try:
-                from datetime import timezone
-                dt = datetime.fromisoformat(str(expire_raw).replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                expire_ts = int(dt.timestamp())
-            except Exception:
-                expire_ts = 0
+        try:
+            from datetime import timezone
+            dt = datetime.fromisoformat(str(expire_raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            expire_ts = int(dt.timestamp())
+        except Exception:
+            expire_ts = 0
 
-    # subscription_url
-    sub_token = u.get("subscriptionUrl") or u.get("shortUuid") or u.get("uuid", "")
-    if sub_token and not sub_token.startswith("http"):
-        sub_url = f"{REMNAWAVE_URL}/api/sub/{sub_token}"
-    else:
-        sub_url = sub_token
+    # subscription_url — уже полный URL в subscriptionUrl
+    sub_url = u.get("subscriptionUrl") or ""
 
-    # ip_limit (devices limit) — в Remnawave это hwid / activeUserDevices
-    ip_limit = u.get("activeUserDevices") or u.get("ipLimit") or u.get("ip_limit") or 0
+    # ip_limit — hwidDeviceLimit (может быть null = без лимита = 0)
+    ip_limit = u.get("hwidDeviceLimit") or 0
 
-    # traffic
-    used_traffic = u.get("usedTrafficBytes") or u.get("usedTraffic") or u.get("used_traffic") or 0
+    # traffic — вложен в userTraffic
+    traffic = u.get("userTraffic") or {}
+    used_traffic = traffic.get("usedTrafficBytes") or 0
 
-    # online_at
-    online_raw = u.get("lastOnlineAt") or u.get("online_at")
+    # online_at — вложен в userTraffic.onlineAt
+    online_raw = traffic.get("onlineAt")
 
     return {
         **u,
@@ -261,7 +273,7 @@ def _rw_to_marz(u: dict) -> dict:
         "ip_limit":         ip_limit,
         "used_traffic":     used_traffic,
         "online_at":        online_raw,
-        "status":           u.get("status", "active"),
+        "status":           u.get("status", "ACTIVE"),
         "uuid":             u.get("uuid", ""),
     }
 
@@ -335,19 +347,38 @@ def parse_user_agent(ua: str | None) -> str:
     return f"{platform} · {app}"
 
 async def marzban_get_active_sessions(username: str) -> int:
-    """Получает количество активных сессий (HWID-устройств) пользователя из Remnawave."""
+    """Получает количество HWID-устройств пользователя из Remnawave."""
     try:
         async with httpx.AsyncClient(verify=False) as client:
+            # Сначала получаем uuid пользователя
             r = await client.get(
-                f"{REMNAWAVE_URL}/api/users/username/{username}/hwid",
+                f"{REMNAWAVE_URL}/api/users",
+                params={"username": username, "size": 1},
                 headers=rw_headers(), timeout=10,
             )
-            if r.status_code == 200:
-                data = r.json()
-                resp = data.get("response", data)
-                if isinstance(resp, list):
-                    return len(resp)
-                return resp.get("total", 0)
+            if r.status_code != 200:
+                return -1
+            data = r.json()
+            resp = data.get("response", data)
+            users = resp.get("users", []) if isinstance(resp, dict) else []
+            user_uuid = None
+            for u in users:
+                if u.get("username") == username:
+                    user_uuid = u.get("uuid")
+                    break
+            if not user_uuid:
+                return -1
+            # Получаем список HWID устройств
+            r2 = await client.get(
+                f"{REMNAWAVE_URL}/api/users/{user_uuid}/hwid",
+                headers=rw_headers(), timeout=10,
+            )
+            if r2.status_code == 200:
+                data2 = r2.json()
+                resp2 = data2.get("response", data2)
+                if isinstance(resp2, list):
+                    return len(resp2)
+                return resp2.get("total", 0)
             return -1
     except Exception as e:
         log.error("[Remnawave] get_active_sessions: %s", e)
@@ -365,8 +396,11 @@ async def marzban_create_user(user_id: int, days: int, limit_ip: int = 0) -> dic
         "trafficLimitStrategy": "NO_RESET",
         "expireAt":            expire_iso,
         "status":              "ACTIVE",
-        "activeUserDevices":   limit_ip,
+        "hwidDeviceLimit":     limit_ip if limit_ip > 0 else None,
     }
+    # Добавляем внутренние сквады если настроены
+    if REMNAWAVE_SQUAD_UUID:
+        payload["activeInternalSquads"] = [{"uuid": REMNAWAVE_SQUAD_UUID}]
     try:
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.post(
@@ -406,7 +440,7 @@ async def marzban_extend_user(user_id: int, days: int, limit_ip: int | None = No
 
         payload: dict = {"uuid": user_uuid, "expireAt": new_iso}
         if limit_ip is not None:
-            payload["activeUserDevices"] = limit_ip
+            payload["hwidDeviceLimit"] = limit_ip if limit_ip > 0 else None
 
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.put(
@@ -2209,7 +2243,7 @@ async def set_ip_limit(cb: CallbackQuery):
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.put(
                 f"{REMNAWAVE_URL}/api/users",
-                json={"uuid": user_uuid, "activeUserDevices": new_limit},
+                json={"uuid": user_uuid, "hwidDeviceLimit": new_limit if new_limit > 0 else None},
                 headers=rw_headers(), timeout=15,
             )
             r.raise_for_status()
