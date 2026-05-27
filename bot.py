@@ -23,10 +23,9 @@ from yookassa import Configuration, Payment
 API_TOKEN    = os.environ["BOT_TOKEN"]
 SHOP_ID      = os.environ["SHOP_ID"]
 YOOKASSA_KEY = os.environ["YOOKASSA_KEY"]
-DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
-MARZBAN_URL  = os.environ["MARZBAN_URL"].rstrip("/")
-MARZBAN_USER = os.environ["MARZBAN_USER"]
-MARZBAN_PASS = os.environ["MARZBAN_PASS"]
+DATABASE_URL    = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
+REMNAWAVE_URL   = os.environ["REMNAWAVE_URL"].rstrip("/")
+REMNAWAVE_TOKEN = os.environ["REMNAWAVE_TOKEN"]
 
 ADMIN_IDS: list[int] = []
 for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
@@ -44,10 +43,10 @@ Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 #  ТАРИФЫ
 # ─────────────────────────────────────────────
 TARIFFS: dict = {
-    "trial": {"name": "Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
-    "1_dev": {"name": "1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
-    "2_dev": {"name": "2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
-    "5_dev": {"name": "5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
+    "trial": {"name": "🆓 Пробный",       "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True, "limit_ip": 1},
+    "1_dev": {"name": "📱 1 устройство",  "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 1},
+    "2_dev": {"name": "📱📱 2 устройства","price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 2},
+    "5_dev": {"name": "🖥️ 5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n\n🌐 Высокая скорость", "limit_ip": 5},
 }
 
 MONTH_OPTIONS = {
@@ -188,47 +187,83 @@ async def init_db():
     log.info("PostgreSQL ready.")
 
 # ─────────────────────────────────────────────
-#  MARZBAN API
+#  REMNAWAVE API
 # ─────────────────────────────────────────────
-_marzban_token: str   = ""
-_token_expires: float = 0.0
 
-async def get_marzban_token() -> str:
-    global _marzban_token, _token_expires
-    if time.time() < _token_expires - 60:
-        return _marzban_token
-    async with httpx.AsyncClient(verify=False) as client:
-        r = await client.post(
-            f"{MARZBAN_URL}/api/admin/token",
-            data={"username": MARZBAN_USER, "password": MARZBAN_PASS},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        _marzban_token = r.json()["access_token"]
-        _token_expires = time.time() + 86000
-        return _marzban_token
-
-async def marz_headers() -> dict:
-    return {"Authorization": f"Bearer {await get_marzban_token()}"}
+def rw_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {REMNAWAVE_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
 def marz_username(user_id: int) -> str:
     return f"truba_{user_id}"
 
 async def marzban_get_user(user_id: int) -> dict | None:
+    """Получает пользователя из Remnawave по username."""
     try:
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.get(
-                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}",
-                headers=await marz_headers(), timeout=15,
+                f"{REMNAWAVE_URL}/api/users/by-username/{marz_username(user_id)}",
+                headers=rw_headers(), timeout=15,
             )
             if r.status_code == 404:
                 return None
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            return _rw_to_marz(data.get("response", data))
     except Exception as e:
-        log.error("[Marzban] get_user: %s", e)
+        log.error("[Remnawave] get_user: %s", e)
         return None
+
+def _rw_to_marz(u: dict) -> dict:
+    """Приводит ответ Remnawave к формату, который ожидает остальной код (как Marzban)."""
+    if not u:
+        return u
+    # expire: Remnawave хранит expireAt в ISO или ms — нормализуем в unix timestamp
+    expire_raw = u.get("expireAt") or u.get("expire")
+    expire_ts  = 0
+    if expire_raw:
+        if isinstance(expire_raw, (int, float)):
+            # может быть в миллисекундах
+            expire_ts = int(expire_raw // 1000) if expire_raw > 1e10 else int(expire_raw)
+        else:
+            try:
+                from datetime import timezone
+                dt = datetime.fromisoformat(str(expire_raw).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                expire_ts = int(dt.timestamp())
+            except Exception:
+                expire_ts = 0
+
+    # subscription_url
+    sub_token = u.get("subscriptionUrl") or u.get("shortUuid") or u.get("uuid", "")
+    if sub_token and not sub_token.startswith("http"):
+        sub_url = f"{REMNAWAVE_URL}/api/sub/{sub_token}"
+    else:
+        sub_url = sub_token
+
+    # ip_limit (devices limit) — в Remnawave это hwid / activeUserDevices
+    ip_limit = u.get("activeUserDevices") or u.get("ipLimit") or u.get("ip_limit") or 0
+
+    # traffic
+    used_traffic = u.get("usedTrafficBytes") or u.get("usedTraffic") or u.get("used_traffic") or 0
+
+    # online_at
+    online_raw = u.get("lastOnlineAt") or u.get("online_at")
+
+    return {
+        **u,
+        "username":         u.get("username", ""),
+        "expire":           expire_ts,
+        "subscription_url": sub_url,
+        "ip_limit":         ip_limit,
+        "used_traffic":     used_traffic,
+        "online_at":        online_raw,
+        "status":           u.get("status", "active"),
+        "uuid":             u.get("uuid", ""),
+    }
 
 def parse_online_at(value) -> int:
     """Конвертирует online_at из Marzban в unix timestamp."""
@@ -257,83 +292,132 @@ async def marzban_get_online_ips(user_id: int) -> list:
         return [f"онлайн (последний раз: {last})"]
     return []
 
+def parse_user_agent(ua: str | None) -> str:
+    """Парсит User-Agent от Marzban в читаемый вид."""
+    if not ua:
+        return "неизвестно"
+    ua = ua.lower()
+
+    # Определяем приложение
+    if "happ" in ua:
+        app = "Happ"
+    elif "v2rayn" in ua or "v2rayng" in ua:
+        app = "v2rayNG"
+    elif "streisand" in ua:
+        app = "Streisand"
+    elif "shadowrocket" in ua:
+        app = "Shadowrocket"
+    elif "clash" in ua:
+        app = "Clash"
+    elif "sing-box" in ua or "singbox" in ua:
+        app = "Sing-Box"
+    elif "quantumult" in ua:
+        app = "Quantumult"
+    elif "surge" in ua:
+        app = "Surge"
+    else:
+        app = ua.split("/")[0].capitalize()
+
+    # Определяем платформу
+    if "ios" in ua or "iphone" in ua or "ipad" in ua:
+        platform = "📱 iOS"
+    elif "android" in ua:
+        platform = "📱 Android"
+    elif "mac" in ua or "macos" in ua or "darwin" in ua:
+        platform = "💻 macOS"
+    elif "windows" in ua or "win" in ua:
+        platform = "🖥️ Windows"
+    elif "linux" in ua:
+        platform = "🖥️ Linux"
+    else:
+        platform = "📲"
+
+    return f"{platform} · {app}"
+
 async def marzban_get_active_sessions(username: str) -> int:
-    """Получает количество активных сессий (устройств) пользователя."""
+    """Получает количество активных сессий (HWID-устройств) пользователя из Remnawave."""
     try:
         async with httpx.AsyncClient(verify=False) as client:
-            # Пробуем endpoint активных сессий
             r = await client.get(
-                f"{MARZBAN_URL}/api/user/{username}/active-sessions",
-                headers=await marz_headers(), timeout=10,
+                f"{REMNAWAVE_URL}/api/users/by-username/{username}/hwid",
+                headers=rw_headers(), timeout=10,
             )
             if r.status_code == 200:
                 data = r.json()
-                if isinstance(data, list):
-                    return len(data)
-                return data.get("total", 0)
-
-            # Fallback: пробуем /sessions
-            r2 = await client.get(
-                f"{MARZBAN_URL}/api/user/{username}/sessions",
-                headers=await marz_headers(), timeout=10,
-            )
-            if r2.status_code == 200:
-                data = r2.json()
-                if isinstance(data, list):
-                    return len(data)
-                return data.get("total", 0)
-
-            return -1  # API не поддерживается
+                resp = data.get("response", data)
+                if isinstance(resp, list):
+                    return len(resp)
+                return resp.get("total", 0)
+            return -1
     except Exception as e:
-        log.error("[Marzban] get_active_sessions: %s", e)
+        log.error("[Remnawave] get_active_sessions: %s", e)
         return -1
 
 async def marzban_create_user(user_id: int, days: int, limit_ip: int = 0) -> dict | None:
-    expire_ts = int(time.time()) + days * 86400
+    """Создаёт пользователя в Remnawave."""
+    from datetime import timezone
+    expire_dt = datetime.now(timezone.utc) + timedelta(days=days)
+    expire_iso = expire_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
     payload = {
-        "username": marz_username(user_id),
-        "proxies":  {"vless": {"flow": "xtls-rprx-vision"}},
-        "inbounds": {"vless": ["VLESS TCP REALITY"]},
-        "expire":   expire_ts, "data_limit": 0,
-        "ip_limit": limit_ip, "status": "active",
+        "username":            marz_username(user_id),
+        "trafficLimitBytes":   0,
+        "trafficLimitStrategy": "NO_RESET",
+        "expireAt":            expire_iso,
+        "status":              "ACTIVE",
+        "activeUserDevices":   limit_ip,
     }
     try:
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.post(
-                f"{MARZBAN_URL}/api/user",
-                json=payload, headers=await marz_headers(), timeout=15,
+                f"{REMNAWAVE_URL}/api/users",
+                json=payload, headers=rw_headers(), timeout=15,
             )
-            if r.status_code == 409:
+            if r.status_code in (409, 400):
+                # Пользователь уже существует — продлеваем
                 return await marzban_extend_user(user_id, days, limit_ip)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            return _rw_to_marz(data.get("response", data))
     except Exception as e:
-        log.error("[Marzban] create_user: %s", e)
+        log.error("[Remnawave] create_user: %s", e)
         return None
 
 async def marzban_extend_user(user_id: int, days: int, limit_ip: int | None = None) -> dict | None:
+    """Продлевает подписку пользователя в Remnawave."""
+    from datetime import timezone
     try:
+        # Сначала получаем текущего пользователя чтобы узнать uuid и текущий expire
+        existing = await marzban_get_user(user_id)
+        if not existing:
+            return await marzban_create_user(user_id, days, limit_ip or 0)
+
+        now        = int(time.time())
+        current_ts = existing.get("expire") or now
+        new_ts     = max(current_ts, now) + days * 86400
+        new_dt     = datetime.fromtimestamp(new_ts, tz=timezone.utc)
+        new_iso    = new_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        # uuid нужен для PATCH/PUT
+        user_uuid = existing.get("uuid") or existing.get("id")
+        if not user_uuid:
+            log.error("[Remnawave] extend_user: no uuid for user %s", user_id)
+            return None
+
+        payload: dict = {"expireAt": new_iso}
+        if limit_ip is not None:
+            payload["activeUserDevices"] = limit_ip
+
         async with httpx.AsyncClient(verify=False) as client:
-            r = await client.get(
-                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}",
-                headers=await marz_headers(), timeout=15,
+            r = await client.patch(
+                f"{REMNAWAVE_URL}/api/users/{user_uuid}",
+                json=payload, headers=rw_headers(), timeout=15,
             )
             r.raise_for_status()
-            user = r.json()
-            now        = int(time.time())
-            current    = user.get("expire") or now
-            new_expire = max(current, now) + days * 86400
-            payload: dict = {"expire": new_expire}
-            if limit_ip is not None:
-                payload["ip_limit"] = limit_ip
-            r2 = await client.put(
-                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}",
-                json=payload, headers=await marz_headers(), timeout=15,
-            )
-            r2.raise_for_status()
-            return r2.json()
+            data = r.json()
+            return _rw_to_marz(data.get("response", data))
     except Exception as e:
-        log.error("[Marzban] extend_user: %s", e)
+        log.error("[Remnawave] extend_user: %s", e)
         return None
 
 async def activate_subscription(user_id: int, days: int, limit_ip: int = 0) -> dict | None:
@@ -343,16 +427,31 @@ async def activate_subscription(user_id: int, days: int, limit_ip: int = 0) -> d
     return await marzban_create_user(user_id, days, limit_ip)
 
 async def marzban_get_all_users() -> list:
+    """Получает всех пользователей из Remnawave (постранично)."""
     try:
+        all_users = []
+        page = 1
+        size = 100
         async with httpx.AsyncClient(verify=False) as client:
-            r = await client.get(
-                f"{MARZBAN_URL}/api/users?limit=1000",
-                headers=await marz_headers(), timeout=30,
-            )
-            r.raise_for_status()
-            return r.json().get("users", [])
+            while True:
+                r = await client.get(
+                    f"{REMNAWAVE_URL}/api/users",
+                    params={"page": page, "size": size},
+                    headers=rw_headers(), timeout=30,
+                )
+                r.raise_for_status()
+                body  = r.json()
+                resp  = body.get("response", body)
+                users = resp.get("users", resp) if isinstance(resp, dict) else resp
+                if not users:
+                    break
+                all_users.extend([_rw_to_marz(u) for u in users])
+                if len(users) < size:
+                    break
+                page += 1
+        return all_users
     except Exception as e:
-        log.error("[Marzban] get_all_users: %s", e)
+        log.error("[Remnawave] get_all_users: %s", e)
         return []
 
 # ─────────────────────────────────────────────
@@ -374,7 +473,7 @@ def format_key_message(user: dict) -> str:
     expire   = user.get("expire", 0)
     sub_url  = user.get("subscription_url", "")
     date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(expire)) if expire else "∞"
-    full_sub = sub_url if sub_url.startswith("http") else f"{MARZBAN_URL}{sub_url}"
+    full_sub = sub_url if sub_url.startswith("http") else f"{REMNAWAVE_URL}/api/sub/{sub_url}"
     lines = [f"🗓 Подписка активна до: <b>{date_str}</b>", "", "━━━━━━━━━━━━━━━━━━━━"]
     if full_sub:
         lines += [
@@ -683,10 +782,10 @@ async def cmd_subs(message: types.Message, command: CommandObject):
 
     # ── АДМИН: список всех подписчиков ──────────────────────────
     if message.from_user.id in ADMIN_IDS:
-        await message.answer("⏳ Загружаю список подписчиков из Marzban...")
+        await message.answer("⏳ Загружаю список подписчиков из Remnawave...")
         all_marz = await marzban_get_all_users()
         if not all_marz:
-            await message.answer("Не удалось получить список из Marzban.")
+            await message.answer("Не удалось получить список из Remnawave.")
             return
 
         # Фильтр: только с именем truba_ (наши пользователи)
@@ -757,7 +856,7 @@ async def cmd_subs(message: types.Message, command: CommandObject):
     days_left = (expire - now) // 86400
     date_str  = time.strftime("%d.%m.%Y %H:%M", time.localtime(expire))
     sub_url   = user.get("subscription_url", "")
-    full_sub  = sub_url if sub_url.startswith("http") else f"{MARZBAN_URL}{sub_url}"
+    full_sub  = sub_url if sub_url.startswith("http") else f"{REMNAWAVE_URL}/api/sub/{sub_url}"
     used_gb   = round((user.get("used_traffic", 0) or 0) / 1024**3, 2)
     ip_limit  = user.get("ip_limit", 0)
     dev_label = DEVICE_OPTIONS.get(ip_limit, f"{ip_limit} уст.")
@@ -883,7 +982,7 @@ async def profile_tab(cb: CallbackQuery):
         days_left = (expire - now) // 86400
         date_str  = time.strftime("%d.%m.%Y", time.localtime(expire))
         sub_url   = user.get("subscription_url", "")
-        full_sub  = sub_url if sub_url.startswith("http") else f"{MARZBAN_URL}{sub_url}"
+        full_sub  = sub_url if sub_url.startswith("http") else f"{REMNAWAVE_URL}/api/sub/{sub_url}"
         sub_line  = f"\n\n🌐 <b>Ссылка на подписку:</b>\n{hcode(full_sub)}" if full_sub else ""
         ip_limit  = user.get("ip_limit", 0)
         dev_label = DEVICE_OPTIONS.get(ip_limit, f"{ip_limit} уст.")
@@ -1547,10 +1646,13 @@ async def admin_stats(message: types.Message):
     try:
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.get(
-                f"{MARZBAN_URL}/api/users?status=active",
-                headers=await marz_headers(), timeout=15,
+                f"{REMNAWAVE_URL}/api/users",
+                params={"page": 1, "size": 1, "status": "ACTIVE"},
+                headers=rw_headers(), timeout=15,
             )
-            active = r.json().get("total", "?")
+            body = r.json()
+            resp = body.get("response", body)
+            active = resp.get("total", "?") if isinstance(resp, dict) else "?"
     except Exception:
         active = "?"
     dnd = await is_admin_dnd(message.from_user.id)
@@ -1877,16 +1979,16 @@ async def admin_online(message: types.Message):
 
     lines = [f"🟢 <b>Онлайн прямо сейчас: {len(online)} чел.</b>\n"]
     for u in online[:30]:
-        uid      = u["username"].replace("truba_", "")
+        uid       = u["username"].replace("truba_", "")
         last_seen = time.strftime("%H:%M:%S", time.localtime(parse_online_at(u.get("online_at", 0))))
-        used_gb  = round((u.get("used_traffic") or 0) / 1024**3, 2)
+        ua        = parse_user_agent(u.get("sub_last_user_agent"))
         async with pool.acquire() as conn:
             db_row = await conn.fetchrow(
                 "SELECT username FROM users WHERE user_id=$1",
                 int(uid) if uid.isdigit() else 0,
             )
         tg = f"@{db_row['username']}" if db_row and db_row["username"] else f"ID:{uid}"
-        lines.append(f"• {tg} · {last_seen} · {used_gb}GB")
+        lines.append(f"• {tg} · {last_seen} · {ua}")
 
     if len(online) > 30:
         lines.append(f"\n... и ещё {len(online) - 30}")
@@ -1991,7 +2093,7 @@ async def _build_check_text(user_id: int, username: str, db_row, now: int) -> tu
         status    = "✅ Активна" if (expire or 0) > now else "❌ Истекла"
         dev_label = DEVICE_OPTIONS.get(ip_limit, f"{ip_limit} уст.")
         sub_url   = marz_user.get("subscription_url", "")
-        full_sub  = sub_url if sub_url.startswith("http") else f"{MARZBAN_URL}{sub_url}"
+        full_sub  = sub_url if sub_url.startswith("http") else f"{REMNAWAVE_URL}/api/sub/{sub_url}"
         online_at = parse_online_at(marz_user.get("online_at"))
         is_online = online_at > (now - 180)
 
@@ -2005,7 +2107,7 @@ async def _build_check_text(user_id: int, username: str, db_row, now: int) -> tu
         # Онлайн / офлайн
         if is_online:
             last = time.strftime("%H:%M:%S", time.localtime(online_at))
-            lines.append(f"🟢 <b>Онлайн</b> (последняя активность: {last})")
+            lines.append(f"🟢 <b>Онлайн</b> (активность: {last})")
         else:
             if online_at:
                 last = time.strftime("%d.%m %H:%M", time.localtime(online_at))
@@ -2013,33 +2115,30 @@ async def _build_check_text(user_id: int, username: str, db_row, now: int) -> tu
             else:
                 lines.append(f"⚫️ Офлайн (не подключался)")
 
-        # Устройства — IP из Marzban
-        # Marzban хранит список IP в поле node_ips или ips (зависит от версии)
-        raw_ips: list = (
-            marz_user.get("node_ips") or
-            marz_user.get("ips") or
-            []
-        )
-
-        lines.append("")
-        lines.append(f"📱 <b>Устройства</b> (лимит: {dev_label}):")
-
-        if raw_ips:
-            for ip_entry in raw_ips[:10]:
-                # ip_entry может быть строкой или dict с полями ip, node_name
-                if isinstance(ip_entry, dict):
-                    ip_addr   = ip_entry.get("ip", "?")
-                    node_name = ip_entry.get("node_name") or ip_entry.get("node", "")
-                    node_part = f" [{node_name}]" if node_name else ""
-                else:
-                    ip_addr   = str(ip_entry)
-                    node_part = ""
-                lines.append(f"  • <code>{ip_addr}</code>{node_part}")
-            if len(raw_ips) > 10:
-                lines.append(f"  ... и ещё {len(raw_ips) - 10}")
+        # Последнее устройство из User-Agent подписки
+        ua_raw    = marz_user.get("sub_last_user_agent")
+        ua_parsed = parse_user_agent(ua_raw)
+        sub_upd   = marz_user.get("sub_updated_at", "")
+        if sub_upd:
+            try:
+                from datetime import timezone
+                dt = datetime.fromisoformat(sub_upd.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                sub_upd_str = time.strftime("%d.%m %H:%M", time.localtime(int(dt.timestamp())))
+            except Exception:
+                sub_upd_str = sub_upd[:16]
         else:
-            lines.append("  <i>IP адреса не доступны в этой версии Marzban</i>")
-            lines.append(f"  <i>(онлайн статус определяется по online_at)</i>")
+            sub_upd_str = "—"
+
+        lines += [
+            "",
+            f"📱 <b>Устройства</b> (лимит: {dev_label}):",
+            f"  Последнее подключение: <b>{ua_parsed}</b>",
+            f"  Подписка обновлена: <b>{sub_upd_str}</b>",
+        ]
+        if ua_raw:
+            lines.append(f"  <i>UA: {ua_raw[:60]}</i>")
 
         if full_sub:
             lines += ["", f"🌐 <code>{full_sub}</code>"]
@@ -2100,13 +2199,18 @@ async def set_ip_limit(cb: CallbackQuery):
     user_id  = int(parts[1])
     new_limit = int(parts[2])
 
-    # Обновляем в Marzban
+    # Обновляем в Remnawave
     try:
+        existing = await marzban_get_user(user_id)
+        if not existing:
+            await cb.answer("Пользователь не найден в Remnawave.", show_alert=True)
+            return
+        user_uuid = existing.get("uuid") or existing.get("id")
         async with httpx.AsyncClient(verify=False) as client:
-            r = await client.put(
-                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}",
-                json={"ip_limit": new_limit},
-                headers=await marz_headers(), timeout=15,
+            r = await client.patch(
+                f"{REMNAWAVE_URL}/api/users/{user_uuid}",
+                json={"activeUserDevices": new_limit},
+                headers=rw_headers(), timeout=15,
             )
             r.raise_for_status()
     except Exception as e:
@@ -2177,18 +2281,24 @@ async def quick_take(cb: CallbackQuery):
 #  ADMIN — /take username|id — забрать подписку
 # ─────────────────────────────────────────────
 async def _do_take(user_id: int):
-    """Устанавливает expire = now (мгновенно истекает)."""
+    """Деактивирует пользователя в Remnawave."""
     try:
+        existing = await marzban_get_user(user_id)
+        if not existing:
+            return False
+        user_uuid = existing.get("uuid") or existing.get("id")
+        if not user_uuid:
+            return False
         async with httpx.AsyncClient(verify=False) as client:
-            r = await client.put(
-                f"{MARZBAN_URL}/api/user/{marz_username(user_id)}",
-                json={"expire": int(time.time()), "status": "disabled"},
-                headers=await marz_headers(), timeout=15,
+            r = await client.patch(
+                f"{REMNAWAVE_URL}/api/users/{user_uuid}",
+                json={"status": "DISABLED"},
+                headers=rw_headers(), timeout=15,
             )
             r.raise_for_status()
             return True
     except Exception as e:
-        log.error("[Marzban] take subscription: %s", e)
+        log.error("[Remnawave] take subscription: %s", e)
         return False
 
 @router.message(Command("take"))
@@ -2230,7 +2340,7 @@ async def admin_take(message: types.Message, command: CommandObject):
         except Exception:
             pass
     else:
-        await message.answer("❌ Ошибка при отзыве подписки. Проверьте Marzban.")
+        await message.answer("❌ Ошибка при отзыве подписки. Проверьте Remnawave.")
 
 # ─────────────────────────────────────────────
 #  ПОЧИНКА ОТЧЁТА — обновлённая функция
@@ -2332,10 +2442,10 @@ async def send_daily_report():
 # ─────────────────────────────────────────────
 async def main():
     await init_db()
-    await get_marzban_token()
+    # Remnawave использует статический токен, прогрев не нужен
     dp.include_router(router)
     asyncio.create_task(daily_report_scheduler())
-    log.info("TrubaVPN Bot starting (Marzban + Support + Reports)...")
+    log.info("TrubaVPN Bot starting (Remnawave + Support + Reports)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
