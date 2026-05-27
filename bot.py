@@ -204,7 +204,7 @@ async def marzban_get_user(user_id: int) -> dict | None:
     try:
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.get(
-                f"{REMNAWAVE_URL}/api/users/by-username/{marz_username(user_id)}",
+                f"{REMNAWAVE_URL}/api/users/username/{marz_username(user_id)}",
                 headers=rw_headers(), timeout=15,
             )
             if r.status_code == 404:
@@ -339,7 +339,7 @@ async def marzban_get_active_sessions(username: str) -> int:
     try:
         async with httpx.AsyncClient(verify=False) as client:
             r = await client.get(
-                f"{REMNAWAVE_URL}/api/users/by-username/{username}/hwid",
+                f"{REMNAWAVE_URL}/api/users/username/{username}/hwid",
                 headers=rw_headers(), timeout=10,
             )
             if r.status_code == 200:
@@ -404,13 +404,13 @@ async def marzban_extend_user(user_id: int, days: int, limit_ip: int | None = No
             log.error("[Remnawave] extend_user: no uuid for user %s", user_id)
             return None
 
-        payload: dict = {"expireAt": new_iso}
+        payload: dict = {"uuid": user_uuid, "expireAt": new_iso}
         if limit_ip is not None:
             payload["activeUserDevices"] = limit_ip
 
         async with httpx.AsyncClient(verify=False) as client:
-            r = await client.patch(
-                f"{REMNAWAVE_URL}/api/users/{user_uuid}",
+            r = await client.put(
+                f"{REMNAWAVE_URL}/api/users",
                 json=payload, headers=rw_headers(), timeout=15,
             )
             r.raise_for_status()
@@ -2207,9 +2207,9 @@ async def set_ip_limit(cb: CallbackQuery):
             return
         user_uuid = existing.get("uuid") or existing.get("id")
         async with httpx.AsyncClient(verify=False) as client:
-            r = await client.patch(
-                f"{REMNAWAVE_URL}/api/users/{user_uuid}",
-                json={"activeUserDevices": new_limit},
+            r = await client.put(
+                f"{REMNAWAVE_URL}/api/users",
+                json={"uuid": user_uuid, "activeUserDevices": new_limit},
                 headers=rw_headers(), timeout=15,
             )
             r.raise_for_status()
@@ -2290,9 +2290,8 @@ async def _do_take(user_id: int):
         if not user_uuid:
             return False
         async with httpx.AsyncClient(verify=False) as client:
-            r = await client.patch(
-                f"{REMNAWAVE_URL}/api/users/{user_uuid}",
-                json={"status": "DISABLED"},
+            r = await client.post(
+                f"{REMNAWAVE_URL}/api/users/{user_uuid}/disable",
                 headers=rw_headers(), timeout=15,
             )
             r.raise_for_status()
