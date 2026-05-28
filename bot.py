@@ -225,7 +225,7 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1) -> dict | No
         "expireAt":            _expire_at(days),
         "hwidDeviceLimit":     hwid,
         "telegramId":          user_id,
-        "activeUserInbounds":  [SQUAD_UUID],
+        "activeInternalSquads": [SQUAD_UUID],
     }
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -252,7 +252,7 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None) ->
     base       = max(current, now)
     new_expire = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "activeUserInbounds": [SQUAD_UUID]}
+    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "activeInternalSquads": [SQUAD_UUID]}
     if hwid is not None:
         payload["hwidDeviceLimit"] = hwid
 
