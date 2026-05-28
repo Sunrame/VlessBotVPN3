@@ -225,6 +225,7 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1) -> dict | No
         "expireAt":            _expire_at(days),
         "hwidDeviceLimit":     hwid,
         "telegramId":          user_id,
+        "activeUserInbounds":  [SQUAD_UUID],
     }
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -251,7 +252,7 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None) ->
     base       = max(current, now)
     new_expire = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire}
+    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "activeUserInbounds": [SQUAD_UUID]}
     if hwid is not None:
         payload["hwidDeviceLimit"] = hwid
 
@@ -302,23 +303,6 @@ async def remna_get_all_users() -> list:
 
 
 
-async def remna_add_to_squad(user_uuid: str) -> bool:
-    """Добавить пользователя во внутренний сквад Default-Squad."""
-    try:
-        async with httpx.AsyncClient(verify=True) as client:
-            r = await client.post(
-                f"{REMNAWAVE_URL}/api/internal-squads/{SQUAD_UUID}/users",
-                json={"userUuid": user_uuid},
-                headers=_remna_headers(),
-                timeout=15,
-            )
-            r.raise_for_status()
-            log.info("[Remna] User %s added to internal squad %s", user_uuid, SQUAD_UUID)
-            return True
-    except Exception as e:
-        log.error("[Remna] add_to_squad: %s", e)
-        return False
-
 async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict | None:
     user = await remna_get_user(user_id)
     if user:
@@ -332,7 +316,6 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict 
                 "UPDATE users SET remna_uuid=$1 WHERE user_id=$2",
                 result.get("uuid"), user_id,
             )
-        await remna_add_to_squad(result["uuid"])
     return result
 
 # ─────────────────────────────────────────────
