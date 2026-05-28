@@ -30,6 +30,8 @@ REMNAWAVE_TOKEN  = os.environ["REMNAWAVE_TOKEN"]
 REMNAWAVE_COOKIE = os.environ["REMNAWAVE_COOKIE"]
 SUB_BASE_URL     = os.environ["SUB_BASE_URL"].rstrip("/")
 
+SQUAD_UUID = "efe466ef-3d92-4a14-9b17-b47f0df331e8"  # Default-Squad
+
 ADMIN_IDS: list[int] = []
 for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     _val = os.environ.get(_key, "")
@@ -298,6 +300,23 @@ async def remna_get_all_users() -> list:
         log.error("[Remna] get_all_users: %s", e)
         return []
 
+async def remna_add_to_squad(user_uuid: str) -> bool:
+    """Добавить пользователя в сквад Default-Squad."""
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            r = await client.post(
+                f"{REMNAWAVE_URL}/api/squads/{SQUAD_UUID}/users",
+                json={"userUuid": user_uuid},
+                headers=_remna_headers(),
+                timeout=15,
+            )
+            r.raise_for_status()
+            log.info("[Remna] User %s added to squad %s", user_uuid, SQUAD_UUID)
+            return True
+    except Exception as e:
+        log.error("[Remna] add_to_squad: %s", e)
+        return False
+
 async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict | None:
     user = await remna_get_user(user_id)
     if user:
@@ -311,6 +330,9 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict 
                 "UPDATE users SET remna_uuid=$1 WHERE user_id=$2",
                 result.get("uuid"), user_id,
             )
+        # Добавляем пользователя в сквад Default-Squad
+        await remna_add_to_squad(result["uuid"])
+
     return result
 
 # ─────────────────────────────────────────────
