@@ -30,7 +30,7 @@ REMNAWAVE_TOKEN  = os.environ["REMNAWAVE_TOKEN"]
 REMNAWAVE_COOKIE = os.environ["REMNAWAVE_COOKIE"]
 SUB_BASE_URL     = os.environ["SUB_BASE_URL"].rstrip("/")
 
-SQUAD_UUID = "efe466ef-3d92-4a14-9b17-b47f0df331e8"  # Default-Squad
+SQUAD_UUID = "ed383cc2-c7c0-46ea-9237-19ebe8f10465"  # Default-Squad
 
 ADMIN_IDS: list[int] = []
 for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
@@ -38,7 +38,7 @@ for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     if _val.isdigit():
         ADMIN_IDS.append(int(_val))
 
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@support")
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "@vvvvvpppnn")
 CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 CHANNEL_ID      = os.environ.get("CHANNEL_ID", "@Truba_VPN")
 
@@ -48,10 +48,10 @@ Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 #  ТАРИФЫ
 # ─────────────────────────────────────────────
 TARIFFS: dict = {
-    "trial": {"name": "🆓 Пробный",        "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True,  "hwid": 1},
-    "1_dev": {"name": "📱 1 устройство",   "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 1},
-    "2_dev": {"name": "📱📱 2 устройства", "price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 2},
-    "5_dev": {"name": "🖥️ 5 устройств",   "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 5},
+    "trial": {"name": "Пробный",        "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True,  "hwid": 1},
+    "1_dev": {"name": "1 устройство",   "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 1},
+    "2_dev": {"name": "2 устройства", "price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 2},
+    "5_dev": {"name": "5 устройств",   "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 5},
 }
 
 MONTH_OPTIONS = {
@@ -869,9 +869,9 @@ async def info_tab(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📖 Канал с инструкциями", url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="📄 Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-04-27")],
+                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
             [InlineKeyboardButton(text="🔐 Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-04-27")],
+                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
             [InlineKeyboardButton(text="← Назад", callback_data="back")],
         ]),
         parse_mode="HTML",
