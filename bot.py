@@ -30,7 +30,7 @@ REMNAWAVE_TOKEN  = os.environ["REMNAWAVE_TOKEN"]
 REMNAWAVE_COOKIE = os.environ["REMNAWAVE_COOKIE"]
 SUB_BASE_URL     = os.environ["SUB_BASE_URL"].rstrip("/")
  
-SQUAD_UUID = "efe466ef-3d92-4a14-9b17-b47f0df331e8"  # Default-Squad
+SQUAD_UUID = "ed383cc2-c7c0-46ea-9237-19ebe8f10465"  # Default-Squad
  
 ADMIN_IDS: list[int] = []
 for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
