@@ -48,10 +48,10 @@ Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 #  ТАРИФЫ
 # ─────────────────────────────────────────────
 TARIFFS: dict = {
-    "trial": {"name": "Пробный",        "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True,  "hwid": 1},
-    "1_dev": {"name": "1 устройство",   "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 1},
-    "2_dev": {"name": "2 устройства", "price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 2},
-    "5_dev": {"name": "5 устройств",   "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 5},
+    "trial": {"name": "🆓 Пробный",        "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа", "trial": True,  "hwid": 1},
+    "1_dev": {"name": "📱 1 устройство",   "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 1},
+    "2_dev": {"name": "📱📱 2 устройства", "price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 2},
+    "5_dev": {"name": "🖥️ 5 устройств",   "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость", "hwid": 5},
 }
  
 MONTH_OPTIONS = {
@@ -613,7 +613,7 @@ async def _show_payment_page(cb: CallbackQuery, t_key: str, months: int,
         price_line += f"  <s>{price_full} ₽</s>  🎁 Скидка {discount}%"
  
     promo_btn_text = f"🎟 Промокод применён: {promo_code} (−{discount}%)" if promo_code else "🎟 Ввести промокод"
-    promo_cb       = f"order_promo_applied" if promo_code else f"order_promo_{t_key}_{months}"
+    promo_cb       = "opromo:applied" if promo_code else f"opromo:{t_key}:{months}"
  
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплатить",         url=payment.confirmation.confirmation_url)],
@@ -682,14 +682,16 @@ async def check_payment(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 #  ПРОМОКОД НА СКИДКУ ПРИ ОФОРМЛЕНИИ ЗАКАЗА
 # ─────────────────────────────────────────────
-@router.callback_query(F.data == "order_promo_applied")
+@router.callback_query(F.data == "opromo:applied")
 async def order_promo_already(cb: CallbackQuery):
     await cb.answer("✅ Промокод уже применён!", show_alert=True)
  
-@router.callback_query(F.data.startswith("order_promo_"))
+@router.callback_query(F.data.startswith("opromo:") & (F.data != "opromo:applied"))
 async def order_promo_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    _, _, t_key, months_str = cb.data.split("_", 3)
+    # opromo:{t_key}:{months}  — используем : чтобы не конфликтовать с _ в t_key
+    rest = cb.data[len("opromo:"):]
+    t_key, months_str = rest.rsplit(":", 1)
     await state.set_state(OrderPromoState.waiting_code)
     await state.update_data(t_key=t_key, months=int(months_str))
     await cb.message.edit_text(
@@ -744,19 +746,18 @@ async def order_promo_check(message: types.Message, state: FSMContext):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Применить и перейти к оплате",
-                                  callback_data=f"orderapply_{t_key}_{months}_{discount}_{code}")]
+                                  callback_data=f"oapply:{t_key}:{months}:{discount}:{code}")]
         ]),
     )
  
-@router.callback_query(F.data.startswith("orderapply_"))
+@router.callback_query(F.data.startswith("oapply:"))
 async def order_apply_discount(cb: CallbackQuery):
     await cb.answer()
-    # orderapply_{t_key}_{months}_{discount}_{code}
-    parts    = cb.data.split("_", 4)
-    t_key    = parts[1]
-    months   = int(parts[2])
-    discount = int(parts[3])
-    code     = parts[4]
+    # oapply:{t_key}:{months}:{discount}:{code}
+    rest              = cb.data[len("oapply:"):]
+    t_key, months_str, discount_str, code = rest.split(":", 3)
+    months   = int(months_str)
+    discount = int(discount_str)
     if t_key not in TARIFFS:
         await cb.answer("Тариф не найден.", show_alert=True); return
     await _show_payment_page(cb, t_key, months, discount=discount, promo_code=code)
