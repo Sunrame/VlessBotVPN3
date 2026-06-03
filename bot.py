@@ -100,6 +100,10 @@ class SupportState(StatesGroup):
 class TemplateState(StatesGroup):
     waiting_name = State()
     waiting_text = State()
+
+class SurveyState(StatesGroup):
+    waiting_rating  = State()
+    waiting_comment = State()
  
 # ─────────────────────────────────────────────
 #  INIT
@@ -173,11 +177,20 @@ async def init_db():
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
             except Exception:
                 pass
-        # Миграция промокодов: добавляем поле скидки
         try:
             await conn.execute("ALTER TABLE promos ADD COLUMN discount_percent INTEGER DEFAULT 0")
         except Exception:
             pass
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS survey_responses (
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT,
+                username   TEXT,
+                rating     INTEGER,
+                comment    TEXT,
+                created_at BIGINT DEFAULT 0
+            )
+        """)
     log.info("PostgreSQL ready.")
  
 # ─────────────────────────────────────────────
@@ -194,12 +207,10 @@ def remna_username(user_id: int) -> str:
     return f"truba_{user_id}"
  
 def _expire_at(days: int) -> str:
-    """ISO дата истечения через N дней."""
     dt = datetime.now(timezone.utc) + timedelta(days=days)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
  
 async def remna_get_user(user_id: int) -> dict | None:
-    """Получить пользователя по username."""
     try:
         async with httpx.AsyncClient(verify=True) as client:
             r = await client.get(
@@ -230,7 +241,6 @@ async def remna_get_user_by_uuid(uuid_: str) -> dict | None:
         return None
  
 async def remna_create_user(user_id: int, days: int, hwid: int = 1) -> dict | None:
-    """Создать нового пользователя в Remnawave."""
     payload = {
         "username":            remna_username(user_id),
         "trafficLimitBytes":   0,
@@ -255,7 +265,6 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1) -> dict | No
         return None
  
 async def remna_extend_user(user_id: int, days: int, hwid: int | None = None) -> dict | None:
-    """Продлить подписку пользователя."""
     user = await remna_get_user(user_id)
     if not user:
         return await remna_create_user(user_id, days, hwid or 1)
@@ -282,7 +291,6 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None) ->
         return None
  
 async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
-    """Обновить любые поля пользователя."""
     payload["uuid"] = uuid_
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -297,7 +305,6 @@ async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
         return None
  
 async def remna_disable_user(uuid_: str) -> bool:
-    """Отключить подписку пользователя."""
     result = await remna_update_user(uuid_, {"status": "DISABLED"})
     return result is not None
  
@@ -313,8 +320,6 @@ async def remna_get_all_users() -> list:
     except Exception as e:
         log.error("[Remna] get_all_users: %s", e)
         return []
- 
- 
  
 async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict | None:
     user = await remna_get_user(user_id)
@@ -689,7 +694,6 @@ async def order_promo_already(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("opromo:") & (F.data != "opromo:applied"))
 async def order_promo_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    # opromo:{t_key}:{months}  — используем : чтобы не конфликтовать с _ в t_key
     rest = cb.data[len("opromo:"):]
     t_key, months_str = rest.rsplit(":", 1)
     await state.set_state(OrderPromoState.waiting_code)
@@ -709,38 +713,22 @@ async def order_promo_check(message: types.Message, state: FSMContext):
     t_key  = data["t_key"]
     months = data["months"]
     await state.clear()
- 
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT promo_type, discount_percent, uses FROM promos WHERE code=$1", code
         )
- 
+
     if not row or row["promo_type"] != "discount" or (row["discount_percent"] or 0) <= 0:
         await message.answer(
-            "❌ Промокод не найден или не является промокодом на скидку.\n\nВозвращаю к оплате...",
-        )
-        # Имитируем callback чтобы показать страницу заново
-        class _FakeCB:
-            from_user = message.from_user
-            data      = f"buym_{t_key}_{months}"
-            async def answer(self, *a, **kw): pass
-            class message:
-                pass
-        # Просто сообщаем и просим нажать кнопку
-        info  = TARIFFS.get(t_key, {})
-        price = calc_price(info["price"], months) if not info.get("trial") else info["price"]
-        await message.answer(
-            f"Нажмите кнопку ниже, чтобы вернуться к оплате.",
+            "❌ Промокод не найден или не является промокодом на скидку.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="← К оплате", callback_data=f"buym_{t_key}_{months}")]
             ]),
         )
         return
- 
+
     discount = row["discount_percent"]
-    # Создаём фиктивный callback для переиспользования _show_payment_page
-    # Нельзя напрямую — отправляем сообщение с инструкцией и inline-кнопкой редиректа
-    # Сохраняем скидку в state и переводим пользователя
     await message.answer(
         f"✅ Промокод <b>{code}</b> принят — скидка <b>{discount}%</b>!\n\nНажмите кнопку ниже:",
         parse_mode="HTML",
@@ -753,7 +741,6 @@ async def order_promo_check(message: types.Message, state: FSMContext):
 @router.callback_query(F.data.startswith("oapply:"))
 async def order_apply_discount(cb: CallbackQuery):
     await cb.answer()
-    # oapply:{t_key}:{months}:{discount}:{code}
     rest              = cb.data[len("oapply:"):]
     t_key, months_str, discount_str, code = rest.split(":", 3)
     months   = int(months_str)
@@ -807,7 +794,6 @@ async def cmd_subs(message: types.Message):
             await message.answer(text, parse_mode="HTML")
         return
  
-    # Пользователь — своя подписка
     user = await remna_get_user(message.from_user.id)
     if not user or parse_dt(user.get("expireAt")) <= now:
         await message.answer("❌ У вас нет активной подписки.\nНажмите /start чтобы купить.")
@@ -1509,14 +1495,11 @@ async def set_hwid_limit(cb: CallbackQuery):
     if not result:
         await cb.answer("Ошибка обновления.", show_alert=True); return
     await cb.answer(f"✅ Лимит изменён: {HWID_OPTIONS.get(new_hwid, str(new_hwid))}", show_alert=True)
-    # Обновляем сообщение
-    now = int(time.time())
     async with pool.acquire() as conn:
         db_row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
     if db_row:
-        username = db_row["username"] or str(user_id)
-        remna2   = await remna_get_user(user_id)
-        hwid2    = remna2.get("hwidDeviceLimit", new_hwid) if remna2 else new_hwid
+        remna2 = await remna_get_user(user_id)
+        hwid2  = remna2.get("hwidDeviceLimit", new_hwid) if remna2 else new_hwid
         try:
             await cb.message.edit_reply_markup(reply_markup=_check_kb(user_id, hwid2))
         except Exception: pass
@@ -1667,7 +1650,6 @@ async def admin_genpromo_handle(message: types.Message, state: FSMContext):
     await state.clear()
     parts = message.text.strip().split()
     if parts[0].isdigit(): parts = [uuid.uuid4().hex[:8].upper()] + parts
-    # Для discount-промокодов days может быть 0
     if len(parts) < 2 or not parts[1].isdigit():
         await message.answer("❌ Неверный формат."); return
     await _save_promo(message, parts)
@@ -1732,7 +1714,6 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
     if not text_body:
         await cb.answer("Текст не найден.", show_alert=True); return
     await cb.message.edit_text("Рассылка запущена...")
-    now = int(time.time())
     async with pool.acquire() as conn:
         if subs_only:
             users = await conn.fetch("SELECT user_id FROM users WHERE has_paid=1")
@@ -1830,6 +1811,169 @@ async def daily_report_scheduler():
         await send_daily_report()
  
 # ─────────────────────────────────────────────
+#  ОПРОС — оценка сервиса (только для платников)
+# ─────────────────────────────────────────────
+def _rating_kb() -> InlineKeyboardMarkup:
+    row1 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(1, 6)]
+    row2 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(6, 11)]
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+
+@router.message(Command("survey"))
+async def admin_survey_start(message: types.Message):
+    """Запустить опрос среди всех платников."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer("⏳ Рассылаю опрос платникам...")
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id FROM users WHERE has_paid=1")
+    ok = fail = 0
+    for row in users:
+        try:
+            await bot.send_message(
+                row["user_id"],
+                "⭐️ <b>Оцените работу TrubaVPN</b>\n\n"
+                "Насколько вы довольны сервисом? Выберите оценку от 1 до 10:",
+                parse_mode="HTML",
+                reply_markup=_rating_kb(),
+            )
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await message.answer(
+        f"✅ Опрос разослан.\nДоставлено: <b>{ok}</b> · Ошибок: <b>{fail}</b>",
+        parse_mode="HTML",
+    )
+
+@router.callback_query(F.data.startswith("survey_rate_"))
+async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
+    """Пользователь выбрал оценку."""
+    await cb.answer()
+    # Проверяем что это платник
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT has_paid FROM users WHERE user_id=$1", cb.from_user.id)
+    if not row or not row["has_paid"]:
+        await cb.answer("Опрос доступен только для платных подписчиков.", show_alert=True)
+        return
+
+    rating = int(cb.data.removeprefix("survey_rate_"))
+    await state.set_state(SurveyState.waiting_comment)
+    await state.update_data(survey_rating=rating)
+
+    emoji = "😍" if rating >= 9 else "😊" if rating >= 7 else "😐" if rating >= 5 else "😕" if rating >= 3 else "😞"
+    await cb.message.edit_text(
+        f"{emoji} Спасибо! Вы поставили оценку <b>{rating}/10</b>.\n\n"
+        "✍️ Напишите короткий комментарий — что понравилось или что можно улучшить?\n\n"
+        "<i>Можно пропустить, нажав кнопку ниже.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить →", callback_data="survey_skip_comment")]
+        ]),
+    )
+
+@router.callback_query(F.data == "survey_skip_comment")
+async def survey_skip_comment(cb: CallbackQuery, state: FSMContext):
+    """Пользователь пропустил комментарий."""
+    await cb.answer()
+    data = await state.get_data()
+    rating = data.get("survey_rating", 0)
+    await state.clear()
+    await _save_survey(cb.from_user, rating, None)
+    await cb.message.edit_text(
+        "🙏 <b>Спасибо за вашу оценку!</b>\n\nВаш отзыв поможет нам стать лучше.",
+        parse_mode="HTML",
+    )
+    await _notify_admins_survey(cb.from_user, rating, None)
+
+@router.message(SurveyState.waiting_comment)
+async def survey_comment_handler(message: types.Message, state: FSMContext):
+    """Пользователь написал комментарий."""
+    data = await state.get_data()
+    rating = data.get("survey_rating", 0)
+    comment = message.text.strip()
+    await state.clear()
+    await _save_survey(message.from_user, rating, comment)
+    await message.answer(
+        "🙏 <b>Спасибо за ваш отзыв!</b>\n\nМы учтём ваше мнение для улучшения сервиса.",
+        parse_mode="HTML",
+    )
+    await _notify_admins_survey(message.from_user, rating, comment)
+
+async def _save_survey(user, rating: int, comment: str | None):
+    now = int(time.time())
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO survey_responses (user_id, username, rating, comment, created_at) VALUES ($1,$2,$3,$4,$5)",
+            user.id, user.username, rating, comment, now,
+        )
+
+async def _notify_admins_survey(user, rating: int, comment: str | None):
+    emoji = "😍" if rating >= 9 else "😊" if rating >= 7 else "😐" if rating >= 5 else "😕" if rating >= 3 else "😞"
+    uname = f"@{user.username}" if user.username else f"ID:{user.id}"
+    text = (
+        f"📊 <b>Новый отзыв</b>\n\n"
+        f"👤 {uname}\n"
+        f"⭐️ Оценка: <b>{rating}/10</b> {emoji}\n"
+    )
+    if comment:
+        text += f"💬 Комментарий:\n<i>{comment}</i>"
+    else:
+        text += "💬 <i>Без комментария</i>"
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception:
+            pass
+
+@router.message(Command("survey_results"))
+async def admin_survey_results(message: types.Message):
+    """Показать результаты опроса."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM survey_responses") or 0
+        if not total:
+            await message.answer("📊 Ответов на опрос пока нет.")
+            return
+        avg = await conn.fetchval("SELECT AVG(rating) FROM survey_responses") or 0
+        dist = await conn.fetch(
+            "SELECT rating, COUNT(*) as cnt FROM survey_responses GROUP BY rating ORDER BY rating DESC"
+        )
+        comments = await conn.fetch(
+            "SELECT username, rating, comment, created_at FROM survey_responses "
+            "WHERE comment IS NOT NULL ORDER BY created_at DESC LIMIT 10"
+        )
+
+    avg_rounded = round(float(avg), 2)
+    emoji = "😍" if avg_rounded >= 9 else "😊" if avg_rounded >= 7 else "😐" if avg_rounded >= 5 else "😕"
+
+    lines = [
+        f"📊 <b>Результаты опроса</b>\n",
+        f"Всего ответов: <b>{total}</b>",
+        f"Средняя оценка: <b>{avg_rounded}/10</b> {emoji}\n",
+        "📈 <b>Распределение:</b>",
+    ]
+    for r in dist:
+        bar = "█" * r["cnt"] if r["cnt"] <= 20 else "█" * 20 + f"+{r['cnt']-20}"
+        lines.append(f"  {r['rating']:2d}/10 · {r['cnt']:3d} чел.  {bar}")
+
+    if comments:
+        lines += ["", "💬 <b>Последние комментарии:</b>"]
+        for c in comments:
+            uname = f"@{c['username']}" if c["username"] else "аноним"
+            dt = time.strftime("%d.%m", time.localtime(c["created_at"]))
+            preview = c["comment"][:120] + "..." if len(c["comment"]) > 120 else c["comment"]
+            lines.append(f"\n⭐️{c['rating']} · {uname} [{dt}]:\n<i>{preview}</i>")
+
+    text = "\n".join(lines)
+    # Разбиваем если длинно
+    if len(text) > 4000:
+        await message.answer("\n".join(lines[:20]), parse_mode="HTML")
+        await message.answer("\n".join(lines[20:]), parse_mode="HTML")
+    else:
+        await message.answer(text, parse_mode="HTML")
+
+# ─────────────────────────────────────────────
 #  STATS / REPORT / ADMIN
 # ─────────────────────────────────────────────
 @router.message(Command("stats"))
@@ -1883,7 +2027,9 @@ async def admin_help(message: types.Message):
         "<code>/del_template ID</code>\n\n"
         "📊 <b>Статистика:</b>\n"
         "<code>/stats</code> · <code>/report</code>\n"
-        "<code>/broadcast</code> — рассылка",
+        "<code>/broadcast</code> — рассылка\n"
+        "<code>/survey</code> — опрос платников (оценка 1–10 + комментарий)\n"
+        "<code>/survey_results</code> — результаты опроса",
         parse_mode="HTML",
     )
  
