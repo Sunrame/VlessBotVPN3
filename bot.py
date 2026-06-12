@@ -43,19 +43,19 @@ CHANNEL_LINK    = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 CHANNEL_ID      = os.environ.get("CHANNEL_ID", "@Truba_VPN")
  
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
-
+ 
 # Московский часовой пояс UTC+3
 MSK = timezone(timedelta(hours=3))
-
+ 
 def fmt_dt(ts: int, fmt: str = "%d.%m.%Y %H:%M") -> str:
     """Unix-timestamp -> строка в московском времени."""
     if not ts:
         return "inf"
     return datetime.fromtimestamp(ts, tz=MSK).strftime(fmt) + " МСК"
-
+ 
 def msk_now() -> datetime:
     return datetime.now(MSK)
-
+ 
  
 # ─────────────────────────────────────────────
 #  ТАРИФЫ
@@ -65,7 +65,7 @@ TARIFFS: dict = {
     "1_dev":  {"name": "1 устройство",   "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 1},
     "2_dev":  {"name": "2 устройства",   "price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 2},
     "5_dev":  {"name": "5 устройств",    "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 5},
-    "family": {"name": "Семейный",       "price": 449, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость\n👨‍👩‍👧‍👦 До 10 устройств", "hwid": 10},
+    "family": {"name": "10 устройств",   "price": 449, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость\n👨‍👩‍👧‍👦 До 10 устройств", "hwid": 10},
 }
  
 MONTH_OPTIONS = {
@@ -114,16 +114,16 @@ class SupportState(StatesGroup):
 class TemplateState(StatesGroup):
     waiting_name = State()
     waiting_text = State()
-
+ 
 class SurveyState(StatesGroup):
     waiting_rating  = State()
     waiting_comment = State()
-
+ 
 class CheckActionState(StatesGroup):
-    waiting_days_add   = State()   # добавить дни (произвольно)
-    waiting_days_sub   = State()   # убрать дни
-    waiting_days_set   = State()   # установить дату
-    waiting_hwid_set   = State()   # установить кол-во устройств
+    waiting_days_add   = State()
+    waiting_days_sub   = State()
+    waiting_days_set   = State()
+    waiting_hwid_set   = State()
  
 # ─────────────────────────────────────────────
 #  INIT
@@ -376,7 +376,7 @@ async def is_admin_dnd(admin_id: int) -> bool:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT dnd FROM admin_settings WHERE admin_id=$1", admin_id)
         return row["dnd"] if row else False
-
+ 
 async def is_admin_sale_notify(admin_id: int) -> bool:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT sale_notify FROM admin_settings WHERE admin_id=$1", admin_id)
@@ -384,7 +384,7 @@ async def is_admin_sale_notify(admin_id: int) -> bool:
             return True
         v = row["sale_notify"]
         return v if v is not None else True
-
+ 
 async def notify_admins_sale(u_id: int, username: str | None, tariff_name: str,
                               days: int, price: float, is_trial: bool):
     """Уведомить всех админов о новой покупке."""
@@ -519,7 +519,7 @@ def support_user_kb():
         [InlineKeyboardButton(text="❌ Закрыть обращение", callback_data="support_close_user")],
         [InlineKeyboardButton(text="🏠 Главное меню",      callback_data="support_to_main")],
     ])
-
+ 
 @router.callback_query(F.data == "support_to_main")
 async def support_to_main_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -538,7 +538,6 @@ def support_ticket_kb(ticket_id: int, user_id: int):
  
 def _check_kb(user_id: int, hwid: int) -> InlineKeyboardMarkup:
     """Расширенная клавиатура /check с полным набором действий."""
-    # Быстрые пресеты устройств
     preset_rows = []
     row = []
     for limit, label in HWID_OPTIONS.items():
@@ -551,19 +550,15 @@ def _check_kb(user_id: int, hwid: int) -> InlineKeyboardMarkup:
             preset_rows.append(row); row = []
     if row:
         preset_rows.append(row)
-
+ 
     return InlineKeyboardMarkup(inline_keyboard=[
-        # Управление днями
         [
             InlineKeyboardButton(text="➕ Дни",  callback_data=f"ca_adddays_{user_id}"),
             InlineKeyboardButton(text="➖ Дни",  callback_data=f"ca_subdays_{user_id}"),
             InlineKeyboardButton(text="📅 Дата", callback_data=f"ca_setdate_{user_id}"),
         ],
-        # Устройства — ввод числа
         [InlineKeyboardButton(text="📱 Уст. — ввести число", callback_data=f"ca_sethwid_{user_id}")],
-        # Быстрые пресеты устройств
         *preset_rows,
-        # Опасные действия
         [InlineKeyboardButton(text="🚫 Забрать подписку", callback_data=f"quicktake_{user_id}")],
     ])
  
@@ -796,12 +791,12 @@ async def order_promo_check(message: types.Message, state: FSMContext):
     t_key  = data["t_key"]
     months = data["months"]
     await state.clear()
-
+ 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT promo_type, discount_percent, uses FROM promos WHERE code=$1", code
         )
-
+ 
     if not row or row["promo_type"] != "discount" or (row["discount_percent"] or 0) <= 0:
         await message.answer(
             "❌ Промокод не найден или не является промокодом на скидку.",
@@ -810,7 +805,7 @@ async def order_promo_check(message: types.Message, state: FSMContext):
             ]),
         )
         return
-
+ 
     discount = row["discount_percent"]
     await message.answer(
         f"✅ Промокод <b>{code}</b> принят — скидка <b>{discount}%</b>!\n\nНажмите кнопку ниже:",
@@ -833,7 +828,7 @@ async def order_apply_discount(cb: CallbackQuery):
     await _show_payment_page(cb, t_key, months, discount=discount, promo_code=code)
  
 # ─────────────────────────────────────────────
-#  /subs
+#  /subs — показывает ВСЕХ без лимита
 # ─────────────────────────────────────────────
 @router.message(Command("subs"))
 async def cmd_subs(message: types.Message):
@@ -850,7 +845,8 @@ async def cmd_subs(message: types.Message):
             f"✅ Активных: <b>{len(active)}</b> | ❌ Истёкших: <b>{len(expired)}</b>\n",
             "━━━━━━━━━━━━━━━━━━━━",
         ]
-        for u in sorted(active, key=lambda x: parse_dt(x.get("expireAt")), reverse=True)[:30]:
+        # Показываем ВСЕХ активных без лимита, сортируем по дате истечения
+        for u in sorted(active, key=lambda x: parse_dt(x.get("expireAt")), reverse=True):
             uid       = u["username"].replace("truba_", "")
             expire    = parse_dt(u.get("expireAt"))
             days_left = max(0, (expire - now) // 86400)
@@ -864,15 +860,20 @@ async def cmd_subs(message: types.Message):
             tg = f"@{db['username']}" if db and db["username"] else f"ID:{uid}"
             lines.append(f"👤 {tg}\n   {hwid_lbl} · до {date_str} ({days_left}д) · {used_gb}GB")
  
-        if len(active) > 30:
-            lines.append(f"\n... и ещё {len(active) - 30}")
- 
         text = "\n".join(lines)
+        # Разбиваем на чанки по 4000 символов
         if len(text) > 4000:
-            for i in range(0, len(lines), 20):
-                chunk = "\n".join(lines[i:i+20])
-                if chunk:
-                    await message.answer(chunk, parse_mode="HTML")
+            chunk_lines = []
+            chunk_text  = ""
+            for line in lines:
+                if len(chunk_text) + len(line) + 1 > 4000:
+                    await message.answer(chunk_text, parse_mode="HTML")
+                    chunk_text  = line + "\n"
+                    chunk_lines = []
+                else:
+                    chunk_text += line + "\n"
+            if chunk_text:
+                await message.answer(chunk_text, parse_mode="HTML")
         else:
             await message.answer(text, parse_mode="HTML")
         return
@@ -1099,12 +1100,11 @@ async def _process_support_message(message: types.Message, state: FSMContext):
     data  = await state.get_data()
     now   = int(time.time())
     uname = f"@{message.from_user.username}" if message.from_user.username else f"ID:{u_id}"
-
-    # Определяем тип контента
+ 
     is_photo    = bool(message.photo)
     text_body   = message.caption or message.text or ""
     display_txt = text_body if text_body else ("📷 Фото" if is_photo else "")
-
+ 
     async with pool.acquire() as conn:
         ticket_id = data.get("ticket_id")
         if not ticket_id:
@@ -1120,13 +1120,13 @@ async def _process_support_message(message: types.Message, state: FSMContext):
             "INSERT INTO support_messages (ticket_id, user_id, is_admin, text, sent_at) VALUES ($1,$2,FALSE,$3,$4)",
             ticket_id, u_id, display_txt, now,
         )
-
+ 
     await message.answer("✅ Сообщение отправлено. Ожидайте ответа.", reply_markup=support_user_kb())
-
+ 
     header = f"📨 <b>Поддержка</b> · #{ticket_id}\n\nОт: {uname}"
     if text_body:
         header += f"\n\n{text_body}"
-
+ 
     for admin_id in ADMIN_IDS:
         if not await is_admin_dnd(admin_id):
             try:
@@ -1147,11 +1147,11 @@ async def _process_support_message(message: types.Message, state: FSMContext):
                     )
             except Exception:
                 pass
-
+ 
 @router.message(SupportState.waiting_message, F.photo)
 async def support_user_photo(message: types.Message, state: FSMContext):
     await _process_support_message(message, state)
-
+ 
 @router.message(SupportState.waiting_message, F.text)
 async def support_user_message(message: types.Message, state: FSMContext):
     await _process_support_message(message, state)
@@ -1308,13 +1308,12 @@ async def toggle_dnd(message: types.Message):
         else:
             await conn.execute("INSERT INTO admin_settings (admin_id, dnd) VALUES ($1,$2)", admin_id, new_dnd)
     await message.answer("🔕 DND включён" if new_dnd else "🔔 Уведомления о тикетах включены")
-
+ 
 # ─────────────────────────────────────────────
 #  УВЕДОМЛЕНИЯ О ПРОДАЖАХ
 # ─────────────────────────────────────────────
 @router.message(Command("sale_notify"))
 async def toggle_sale_notify(message: types.Message):
-    """Вкл/выкл уведомления о покупках для этого админа."""
     if message.from_user.id not in ADMIN_IDS: return
     admin_id = message.from_user.id
     async with pool.acquire() as conn:
@@ -1553,7 +1552,7 @@ async def admin_genkey_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer(); await state.clear(); await cb.message.edit_text("Отменено.")
  
 # ─────────────────────────────────────────────
-#  /check — вывод карточки
+#  /check — карточка пользователя
 # ─────────────────────────────────────────────
 async def _render_check(target_send, user_id: int):
     """Рендер карточки /check. target_send — message или cb."""
@@ -1621,7 +1620,7 @@ async def _render_check(target_send, user_id: int):
             await target_send.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception:
             await target_send.message.answer(text, parse_mode="HTML", reply_markup=kb)
-
+ 
 @router.message(Command("check"))
 async def admin_check(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
@@ -1636,7 +1635,7 @@ async def admin_check(message: types.Message, command: CommandObject):
     if not db_row:
         await message.answer(f"❌ Пользователь <code>{target}</code> не найден.", parse_mode="HTML"); return
     await _render_check(message, db_row["user_id"])
-
+ 
 # --- Быстрые пресеты устройств (кнопки setlim_) ---
 @router.callback_query(F.data.startswith("setlim_"))
 async def set_hwid_limit(cb: CallbackQuery):
@@ -1656,15 +1655,113 @@ async def set_hwid_limit(cb: CallbackQuery):
     try:
         await cb.message.edit_reply_markup(reply_markup=_check_kb(user_id, hwid2))
     except Exception: pass
-
-# --- FSM: добавить дни ---\n@router.callback_query(F.data.startswith("ca_adddays_"))\nasync def ca_adddays_start(cb: CallbackQuery, state: FSMContext):\nawait cb.answer()\nif cb.from_user.id not in ADMIN_IDS: return\nuser_id = int(cb.data.removeprefix("ca_adddays_"))\nawait state.set_state(CheckActionState.waiting_days_add)\nawait state.update_data(ca_uid=user_id)\nawait cb.message.answer(\nf"➕ <b>Добавить дни</b> для ID:{user_id}\n\nВведите количество дней (например: <code>30</code>):\n/cancel — отмена",\nparse_mode="HTML"\n)\n\n@router.message(CheckActionState.waiting_days_add)\nasync def ca_adddays_handler(message: types.Message, state: FSMContext):\nif message.from_user.id not in ADMIN_IDS: return\nif not message.text or not message.text.strip().isdigit():\nawait message.answer("❌ Введите положительное целое число."); return\ndays = int(message.text.strip())\nif days <= 0:\nawait message.answer("❌ Число должно быть больше 0."); return\ndata = await state.get_data()\nuser_id = data["ca_uid"]\nawait state.clear()\nremna = await remna_get_user(user_id)\nif not remna:\nawait message.answer("❌ Пользователь не найден в Remnawave."); return\nnow_utc = datetime.now(timezone.utc)\ncurrent = datetime.fromisoformat(remna["expireAt"].replace("Z", "+00:00"))\nbase    = max(current, now_utc)\nnew_exp = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")\nresult  = await remna_update_user(remna["uuid"], {"expireAt": new_exp})\nif not result:\nawait message.answer("❌ Ошибка обновления."); return\nnew_ts = parse_dt(result.get("expireAt"))\nawait message.answer(\nf"✅ ID:{user_id} — добавлено <b>+{days} дн.</b>\n📅 Новая дата: <b>{fmt_dt(new_ts)}</b>",\nparse_mode="HTML"\n)
+ 
+# ─────────────────────────────────────────────
+#  CheckActionState FSM — добавить дни
+# ─────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ca_adddays_"))
+async def ca_adddays_start(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS: return
+    user_id = int(cb.data.removeprefix("ca_adddays_"))
+    await state.set_state(CheckActionState.waiting_days_add)
+    await state.update_data(ca_uid=user_id)
+    await cb.message.answer(
+        f"➕ <b>Добавить дни</b> для ID:{user_id}\n\n"
+        f"Введите количество дней (например: <code>30</code>):\n/cancel — отмена",
+        parse_mode="HTML"
+    )
+ 
+@router.message(CheckActionState.waiting_days_add)
+async def ca_adddays_handler(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("❌ Введите положительное целое число."); return
+    days = int(message.text.strip())
+    if days <= 0:
+        await message.answer("❌ Число должно быть больше 0."); return
+    data = await state.get_data()
+    user_id = data["ca_uid"]
+    await state.clear()
+    remna = await remna_get_user(user_id)
+    if not remna:
+        await message.answer("❌ Пользователь не найден в Remnawave."); return
+    now_utc = datetime.now(timezone.utc)
+    current = datetime.fromisoformat(remna["expireAt"].replace("Z", "+00:00"))
+    base    = max(current, now_utc)
+    new_exp = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp})
+    if not result:
+        await message.answer("❌ Ошибка обновления."); return
+    new_ts = parse_dt(result.get("expireAt"))
+    await message.answer(
+        f"✅ ID:{user_id} — добавлено <b>+{days} дн.</b>\n📅 Новая дата: <b>{fmt_dt(new_ts)}</b>",
+        parse_mode="HTML"
+    )
     await _render_check(message, user_id)
-
-# --- FSM: убрать дни ---\n@router.callback_query(F.data.startswith("ca_subdays_"))\nasync def ca_subdays_start(cb: CallbackQuery, state: FSMContext):\nawait cb.answer()\nif cb.from_user.id not in ADMIN_IDS: return\nuser_id = int(cb.data.removeprefix("ca_subdays_"))\nawait state.set_state(CheckActionState.waiting_days_sub)\nawait state.update_data(ca_uid=user_id)\nawait cb.message.answer(\nf"➖ <b>Убрать дни</b> у ID:{user_id}\n\nВведите количество дней:\n/cancel — отмена",\nparse_mode="HTML"\n)\n\n@router.message(CheckActionState.waiting_days_sub)\nasync def ca_subdays_handler(message: types.Message, state: FSMContext):\nif message.from_user.id not in ADMIN_IDS: return\nif not message.text or not message.text.strip().isdigit():\nawait message.answer("❌ Введите положительное целое число."); return\ndays = int(message.text.strip())\nif days <= 0:\nawait message.answer("❌ Число должно быть больше 0."); return\ndata = await state.get_data()\nuser_id = data["ca_uid"]\nawait state.clear()\nremna = await remna_get_user(user_id)\nif not remna:\nawait message.answer("❌ Пользователь не найден в Remnawave."); return\nnow_utc = datetime.now(timezone.utc)\ncurrent = datetime.fromisoformat(remna["expireAt"].replace("Z", "+00:00"))\nnew_exp_dt = current - timedelta(days=days)\nif new_exp_dt <= now_utc:\nnew_exp_dt = now_utc + timedelta(minutes=5)\nnew_exp = new_exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")\nresult  = await remna_update_user(remna["uuid"], {"expireAt": new_exp})\nif not result:\nawait message.answer("❌ Ошибка обновления."); return\nnew_ts = parse_dt(result.get("expireAt"))\nawait message.answer(\nf"✅ ID:{user_id} — убрано <b>−{days} дн.</b>\n📅 Новая дата: <b>{fmt_dt(new_ts)}</b>",\nparse_mode="HTML"\n)
+ 
+# ─────────────────────────────────────────────
+#  CheckActionState FSM — убрать дни
+# ─────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ca_subdays_"))
+async def ca_subdays_start(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS: return
+    user_id = int(cb.data.removeprefix("ca_subdays_"))
+    await state.set_state(CheckActionState.waiting_days_sub)
+    await state.update_data(ca_uid=user_id)
+    await cb.message.answer(
+        f"➖ <b>Убрать дни</b> у ID:{user_id}\n\n"
+        f"Введите количество дней:\n/cancel — отмена",
+        parse_mode="HTML"
+    )
+ 
+@router.message(CheckActionState.waiting_days_sub)
+async def ca_subdays_handler(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("❌ Введите положительное целое число."); return
+    days = int(message.text.strip())
+    if days <= 0:
+        await message.answer("❌ Число должно быть больше 0."); return
+    data = await state.get_data()
+    user_id = data["ca_uid"]
+    await state.clear()
+    remna = await remna_get_user(user_id)
+    if not remna:
+        await message.answer("❌ Пользователь не найден в Remnawave."); return
+    now_utc = datetime.now(timezone.utc)
+    current = datetime.fromisoformat(remna["expireAt"].replace("Z", "+00:00"))
+    new_exp_dt = current - timedelta(days=days)
+    if new_exp_dt <= now_utc:
+        new_exp_dt = now_utc + timedelta(minutes=5)
+    new_exp = new_exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp})
+    if not result:
+        await message.answer("❌ Ошибка обновления."); return
+    new_ts = parse_dt(result.get("expireAt"))
+    await message.answer(
+        f"✅ ID:{user_id} — убрано <b>−{days} дн.</b>\n📅 Новая дата: <b>{fmt_dt(new_ts)}</b>",
+        parse_mode="HTML"
+    )
     await _render_check(message, user_id)
-
-# --- FSM: установить конкретную дату ---\n@router.callback_query(F.data.startswith("ca_setdate_"))\nasync def ca_setdate_start(cb: CallbackQuery, state: FSMContext):\nawait cb.answer()\nif cb.from_user.id not in ADMIN_IDS: return\nuser_id = int(cb.data.removeprefix("ca_setdate_"))\nawait state.set_state(CheckActionState.waiting_days_set)\nawait state.update_data(ca_uid=user_id)\nawait cb.message.answer(\nf"📅 <b>Установить дату истечения</b> для ID:{user_id}\n\n"\nf"Введите дату в формате <code>ДД.ММ.ГГГГ</code> (по МСК, время 23:59):\n/cancel — отмена",\nparse_mode="HTML"\n)
-
+ 
+# ─────────────────────────────────────────────
+#  CheckActionState FSM — установить дату
+# ─────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ca_setdate_"))
+async def ca_setdate_start(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS: return
+    user_id = int(cb.data.removeprefix("ca_setdate_"))
+    await state.set_state(CheckActionState.waiting_days_set)
+    await state.update_data(ca_uid=user_id)
+    await cb.message.answer(
+        f"📅 <b>Установить дату истечения</b> для ID:{user_id}\n\n"
+        f"Введите дату в формате <code>ДД.ММ.ГГГГ</code> (по МСК, время 23:59):\n/cancel — отмена",
+        parse_mode="HTML"
+    )
+ 
 @router.message(CheckActionState.waiting_days_set)
 async def ca_setdate_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
@@ -1689,9 +1786,23 @@ async def ca_setdate_handler(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
     await _render_check(message, user_id)
-
-# --- FSM: установить кол-во устройств ---\n@router.callback_query(F.data.startswith("ca_sethwid_"))\nasync def ca_sethwid_start(cb: CallbackQuery, state: FSMContext):\nawait cb.answer()\nif cb.from_user.id not in ADMIN_IDS: return\nuser_id = int(cb.data.removeprefix("ca_sethwid_"))\nawait state.set_state(CheckActionState.waiting_hwid_set)\nawait state.update_data(ca_uid=user_id)\nawait cb.message.answer(\nf"📱 <b>Установить лимит устройств</b> для ID:{user_id}\n\n"\nf"Введите число (0 = без лимита):\n/cancel — отмена",\nparse_mode="HTML"\n)
-
+ 
+# ─────────────────────────────────────────────
+#  CheckActionState FSM — установить устройства
+# ─────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ca_sethwid_"))
+async def ca_sethwid_start(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS: return
+    user_id = int(cb.data.removeprefix("ca_sethwid_"))
+    await state.set_state(CheckActionState.waiting_hwid_set)
+    await state.update_data(ca_uid=user_id)
+    await cb.message.answer(
+        f"📱 <b>Установить лимит устройств</b> для ID:{user_id}\n\n"
+        f"Введите число (0 = без лимита):\n/cancel — отмена",
+        parse_mode="HTML"
+    )
+ 
 @router.message(CheckActionState.waiting_hwid_set)
 async def ca_sethwid_handler(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
@@ -1715,7 +1826,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
     await _render_check(message, user_id)
-
+ 
 # --- /cancel для CheckActionState ---
 @router.message(Command("cancel"), CheckActionState.waiting_days_add)
 @router.message(Command("cancel"), CheckActionState.waiting_days_sub)
@@ -1724,7 +1835,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
 async def ca_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
-
+ 
 @router.callback_query(F.data.startswith("quicktake_"))
 async def quick_take(cb: CallbackQuery):
     await cb.answer()
@@ -1785,6 +1896,80 @@ async def admin_online(message: types.Message):
         tg = f"@{db['username']}" if db and db["username"] else f"ID:{uid}"
         lines.append(f"• {tg} · {last}")
     await message.answer("\n".join(lines), parse_mode="HTML")
+ 
+# ─────────────────────────────────────────────
+#  /audit — синхронизация тарифов с панелью
+# ─────────────────────────────────────────────
+@router.message(Command("audit"))
+async def admin_audit(message: types.Message):
+    """Проверяет каждого пользователя: если hwid в панели изменился — обновляет /check."""
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("🔍 <b>Запускаю аудит...</b>\n\nПолучаю данные из Remnawave...", parse_mode="HTML")
+ 
+    all_remna = await remna_get_all_users()
+    our_users = {
+        u["username"]: u
+        for u in all_remna
+        if u.get("username", "").startswith("truba_")
+    }
+ 
+    async with pool.acquire() as conn:
+        db_users = await conn.fetch("SELECT user_id, username, remna_uuid FROM users")
+ 
+    checked = 0
+    updated = 0
+    not_found = 0
+    report_lines = ["🔍 <b>Аудит завершён</b>\n"]
+    changed_lines = []
+ 
+    for row in db_users:
+        u_id = row["user_id"]
+        remna_key = f"truba_{u_id}"
+        remna_data = our_users.get(remna_key)
+        checked += 1
+ 
+        if not remna_data:
+            not_found += 1
+            continue
+ 
+        # Обновляем remna_uuid в БД если отличается
+        panel_uuid = remna_data.get("uuid")
+        if panel_uuid and panel_uuid != row["remna_uuid"]:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE users SET remna_uuid=$1 WHERE user_id=$2",
+                    panel_uuid, u_id
+                )
+            updated += 1
+            uname = row["username"] or str(u_id)
+            hwid  = remna_data.get("hwidDeviceLimit", 1)
+            expire = parse_dt(remna_data.get("expireAt"))
+            date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "∞"
+            changed_lines.append(
+                f"• @{uname} — uuid обновлён, {HWID_OPTIONS.get(hwid, str(hwid))}, до {date_str}"
+            )
+ 
+        await asyncio.sleep(0)  # не блокируем event loop
+ 
+    report_lines += [
+        f"✅ Проверено: <b>{checked}</b>",
+        f"🔄 Обновлено uuid: <b>{updated}</b>",
+        f"❓ Не найдено в панели: <b>{not_found}</b>",
+    ]
+ 
+    if changed_lines:
+        report_lines.append("\n📋 <b>Изменения:</b>")
+        # Показываем максимум 20 изменений в одном сообщении
+        report_lines.extend(changed_lines[:20])
+        if len(changed_lines) > 20:
+            report_lines.append(f"... и ещё {len(changed_lines) - 20}")
+ 
+    text = "\n".join(report_lines)
+    if len(text) > 4000:
+        await message.answer("\n".join(report_lines[:30]), parse_mode="HTML")
+        await message.answer("\n".join(report_lines[30:]), parse_mode="HTML")
+    else:
+        await message.answer(text, parse_mode="HTML")
  
 # ─────────────────────────────────────────────
 #  ПРОМОКОДЫ
@@ -2016,16 +2201,15 @@ async def daily_report_scheduler():
         await send_daily_report()
  
 # ─────────────────────────────────────────────
-#  ОПРОС — оценка сервиса (только для платников)
+#  ОПРОС
 # ─────────────────────────────────────────────
 def _rating_kb() -> InlineKeyboardMarkup:
     row1 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(1, 6)]
     row2 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(6, 11)]
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
-
+ 
 @router.message(Command("survey"))
 async def admin_survey_start(message: types.Message):
-    """Запустить опрос среди всех платников."""
     if message.from_user.id not in ADMIN_IDS:
         return
     await message.answer("⏳ Рассылаю опрос платникам...")
@@ -2049,22 +2233,18 @@ async def admin_survey_start(message: types.Message):
         f"✅ Опрос разослан.\nДоставлено: <b>{ok}</b> · Ошибок: <b>{fail}</b>",
         parse_mode="HTML",
     )
-
+ 
 @router.callback_query(F.data.startswith("survey_rate_"))
 async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
-    """Пользователь выбрал оценку."""
     await cb.answer()
-    # Проверяем что это платник
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT has_paid FROM users WHERE user_id=$1", cb.from_user.id)
     if not row or not row["has_paid"]:
         await cb.answer("Опрос доступен только для платных подписчиков.", show_alert=True)
         return
-
     rating = int(cb.data.removeprefix("survey_rate_"))
     await state.set_state(SurveyState.waiting_comment)
     await state.update_data(survey_rating=rating)
-
     emoji = "😍" if rating >= 9 else "😊" if rating >= 7 else "😐" if rating >= 5 else "😕" if rating >= 3 else "😞"
     await cb.message.edit_text(
         f"{emoji} Спасибо! Вы поставили оценку <b>{rating}/10</b>.\n\n"
@@ -2075,10 +2255,9 @@ async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="Пропустить →", callback_data="survey_skip_comment")]
         ]),
     )
-
+ 
 @router.callback_query(F.data == "survey_skip_comment")
 async def survey_skip_comment(cb: CallbackQuery, state: FSMContext):
-    """Пользователь пропустил комментарий."""
     await cb.answer()
     data = await state.get_data()
     rating = data.get("survey_rating", 0)
@@ -2089,10 +2268,9 @@ async def survey_skip_comment(cb: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await _notify_admins_survey(cb.from_user, rating, None)
-
+ 
 @router.message(SurveyState.waiting_comment)
 async def survey_comment_handler(message: types.Message, state: FSMContext):
-    """Пользователь написал комментарий."""
     data = await state.get_data()
     rating = data.get("survey_rating", 0)
     comment = message.text.strip()
@@ -2103,7 +2281,7 @@ async def survey_comment_handler(message: types.Message, state: FSMContext):
         parse_mode="HTML",
     )
     await _notify_admins_survey(message.from_user, rating, comment)
-
+ 
 async def _save_survey(user, rating: int, comment: str | None):
     now = int(time.time())
     async with pool.acquire() as conn:
@@ -2111,7 +2289,7 @@ async def _save_survey(user, rating: int, comment: str | None):
             "INSERT INTO survey_responses (user_id, username, rating, comment, created_at) VALUES ($1,$2,$3,$4,$5)",
             user.id, user.username, rating, comment, now,
         )
-
+ 
 async def _notify_admins_survey(user, rating: int, comment: str | None):
     emoji = "😍" if rating >= 9 else "😊" if rating >= 7 else "😐" if rating >= 5 else "😕" if rating >= 3 else "😞"
     uname = f"@{user.username}" if user.username else f"ID:{user.id}"
@@ -2129,10 +2307,9 @@ async def _notify_admins_survey(user, rating: int, comment: str | None):
             await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception:
             pass
-
+ 
 @router.message(Command("survey_results"))
 async def admin_survey_results(message: types.Message):
-    """Показать результаты опроса."""
     if message.from_user.id not in ADMIN_IDS:
         return
     async with pool.acquire() as conn:
@@ -2148,10 +2325,10 @@ async def admin_survey_results(message: types.Message):
             "SELECT username, rating, comment, created_at FROM survey_responses "
             "WHERE comment IS NOT NULL ORDER BY created_at DESC LIMIT 10"
         )
-
+ 
     avg_rounded = round(float(avg), 2)
     emoji = "😍" if avg_rounded >= 9 else "😊" if avg_rounded >= 7 else "😐" if avg_rounded >= 5 else "😕"
-
+ 
     lines = [
         f"📊 <b>Результаты опроса</b>\n",
         f"Всего ответов: <b>{total}</b>",
@@ -2161,7 +2338,7 @@ async def admin_survey_results(message: types.Message):
     for r in dist:
         bar = "█" * r["cnt"] if r["cnt"] <= 20 else "█" * 20 + f"+{r['cnt']-20}"
         lines.append(f"  {r['rating']:2d}/10 · {r['cnt']:3d} чел.  {bar}")
-
+ 
     if comments:
         lines += ["", "💬 <b>Последние комментарии:</b>"]
         for c in comments:
@@ -2169,15 +2346,14 @@ async def admin_survey_results(message: types.Message):
             dt = fmt_dt(c["created_at"], "%d.%m")
             preview = c["comment"][:120] + "..." if len(c["comment"]) > 120 else c["comment"]
             lines.append(f"\n⭐️{c['rating']} · {uname} [{dt}]:\n<i>{preview}</i>")
-
+ 
     text = "\n".join(lines)
-    # Разбиваем если длинно
     if len(text) > 4000:
         await message.answer("\n".join(lines[:20]), parse_mode="HTML")
         await message.answer("\n".join(lines[20:]), parse_mode="HTML")
     else:
         await message.answer(text, parse_mode="HTML")
-
+ 
 # ─────────────────────────────────────────────
 #  STATS / REPORT / ADMIN
 # ─────────────────────────────────────────────
@@ -2221,8 +2397,9 @@ async def admin_help(message: types.Message):
         "<code>/genkey</code> — интерактивно\n"
         "<code>/check username|id</code> — инфо о клиенте\n"
         "<code>/take username|id</code> — забрать подписку\n"
-        "<code>/subs</code> — список подписчиков\n"
-        "<code>/online</code> — кто онлайн\n\n"
+        "<code>/subs</code> — список всех подписчиков\n"
+        "<code>/online</code> — кто онлайн\n"
+        "<code>/audit</code> — синхронизация uuid из панели\n\n"
         "🎟 <b>Промокоды:</b>\n"
         "<code>/add_promo КОД ДНИ [исп.]</code>\n"
         "<code>/add_promo КОД 0 [исп.] discount:ПРОЦЕНТ</code> — скидка\n"
@@ -2235,7 +2412,7 @@ async def admin_help(message: types.Message):
         "📊 <b>Статистика:</b>\n"
         "<code>/stats</code> · <code>/report</code>\n"
         "<code>/broadcast</code> — рассылка\n"
-        "<code>/survey</code> — опрос платников (оценка 1–10 + комментарий)\n"
+        "<code>/survey</code> — опрос платников\n"
         "<code>/survey_results</code> — результаты опроса\n\n"
         "🔔 <b>Уведомления:</b>\n"
         "<code>/dnd</code> — тикеты не беспокоить\n"
