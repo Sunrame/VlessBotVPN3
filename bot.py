@@ -335,32 +335,32 @@ async def remna_disable_user(uuid_: str) -> bool:
     return result is not None
  
 async def remna_get_all_users() -> list:
-    """Получает ВСЕХ пользователей постранично (API отдаёт max 30 на страницу)."""
+    """Получает ВСЕХ пользователей через start+size (единственная рабочая пагинация)."""
     all_users: list = []
-    page = 1
-    PAGE_SIZE = 30
+    PAGE_SIZE = 100
+    start = 0
     try:
         async with httpx.AsyncClient(verify=True) as client:
             while True:
                 r = await client.get(
-                    f"{REMNAWAVE_URL}/api/users?limit={PAGE_SIZE}&page={page}",
+                    f"{REMNAWAVE_URL}/api/users?start={start}&size={PAGE_SIZE}",
                     headers=_remna_headers(), timeout=30,
                 )
                 r.raise_for_status()
                 data  = r.json().get("response", {})
                 users = data.get("users", [])
+                total = data.get("total", 0)
                 if not users:
                     break
-                # дедупликация по uuid — защита от дублей
+                # дедупликация по uuid
                 existing = {u.get("uuid") for u in all_users}
-                new_users = [u for u in users if u.get("uuid") not in existing]
-                all_users.extend(new_users)
-                total = data.get("total", 0)
-                log.info("[Remna] get_all_users page=%d got=%d total=%d collected=%d",
-                         page, len(users), total, len(all_users))
+                new_u = [u for u in users if u.get("uuid") not in existing]
+                all_users.extend(new_u)
+                log.info("[Remna] get_all_users start=%d got=%d new=%d total=%d collected=%d",
+                         start, len(users), len(new_u), total, len(all_users))
                 if len(all_users) >= total or len(users) < PAGE_SIZE:
                     break
-                page += 1
+                start += PAGE_SIZE
     except Exception as e:
         log.error("[Remna] get_all_users: %s", e)
     return all_users
@@ -861,19 +861,33 @@ async def cmd_subs(message: types.Message):
         all_users = await remna_get_all_users()
         our = [u for u in all_users if u.get("username", "").startswith("truba_")]
 
-        # Активные: срок не истёк И не отключены вручную (DISABLED)
-        # Сюда попадают ACTIVE, LIMITED и любые другие статусы с живым сроком
-        active  = [u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"]
-        expired = [u for u in our if parse_dt(u.get("expireAt")) <= now or u.get("status") == "DISABLED"]
+        # Все категории
+        active   = [u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") not in ("DISABLED",)]
+        disabled = [u for u in our if u.get("status") == "DISABLED"]
+        expired  = [u for u in our if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED"]
 
-        lines = [
-            f"📋 <b>Подписчики TrubaVPN</b>\n",
-            f"✅ Активных: <b>{len(active)}</b> | ❌ Истёкших/откл.: <b>{len(expired)}</b>\n",
+        # Статус-иконки
+        STATUS_ICON = {
+            "ACTIVE":   "✅",
+            "EXPIRED":  "❌",
+            "DISABLED": "🚫",
+            "LIMITED":  "⚠️",
+        }
+
+        subs_lines = [
+            f"📋 <b>Подписчики TrubaVPN</b>",
+            f"Всего в панели: <b>{len(our)}</b> | ✅ Активных: <b>{len(active)}</b> | ❌ Истёкших: <b>{len(expired)}</b> | 🚫 Откл.: <b>{len(disabled)}</b>",
             "━━━━━━━━━━━━━━━━━━━━",
         ]
 
-        # Показываем ВСЕХ активных — без лимита
-        for u in sorted(active, key=lambda x: parse_dt(x.get("expireAt")), reverse=True):
+        # Сортируем: активные по дате (дальние сначала), потом истёкшие, потом disabled
+        sorted_users = (
+            sorted(active,   key=lambda x: parse_dt(x.get("expireAt")), reverse=True) +
+            sorted(expired,  key=lambda x: parse_dt(x.get("expireAt")), reverse=True) +
+            sorted(disabled, key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
+        )
+
+        for u in sorted_users:
             uid       = u["username"].replace("truba_", "")
             expire    = parse_dt(u.get("expireAt"))
             days_left = max(0, (expire - now) // 86400)
@@ -881,16 +895,17 @@ async def cmd_subs(message: types.Message):
             used_gb   = round((u.get("userTraffic", {}).get("usedTrafficBytes") or 0) / 1024**3, 2)
             hwid      = u.get("hwidDeviceLimit", 0)
             hwid_lbl  = HWID_OPTIONS.get(hwid, f"{hwid}уст.")
-            status_icon = "🟡 " if u.get("status") not in ("ACTIVE", "DISABLED") else ""
+            st        = u.get("status", "?")
+            icon      = STATUS_ICON.get(st, "🟡")
             async with pool.acquire() as conn:
                 db = await conn.fetchrow("SELECT username FROM users WHERE user_id=$1",
                                          int(uid) if uid.isdigit() else 0)
             tg = f"@{db['username']}" if db and db["username"] else f"ID:{uid}"
-            lines.append(f"{status_icon}👤 {tg}\n   {hwid_lbl} · до {date_str} ({days_left}д) · {used_gb}GB")
+            subs_lines.append(f"{icon} {tg}\n   {hwid_lbl} · до {date_str} ({days_left}д) · {used_gb}GB")
 
         # Разбиваем на сообщения по 4000 символов
         chunk = ""
-        for line in lines:
+        for line in subs_lines:
             if len(chunk) + len(line) + 1 > 4000:
                 await message.answer(chunk, parse_mode="HTML")
                 chunk = line + "\n"
