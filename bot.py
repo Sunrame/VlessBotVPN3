@@ -2269,6 +2269,63 @@ async def admin_help(message: types.Message):
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+#  /debug_api — отладка пагинации Remnawave
+# ─────────────────────────────────────────────
+@router.message(Command("debug_api"))
+async def admin_debug_api(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("🔍 Проверяю API Remnawave...")
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            # Страница 1 — смотрим сырой ответ\nr1 = await client.get(\nf"{REMNAWAVE_URL}/api/users?limit=30&page=1",\nheaders=_remna_headers(), timeout=30,\n)\nr1.raise_for_status()\nraw = r1.json()\nresp = raw.get("response", {})\n\ntop_keys = list(raw.keys())\nresp_keys = list(resp.keys()) if isinstance(resp, dict) else str(type(resp))\nusers_p1 = resp.get("users", []) if isinstance(resp, dict) else []\ntotal    = resp.get("total", "N/A")\nmeta     = {k: v for k, v in resp.items() if k != "users"}\n\nlines = [\nf"📦 <b>Сырой ответ API (страница 1)</b>\n",\nf"Ключи top-level: <code>{top_keys}</code>",\nf"Ключи response: <code>{resp_keys}</code>",\nf"total: <b>{total}</b>",\nf"users на стр.1: <b>{len(users_p1)}</b>",\nf"Мета: <code>{meta}</code>\n",\n]\n\nif users_p1:\nu0 = users_p1[0]\nlines.append(f"Ключи первого юзера: <code>{list(u0.keys())}</code>")\nlines.append(f"Пример username: <code>{u0.get('username')}</code>")\nlines.append(f"Пример status: <code>{u0.get('status')}</code>\n")
+
+            # Страница 2
+            r2 = await client.get(
+                f"{REMNAWAVE_URL}/api/users?limit=30&page=2",
+                headers=_remna_headers(), timeout=30,
+            )
+            r2.raise_for_status()
+            raw2  = r2.json()
+            resp2 = raw2.get("response", {})
+            users_p2 = resp2.get("users", []) if isinstance(resp2, dict) else []
+            total2   = resp2.get("total", "N/A")
+            lines.append(f"Страница 2: users={len(users_p2)}, total={total2}")
+
+            # Пересечение uuid
+            if users_p1 and users_p2:
+                uuids1 = {u.get("uuid") for u in users_p1}
+                uuids2 = {u.get("uuid") for u in users_p2}
+                overlap = uuids1 & uuids2
+                lines.append(f"Пересечение uuid стр.1 и стр.2: <b>{len(overlap)}</b>")
+                if overlap:
+                    lines.append("⚠️ API дублирует записи между страницами!")
+
+            # Также попробуем limit=100
+            r_big = await client.get(
+                f"{REMNAWAVE_URL}/api/users?limit=100&page=1",
+                headers=_remna_headers(), timeout=30,
+            )
+            r_big.raise_for_status()
+            resp_big = r_big.json().get("response", {})
+            users_big = resp_big.get("users", []) if isinstance(resp_big, dict) else []
+            lines.append(f"\nС limit=100: users={len(users_big)}, total={resp_big.get('total','N/A')}")
+
+            # И limit=50
+            r50 = await client.get(
+                f"{REMNAWAVE_URL}/api/users?limit=50&page=1",
+                headers=_remna_headers(), timeout=30,
+            )
+            r50.raise_for_status()
+            resp50 = r50.json().get("response", {})
+            users50 = resp50.get("users", []) if isinstance(resp50, dict) else []
+            lines.append(f"С limit=50: users={len(users50)}, total={resp50.get('total','N/A')}")
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
+
 async def main():
     await init_db()
     dp.include_router(router)
