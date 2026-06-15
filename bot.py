@@ -2292,29 +2292,29 @@ async def admin_help(message: types.Message):
 async def admin_debug_api(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    await message.answer("Ищу endpoint устройств...")
+    await message.answer("Ищу HWID API...")
     parts = []
     try:
-        # Берём первого попавшегося реального пользователя из панели
+        # Берём реального пользователя
         all_u = await remna_get_all_users()
         truba = [u for u in all_u if u.get("username","").startswith("truba_")]
-        if not truba:
-            await message.answer("Нет пользователей в панели"); return
-        test_user = truba[0]
-        test_uuid = test_user.get("uuid")
-        test_name = test_user.get("username")
-        parts.append(f"test_user: {test_name}  uuid: {test_uuid}")
-        parts.append(f"Все ключи юзера: {list(test_user.keys())}")
-        parts.append(f"userTraffic: {test_user.get('userTraffic')}")
+        test_uuid = truba[0].get("uuid") if truba else None
+        test_name = truba[0].get("username") if truba else None
+        parts.append(f"test: {test_name} / {test_uuid}")
 
         async with httpx.AsyncClient(verify=True) as client:
             endpoints = [
-                f"/api/users/{test_uuid}/devices",
-                f"/api/users/{test_uuid}/hwid",
-                f"/api/hwid/user/{test_uuid}",
-                f"/api/hwid/{test_uuid}",
-                f"/api/devices/user/{test_uuid}",
-                f"/api/devices/{test_uuid}",
+                "/api/hwid",
+                "/api/hwid/all",
+                f"/api/hwid?userUuid={test_uuid}",
+                f"/api/hwid?uuid={test_uuid}",
+                f"/api/hwid/inspector",
+                f"/api/hwid/inspector?userUuid={test_uuid}",
+                f"/api/users/{test_uuid}/hwid-devices",
+                f"/api/users/{test_uuid}/hwid-inspector",
+                "/api/inspector/hwid",
+                f"/api/inspector/hwid?userUuid={test_uuid}",
+                f"/api/inspector/hwid/{test_uuid}",
             ]
             for ep in endpoints:
                 try:
@@ -2322,24 +2322,22 @@ async def admin_debug_api(message: types.Message):
                         f"{REMNAWAVE_URL}{ep}",
                         headers=_remna_headers(), timeout=10,
                     )
-                    parts.append(f"\n{ep}\n-> {r.status_code}: {r.text[:200]}")
+                    body = r.text[:250]
+                    parts.append(f"{ep}\n-> {r.status_code}: {body}")
                 except Exception as ex:
-                    parts.append(f"\n{ep}\n-> ERR: {ex}")
+                    parts.append(f"{ep}\n-> ERR: {ex}")
 
-        # Отправляем по кускам
         chunk = ""
         for p in parts:
-            if len(chunk) + len(p) > 3800:
+            if len(chunk) + len(p) + 2 > 3800:
                 await message.answer(chunk)
                 chunk = p
             else:
-                chunk += "\n" + p
+                chunk += "\n\n" + p
         if chunk:
             await message.answer(chunk)
-
     except Exception as e:
-        collected = "\n".join(parts) if parts else "(none)"
-        await message.answer(f"Error: {e}\n\n{collected}")
+        await message.answer(f"Error: {e}\n" + "\n".join(parts))
 
 
 async def main():
