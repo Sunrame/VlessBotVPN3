@@ -2292,63 +2292,38 @@ async def admin_help(message: types.Message):
 async def admin_debug_api(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    await message.answer("Проверяю API...")
-    result_parts = []
+    await message.answer("Ищу endpoint устройств...")
+    parts = []
     try:
+        # Получим uuid первого пользователя
+        remna = await remna_get_user(message.from_user.id)
+        test_uuid = remna["uuid"] if remna else None
+        parts.append(f"test_uuid: {test_uuid}")
+
         async with httpx.AsyncClient(verify=True) as client:
-            # Запрос 1: без параметров
-            r = await client.get(f"{REMNAWAVE_URL}/api/users", headers=_remna_headers(), timeout=30)
-            r.raise_for_status()
-            d = r.json().get("response", {})
-            u = d.get("users", []) if isinstance(d, dict) else []
-            result_parts.append(f"No params: users={len(u)} total={d.get('total','?')} keys={list(d.keys()) if isinstance(d,dict) else '?'}")
+            endpoints = [
+                f"/api/users/{test_uuid}/devices",
+                f"/api/users/{test_uuid}/hwid",
+                f"/api/hwid/{test_uuid}",
+                f"/api/hwid/user/{test_uuid}",
+                f"/api/devices/user/{test_uuid}",
+                f"/api/devices/{test_uuid}",
+                f"/api/users/devices/{test_uuid}",
+            ]
+            for ep in endpoints:
+                try:
+                    r = await client.get(
+                        f"{REMNAWAVE_URL}{ep}",
+                        headers=_remna_headers(), timeout=10,
+                    )
+                    parts.append(f"{ep} -> {r.status_code}: {r.text[:120]}")
+                except Exception as ex:
+                    parts.append(f"{ep} -> ERR: {ex}")
 
-            # Запрос 2: limit=100
-            r = await client.get(f"{REMNAWAVE_URL}/api/users?limit=100", headers=_remna_headers(), timeout=30)
-            r.raise_for_status()
-            d = r.json().get("response", {})
-            u = d.get("users", []) if isinstance(d, dict) else []
-            result_parts.append(f"limit=100: users={len(u)} total={d.get('total','?')}")
-
-            # Запрос 3: limit=100&page=1
-            r = await client.get(f"{REMNAWAVE_URL}/api/users?limit=100&page=1", headers=_remna_headers(), timeout=30)
-            r.raise_for_status()
-            d = r.json().get("response", {})
-            u = d.get("users", []) if isinstance(d, dict) else []
-            result_parts.append(f"limit=100&page=1: users={len(u)} total={d.get('total','?')}")
-
-            # Запрос 4: limit=100&page=2
-            r = await client.get(f"{REMNAWAVE_URL}/api/users?limit=100&page=2", headers=_remna_headers(), timeout=30)
-            r.raise_for_status()
-            d = r.json().get("response", {})
-            u2 = d.get("users", []) if isinstance(d, dict) else []
-            result_parts.append(f"limit=100&page=2: users={len(u2)} total={d.get('total','?')}")
-
-            # Запрос 5: offset=0&limit=100
-            r = await client.get(f"{REMNAWAVE_URL}/api/users?offset=0&limit=100", headers=_remna_headers(), timeout=30)
-            r.raise_for_status()
-            d = r.json().get("response", {})
-            u = d.get("users", []) if isinstance(d, dict) else []
-            result_parts.append(f"offset=0&limit=100: users={len(u)} total={d.get('total','?')}")
-
-            # Запрос 6: offset=30&limit=100
-            r = await client.get(f"{REMNAWAVE_URL}/api/users?offset=30&limit=100", headers=_remna_headers(), timeout=30)
-            r.raise_for_status()
-            d = r.json().get("response", {})
-            u = d.get("users", []) if isinstance(d, dict) else []
-            result_parts.append(f"offset=30&limit=100: users={len(u)} total={d.get('total','?')}")
-
-            # Запрос 7: start=0&size=100
-            r = await client.get(f"{REMNAWAVE_URL}/api/users?start=0&size=100", headers=_remna_headers(), timeout=30)
-            r.raise_for_status()
-            d = r.json().get("response", {})
-            u = d.get("users", []) if isinstance(d, dict) else []
-            result_parts.append(f"start=0&size=100: users={len(u)} total={d.get('total','?')}")
-
-        await message.answer("\n".join(result_parts))
+        await message.answer("\n\n".join(parts))
     except Exception as e:
-        collected = "\n".join(result_parts) if result_parts else "(none)"
-        await message.answer(f"Error: {e}\n\nCollected:\n{collected}")
+        collected = "\n".join(parts) if parts else "(none)"
+        await message.answer(f"Error: {e}\n\n{collected}")
 
 
 async def main():
