@@ -30,7 +30,21 @@ REMNAWAVE_TOKEN  = os.environ["REMNAWAVE_TOKEN"]
 REMNAWAVE_COOKIE = os.environ["REMNAWAVE_COOKIE"]
 SUB_BASE_URL     = os.environ["SUB_BASE_URL"].rstrip("/")
 
-SQUAD_UUID = "ed383cc2-c7c0-46ea-9237-19ebe8f10465"
+SQUAD_UUID = "ed383cc2-c7c0-46ea-9237-19ebe8f10465"  # Default-Squad — все сервера
+
+# Сквад с ограниченным набором нод (например, без "белых списков" сервера).
+# СОЗДАЙ этот сквад в Remnawave (Внутренние сквады → Создать), включи туда
+# все ноды КРОМЕ сервера "белые списки", и вставь сюда его UUID.
+SQUAD_UUID_BASIC = os.environ.get("SQUAD_UUID_BASIC", SQUAD_UUID)
+
+# Сквад С доступом к серверу "белые списки" (обычно = SQUAD_UUID, если Default-Squad
+# уже включает все ноды, либо отдельный сквад, если хочешь точнее разграничить).
+SQUAD_UUID_WHITELIST = os.environ.get("SQUAD_UUID_WHITELIST", SQUAD_UUID)
+
+# UUID самой НОДЫ "белые списки" (не сквада!) — нужен для проверки трафика
+# конкретного юзера именно на этом сервере. Скопируй в Remnawave:
+# Ноды → [нода "белые списки"] → More actions → Copy Node UUID.
+WHITELIST_NODE_UUID = os.environ.get("WHITELIST_NODE_UUID", "")
 
 ADMIN_IDS: list[int] = []
 for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
@@ -395,6 +409,27 @@ async def remna_get_user_hwid(uuid_: str) -> list:
             return data if isinstance(data, list) else []
     except Exception as e:
         log.error("[Remna] get_user_hwid: %s", e)
+        return []
+
+async def remna_get_node_bandwidth(node_uuid: str) -> list:
+    """
+    Трафик по каждому юзеру на КОНКРЕТНОЙ ноде (не по всему аккаунту).
+    GET /api/bandwidth-stats/nodes/{uuid}/users/legacy
+    Точная структура ответа проверяется командой /debug_bandwidth.
+    """
+    if not node_uuid:
+        return []
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            r = await client.get(
+                f"{REMNAWAVE_URL}/api/bandwidth-stats/nodes/{node_uuid}/users/legacy",
+                headers=_remna_headers(), timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json().get("response", [])
+            return data if isinstance(data, list) else data.get("users", []) if isinstance(data, dict) else []
+    except Exception as e:
+        log.error("[Remna] get_node_bandwidth: %s", e)
         return []
 
 async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict | None:
@@ -3093,7 +3128,50 @@ async def admin_stats_msg(message: types.Message):
 
 # ─────────────────────────────────────────────
 #  admin_users — возврат из check к поиску
-# ─────────────────────────────────────────────\n@router.callback_query(F.data == "admin_users")\nasync def admin_users_cb(cb: CallbackQuery, state: FSMContext):\nawait cb.answer()\nif cb.from_user.id not in ADMIN_IDS:\nreturn\nawait state.set_state(CheckActionState.waiting_search)\nawait cb.message.edit_text(\n"🔍 <b>Поиск пользователя</b>\n\nВведите username или user_id:\n/cancel — отмена",\nparse_mode="HTML",\nreply_markup=InlineKeyboardMarkup(inline_keyboard=[\n[InlineKeyboardButton(text="✕ Отмена", callback_data="admin_panel")],\n]),\n)
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_users")
+async def admin_users_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    # Перенаправляем на список подписчиков
+    await _render_subs_page(cb, 0)
+
+# ─────────────────────────────────────────────
+#  /debug_bandwidth — смотрим реальную структуру ответа
+#  GET /api/bandwidth-stats/nodes/{uuid}/users/legacy
+# ─────────────────────────────────────────────
+@router.message(Command("debug_bandwidth"))
+async def admin_debug_bandwidth(message: types.Message, command: CommandObject):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    node_uuid = (command.args or "").strip() or WHITELIST_NODE_UUID
+    if not node_uuid:
+        await message.answer(
+            "Формат: <code>/debug_bandwidth NODE_UUID</code>\n\n"
+            "Или сначала задай переменную окружения WHITELIST_NODE_UUID "
+            "с UUID ноды 'белые списки' (Ноды → нужная нода → More actions → "
+            "Copy Node UUID), тогда можно без аргумента.",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.answer(f"Проверяю bandwidth-stats для ноды <code>{node_uuid}</code>...", parse_mode="HTML")
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            r = await client.get(
+                f"{REMNAWAVE_URL}/api/bandwidth-stats/nodes/{node_uuid}/users/legacy",
+                headers=_remna_headers(), timeout=20,
+            )
+            body_preview = r.text[:3500]
+            await message.answer(
+                f"Status: {r.status_code}\n\nBody:\n<code>{body_preview}</code>",
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        await message.answer(f"Error: {e}")
+
+
 
 async def main():
     await init_db()
