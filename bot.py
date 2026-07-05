@@ -1599,57 +1599,109 @@ async def daily_report_scheduler():
 # ─────────────────────────────────────────────
 #  SUBS — все подписчики (inline editing)
 # ─────────────────────────────────────────────
-async def _render_subs_to_msg(target, message: types.Message):
+# ─────────────────────────────────────────────
+#  ПОДПИСЧИКИ — кнопки с пагинацией
+# ─────────────────────────────────────────────
+SUBS_PAGE_SIZE = 8  # кол-во подписчиков на странице
+
+async def _get_sorted_subs() -> list:
+    """Получить всех подписчиков отсортированных: активные → истёкшие → откл."""
     now = int(time.time())
     all_users = await remna_get_all_users()
     our = [u for u in all_users if u.get("username", "").startswith("truba_")]
-    active   = [u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") not in ("DISABLED",)]
-    disabled = [u for u in our if u.get("status") == "DISABLED"]
-    expired  = [u for u in our if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED"]
+    active   = sorted([u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"],
+                      key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
+    expired  = sorted([u for u in our if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED"],
+                      key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
+    disabled = sorted([u for u in our if u.get("status") == "DISABLED"],
+                      key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
+    return active + expired + disabled
+
+def _subs_page_kb(users_page: list, page: int, total: int, now: int) -> InlineKeyboardMarkup:
+    """Клавиатура: каждый подписчик — кнопка, навигация по страницам."""
     STATUS_ICON = {"ACTIVE": "✅", "EXPIRED": "❌", "DISABLED": "🚫", "LIMITED": "⚠️"}
-    subs_lines = [
-        f"📋 <b>Подписчики TrubaVPN</b>",
-        f"Всего: <b>{len(our)}</b> | ✅ Активных: <b>{len(active)}</b> | ❌ Истёкших: <b>{len(expired)}</b> | 🚫 Откл.: <b>{len(disabled)}</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
-    sorted_users = (
-        sorted(active,   key=lambda x: parse_dt(x.get("expireAt")), reverse=True) +
-        sorted(expired,  key=lambda x: parse_dt(x.get("expireAt")), reverse=True) +
-        sorted(disabled, key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
-    )
-    for u in sorted_users[:25]:
-        uid       = u["username"].replace("truba_", "")
-        expire    = parse_dt(u.get("expireAt"))
+    rows = []
+
+    for u in users_page:
+        uid    = u["username"].replace("truba_", "")
+        expire = parse_dt(u.get("expireAt"))
         days_left = max(0, (expire - now) // 86400)
-        date_str  = fmt_dt(expire, "%d.%m.%Y")
-        used_gb   = round((u.get("userTraffic", {}).get("usedTrafficBytes") or 0) / 1024**3, 2)
-        hwid      = u.get("hwidDeviceLimit", 0)
-        hwid_lbl  = HWID_OPTIONS.get(hwid, f"{hwid}уст.")
-        st        = u.get("status", "?")
-        icon      = STATUS_ICON.get(st, "🟡")
-        async with pool.acquire() as conn:
-            db = await conn.fetchrow("SELECT username FROM users WHERE user_id=$1",
-                                     int(uid) if uid.isdigit() else 0)
-        tg = f"@{db['username']}" if db and db["username"] else f"ID:{uid}"
-        subs_lines.append(f"{icon} {tg}\n   {hwid_lbl} · до {date_str} ({days_left}д) · {used_gb}GB")
-    if len(sorted_users) > 25:
-        subs_lines.append(f"\n... и ещё {len(sorted_users)-25} (показаны первые 25)")
-    return "\n".join(subs_lines)
+        st    = u.get("status", "?")
+        icon  = STATUS_ICON.get(st, "🟡")
+        tg    = u.get("_tg_label", f"ID:{uid}")
+        label = f"{icon} {tg} · {days_left}д"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"sub_view_{uid}"
+        )])
+
+    # Навигация
+    total_pages = (total + SUBS_PAGE_SIZE - 1) // SUBS_PAGE_SIZE
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"subs_page_{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="subs_noop"))
+    if (page + 1) * SUBS_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"subs_page_{page+1}"))
+    if len(nav) > 1 or total_pages > 1:
+        rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_subs"),
+        InlineKeyboardButton(text="← Назад",    callback_data="admin_panel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def _render_subs_page(cb: CallbackQuery, page: int):
+    """Отрисовать страницу подписчиков."""
+    now = int(time.time())
+    await cb.message.edit_text("⏳ Загружаю...")
+
+    all_subs = await _get_sorted_subs()
+    total = len(all_subs)
+
+    # Подгружаем TG username для страницы\npage_users = all_subs[page * SUBS_PAGE_SIZE:(page + 1) * SUBS_PAGE_SIZE]\nfor u in page_users:\nuid = u["username"].replace("truba_", "")\nasync with pool.acquire() as conn:\ndb = await conn.fetchrow("SELECT username FROM users WHERE user_id=$1",\nint(uid) if uid.isdigit() else 0)\nu["_tg_label"] = f"@{db['username']}" if db and db["username"] else f"ID:{uid}"\n\nactive_cnt   = sum(1 for u in all_subs if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")\nexpired_cnt  = sum(1 for u in all_subs if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED")\ndisabled_cnt = sum(1 for u in all_subs if u.get("status") == "DISABLED")\n\nheader = (\nf"👥 <b>Подписчики TrubaVPN</b>\n"\nf"Всего: <b>{total}</b> | ✅ <b>{active_cnt}</b> | ❌ <b>{expired_cnt}</b> | 🚫 <b>{disabled_cnt}</b>\n"\nf"<i>Нажмите на подписчика для управления</i>"\n)
+
+    await cb.message.edit_text(
+        header,
+        parse_mode="HTML",
+        reply_markup=_subs_page_kb(page_users, page, total, now),
+    )
 
 @router.callback_query(F.data == "admin_subs")
 async def admin_subs_cb(cb: CallbackQuery):
     await cb.answer()
     if cb.from_user.id not in ADMIN_IDS: return
-    await cb.message.edit_text("⏳ Загружаю список подписчиков...")
-    text = await _render_subs_to_msg(cb, cb.message)
-    await cb.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_subs")],
-            [InlineKeyboardButton(text="← Назад", callback_data="admin_panel")],
-        ]),
-    )
+    await _render_subs_page(cb, 0)
+
+@router.callback_query(F.data.startswith("subs_page_"))
+async def subs_page_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS: return
+    page = int(cb.data.removeprefix("subs_page_"))
+    await _render_subs_page(cb, page)
+
+@router.callback_query(F.data == "subs_noop")
+async def subs_noop(cb: CallbackQuery):
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("sub_view_"))
+async def sub_view_cb(cb: CallbackQuery):
+    """Открыть карточку подписчика по его Telegram ID."""
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS: return
+    uid_str = cb.data.removeprefix("sub_view_")
+    if uid_str.isdigit():
+        user_id = int(uid_str)
+    else:
+        # Это может быть username (если ID не числовой)
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT user_id FROM users WHERE username=$1", uid_str)
+        if not row:
+            await cb.answer("Пользователь не найден в БД.", show_alert=True)
+            return
+        user_id = row["user_id"]
+    await _render_check(cb, user_id)
 
 # ─────────────────────────────────────────────
 #  ONLINE (inline)
