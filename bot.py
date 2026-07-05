@@ -1655,18 +1655,68 @@ def _subs_page_kb(users_page: list, page: int, total: int, now: int) -> InlineKe
 async def _render_subs_page(cb: CallbackQuery, page: int):
     """Отрисовать страницу подписчиков."""
     now = int(time.time())
-    await cb.message.edit_text("⏳ Загружаю...")
+    await cb.message.edit_text("⏳ Загружаю подписчиков...")
+    try:
+        all_subs = await _get_sorted_subs()
+        total = len(all_subs)
 
-    all_subs = await _get_sorted_subs()
-    total = len(all_subs)
+        active_cnt   = sum(1 for u in all_subs
+                          if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")
+        expired_cnt  = sum(1 for u in all_subs
+                          if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED")
+        disabled_cnt = sum(1 for u in all_subs if u.get("status") == "DISABLED")
 
-    # Подгружаем TG username для страницы\npage_users = all_subs[page * SUBS_PAGE_SIZE:(page + 1) * SUBS_PAGE_SIZE]\nfor u in page_users:\nuid = u["username"].replace("truba_", "")\nasync with pool.acquire() as conn:\ndb = await conn.fetchrow("SELECT username FROM users WHERE user_id=$1",\nint(uid) if uid.isdigit() else 0)\nu["_tg_label"] = f"@{db['username']}" if db and db["username"] else f"ID:{uid}"\n\nactive_cnt   = sum(1 for u in all_subs if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")\nexpired_cnt  = sum(1 for u in all_subs if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED")\ndisabled_cnt = sum(1 for u in all_subs if u.get("status") == "DISABLED")\n\nheader = (\nf"👥 <b>Подписчики TrubaVPN</b>\n"\nf"Всего: <b>{total}</b> | ✅ <b>{active_cnt}</b> | ❌ <b>{expired_cnt}</b> | 🚫 <b>{disabled_cnt}</b>\n"\nf"<i>Нажмите на подписчика для управления</i>"\n)
+        # Срез текущей страницы
+        page_users = all_subs[page * SUBS_PAGE_SIZE:(page + 1) * SUBS_PAGE_SIZE]
 
-    await cb.message.edit_text(
-        header,
-        parse_mode="HTML",
-        reply_markup=_subs_page_kb(page_users, page, total, now),
-    )
+        # Batch-запрос usernames из БД для всех юзеров на странице
+        uid_list = []
+        for u in page_users:
+            uid_str = u["username"].replace("truba_", "")
+            if uid_str.isdigit():
+                uid_list.append(int(uid_str))
+
+        if uid_list:
+            async with pool.acquire() as conn:
+                db_rows = await conn.fetch(
+                    "SELECT user_id, username FROM users WHERE user_id = ANY($1::bigint[])",
+                    uid_list,
+                )
+            db_map = {r["user_id"]: r["username"] for r in db_rows}
+        else:
+            db_map = {}
+
+        for u in page_users:
+            uid_str = u["username"].replace("truba_", "")
+            if uid_str.isdigit():
+                uid_int = int(uid_str)
+                tg_name = db_map.get(uid_int)
+                u["_tg_label"] = f"@{tg_name}" if tg_name else f"ID:{uid_int}"
+            else:
+                u["_tg_label"] = f"ID:{uid_str}"
+
+        header = (
+            "👥 <b>Подписчики TrubaVPN</b>\n"
+            f"Всего: <b>{total}</b> | ✅ <b>{active_cnt}</b> | "
+            f"❌ <b>{expired_cnt}</b> | 🚫 <b>{disabled_cnt}</b>\n"
+            "<i>Нажмите на подписчика для управления</i>"
+        )
+
+        await cb.message.edit_text(
+            header,
+            parse_mode="HTML",
+            reply_markup=_subs_page_kb(page_users, page, total, now),
+        )
+
+    except Exception as e:
+        log.exception("_render_subs_page error: %s", e)
+        await cb.message.edit_text(
+            f"❌ Ошибка загрузки: {e}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Повторить", callback_data="admin_subs")],
+                [InlineKeyboardButton(text="← Назад", callback_data="admin_panel")],
+            ]),
+        )
 
 @router.callback_query(F.data == "admin_subs")
 async def admin_subs_cb(cb: CallbackQuery):
