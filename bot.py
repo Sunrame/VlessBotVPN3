@@ -2016,7 +2016,7 @@ async def _render_check(target_send, user_id: int):
         ticket_count = await conn.fetchval("SELECT COUNT(*) FROM support_tickets WHERE user_id=$1", user_id)
     if not db_row:
         txt = f"❌ Пользователь <code>{user_id}</code> не найден."
-        if hasattr(target_send, 'answer'):
+        if isinstance(target_send, types.Message):
             await target_send.answer(txt, parse_mode="HTML")
         else:
             await target_send.message.answer(txt, parse_mode="HTML")
@@ -2063,8 +2063,10 @@ async def _render_check(target_send, user_id: int):
             lines.append(f"  • {dt} · {p['amount']:.0f}₽ · {t_name}{'(триал)' if p['is_trial'] else ''}")
     lines += ["", "🛠 <b>Действия:</b>"]
     text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n<i>… обрезано</i>"
     kb   = _check_kb(user_id, hwid)
-    if hasattr(target_send, 'answer'):
+    if isinstance(target_send, types.Message):
         await target_send.answer(text, parse_mode="HTML", reply_markup=kb)
     else:
         try:
@@ -2764,17 +2766,16 @@ async def media_check_cb(cb: CallbackQuery):
     username = cb.data.removeprefix("media_check_").lstrip("@")
     await _render_media_check(cb, username)
 
-async def _render_media_check(target_send, username: str):
+async def _render_media_check(cb: CallbackQuery, username: str):
     async with pool.acquire() as conn:
         partner = await conn.fetchrow("SELECT * FROM media_partners WHERE username=$1", username)
         if not partner:
-            if hasattr(target_send, 'answer'):
-                await target_send.answer(f"❌ @{username} не является медиа-партнёром. Исполь��уйте «Назначить».")
-            else:
-                await target_send.message.edit_text(f"❌ @{username} не является медиа-партнёром.",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="← Назад", callback_data="admin_media")],
-                    ]))
+            await cb.message.edit_text(
+                f"❌ @{username} не является медиа-партнёром.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="← Назад", callback_data="admin_media")],
+                ]),
+            )
             return
         referrer_id = partner["user_id"]
         percent     = partner["percent"]
@@ -2783,19 +2784,14 @@ async def _render_media_check(target_send, username: str):
             referrer_id,
         )
         if not referrals:
-            if hasattr(target_send, 'edit_text'):
-                await target_send.edit_text(
-                    f"💼 <b>Медиа-партнёр @{username}</b> ({percent}%)\n\nПока нет ни одного реферала.",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="🗑 Снять", callback_data=f"media_unmake_{username}"),
-                         InlineKeyboardButton(text="← Назад", callback_data="admin_media")],
-                    ]),
-                )
-            else:
-                await target_send.answer(
-                    f"💼 <b>Медиа-партнёр @{username}</b> ({percent}%)\n\nПока нет ни одного реферала.",
-                    parse_mode="HTML")
+            await cb.message.edit_text(
+                f"💼 <b>Медиа-партнёр @{username}</b> ({percent}%)\n\nПока нет ни одного реферала.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🗑 Снять", callback_data=f"media_unmake_{username}"),
+                     InlineKeyboardButton(text="← Назад", callback_data="admin_media")],
+                ]),
+            )
             return
         ref_ids = [r["user_id"] for r in referrals]
         payments = await conn.fetch(
@@ -2833,21 +2829,16 @@ async def _render_media_check(target_send, username: str):
                 f"   📅 {dt} · 🎯 {percent}% = <b>{earned:.2f} ₽</b>"
             )
     text = "\n".join(lines)
+    # Telegram лимит на текст сообщения — 4096 символов, режем с запасом
     if len(text) > 4000:
-        text = text[:4000]
-    if hasattr(target_send, 'edit_text'):
-        await target_send.edit_text(
-            text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🗑 Снять", callback_data=f"media_unmake_{username}"),
-                 InlineKeyboardButton(text="← Назад", callback_data="admin_media")],
-            ]),
-        )
-    else:
-        await target_send.answer(text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="← Назад", callback_data="admin_media")],
-            ]))
+        text = text[:4000] + "\n\n<i>… список обрезан</i>"
+    await cb.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Снять", callback_data=f"media_unmake_{username}"),
+             InlineKeyboardButton(text="← Назад", callback_data="admin_media")],
+        ]),
+    )
 
 @router.callback_query(F.data.startswith("media_unmake_"))
 async def media_unmake_cb(cb: CallbackQuery):
