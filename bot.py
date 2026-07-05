@@ -629,7 +629,10 @@ def _check_kb(user_id: int, hwid: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📋 Список устройств",          callback_data=f"ca_devices_{user_id}")],
         *preset_rows,
         [InlineKeyboardButton(text="🚫 Забрать подписку", callback_data=f"quicktake_{user_id}")],
-        [InlineKeyboardButton(text="← Назад", callback_data="admin_users")],
+        [
+            InlineKeyboardButton(text="👥 Подписчики", callback_data="admin_subs"),
+            InlineKeyboardButton(text="🔍 Поиск",      callback_data="admin_search"),
+        ],
     ])
 
 # ─────────────────────────────────────────────
@@ -1605,17 +1608,13 @@ async def daily_report_scheduler():
 SUBS_PAGE_SIZE = 8  # кол-во подписчиков на странице
 
 async def _get_sorted_subs() -> list:
-    """Получить всех подписчиков отсортированных: активные → истёкшие → откл."""
+    """Получить только АКТИВНЫХ подписчиков, отсортированных по дате истечения."""
     now = int(time.time())
     all_users = await remna_get_all_users()
     our = [u for u in all_users if u.get("username", "").startswith("truba_")]
-    active   = sorted([u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"],
-                      key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
-    expired  = sorted([u for u in our if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED"],
-                      key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
-    disabled = sorted([u for u in our if u.get("status") == "DISABLED"],
-                      key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
-    return active + expired + disabled
+    active = [u for u in our
+              if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"]
+    return sorted(active, key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
 
 def _subs_page_kb(users_page: list, page: int, total: int, now: int) -> InlineKeyboardMarkup:
     """Клавиатура: каждый подписчик — кнопка, навигация по страницам."""
@@ -1660,11 +1659,8 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
         all_subs = await _get_sorted_subs()
         total = len(all_subs)
 
-        active_cnt   = sum(1 for u in all_subs
-                          if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")
-        expired_cnt  = sum(1 for u in all_subs
-                          if parse_dt(u.get("expireAt")) <= now and u.get("status") != "DISABLED")
-        disabled_cnt = sum(1 for u in all_subs if u.get("status") == "DISABLED")
+        # Все активные (total уже содержит только их из _get_sorted_subs)
+        active_cnt = total
 
         # Срез текущей страницы
         page_users = all_subs[page * SUBS_PAGE_SIZE:(page + 1) * SUBS_PAGE_SIZE]
@@ -1696,9 +1692,8 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
                 u["_tg_label"] = f"ID:{uid_str}"
 
         header = (
-            "👥 <b>Подписчики TrubaVPN</b>\n"
-            f"Всего: <b>{total}</b> | ✅ <b>{active_cnt}</b> | "
-            f"❌ <b>{expired_cnt}</b> | 🚫 <b>{disabled_cnt}</b>\n"
+            "👥 <b>Активные подписчики TrubaVPN</b>\n"
+            f"✅ Активных: <b>{active_cnt}</b>\n"
             "<i>Нажмите на подписчика для управления</i>"
         )
 
