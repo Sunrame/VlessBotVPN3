@@ -276,6 +276,25 @@ def _remna_headers() -> dict:
 def remna_username(user_id: int) -> str:
     return f"truba_{user_id}"
 
+def _squad_uuids(raw_squads) -> list[str]:
+    """
+    Remnawave в GET-ответе возвращает activeInternalSquads как список ОБЪЕКТОВ
+    {"uuid": "...", "name": "..."}, а не список голых строк. При отправке PATCH
+    же нужен именно список строк-UUID. Эта функция нормализует любой вариант
+    (список объектов, список строк, вперемешку) в чистый список строк.
+    """
+    if not raw_squads:
+        return []
+    out = []
+    for s in raw_squads:
+        if isinstance(s, dict):
+            u = s.get("uuid")
+            if u:
+                out.append(u)
+        elif isinstance(s, str):
+            out.append(s)
+    return out
+
 def _expire_at(days: int) -> str:
     dt = datetime.now(timezone.utc) + timedelta(days=days)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -1788,7 +1807,7 @@ async def check_whitelist_limits():
                 remna = await remna_get_user(user_id)
                 if not remna:
                     continue
-                current_squads = remna.get("activeInternalSquads") or []
+                current_squads = _squad_uuids(remna.get("activeInternalSquads"))
                 # Убираем ТОЛЬКО whitelist-сквад, остальные (basic) оставляем как есть
                 new_squads = [s for s in current_squads if s != SQUAD_UUID_WHITELIST]
                 if SQUAD_UUID_BASIC not in new_squads:
@@ -2262,7 +2281,7 @@ async def _render_check(target_send, user_id: int):
         online_at = parse_dt(remna.get("userTraffic", {}).get("onlineAt"))
         is_online = online_at > (now - 180)
         sub_url   = format_sub_url(remna)
-        current_squads = remna.get("activeInternalSquads") or []
+        current_squads = _squad_uuids(remna.get("activeInternalSquads"))
         has_whitelist_squad = SQUAD_UUID_WHITELIST in current_squads
         lines += [
             "", f"📡 <b>Подписка:</b> {status}",
@@ -2327,7 +2346,7 @@ async def set_hwid_limit(cb: CallbackQuery):
     await cb.answer(f"✅ Лимит: {HWID_OPTIONS.get(new_hwid, str(new_hwid))}", show_alert=True)
     remna2 = await remna_get_user(user_id)
     hwid2  = remna2.get("hwidDeviceLimit", new_hwid) if remna2 else new_hwid
-    has_wl = SQUAD_UUID_WHITELIST in (remna2.get("activeInternalSquads") or []) if remna2 else False
+    has_wl = SQUAD_UUID_WHITELIST in _squad_uuids(remna2.get("activeInternalSquads")) if remna2 else False
     try:
         await cb.message.edit_reply_markup(reply_markup=_check_kb(user_id, hwid2, has_wl))
     except Exception: pass
@@ -2562,7 +2581,7 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
     if not remna:
         await cb.message.answer("❌ Пользователь не найден в Remnawave.")
         return
-    current_squads = remna.get("activeInternalSquads") or []
+    current_squads = _squad_uuids(remna.get("activeInternalSquads"))
     has_whitelist  = SQUAD_UUID_WHITELIST in current_squads
 
     if has_whitelist:
@@ -2615,7 +2634,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
     if not remna:
         await message.answer("❌ Пользователь не найден в Remnawave.")
         return
-    current_squads = remna.get("activeInternalSquads") or []
+    current_squads = _squad_uuids(remna.get("activeInternalSquads"))
     new_squads = list(current_squads)
     if SQUAD_UUID_WHITELIST not in new_squads:
         new_squads.append(SQUAD_UUID_WHITELIST)
