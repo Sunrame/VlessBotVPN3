@@ -248,7 +248,7 @@ async def init_db():
             )
         """)
         # Миграции
-        for col in ["remna_uuid TEXT", "created_at BIGINT DEFAULT 0"]:
+        for col in ["remna_uuid TEXT", "created_at BIGINT DEFAULT 0", "agreed_tos BOOLEAN DEFAULT FALSE"]:
             try:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
             except Exception:
@@ -714,6 +714,15 @@ def sub_required_kb():
         [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
     ])
 
+def tos_agree_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Пользовательское соглашение",
+                              url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
+        [InlineKeyboardButton(text="🔐 Политика конфиденциальности",
+                              url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+        [InlineKeyboardButton(text="✅ Я согласен", callback_data="agree_tos")],
+    ])
+
 def months_kb(tariff_key: str):
     info = TARIFFS[tariff_key]
     rows = []
@@ -808,15 +817,25 @@ async def cmd_start(message: types.Message, command: CommandObject):
 
     now = int(time.time())
     async with pool.acquire() as conn:
-        exists = await conn.fetchrow("SELECT user_id FROM users WHERE user_id=$1", u_id)
+        exists = await conn.fetchrow("SELECT user_id, agreed_tos FROM users WHERE user_id=$1", u_id)
         if not exists:
             await conn.execute(
                 "INSERT INTO users (user_id, username, referrer_id, created_at) VALUES ($1,$2,$3,$4)",
                 u_id, message.from_user.username, r_id, now,
             )
+            agreed_tos = False
         else:
             await conn.execute("UPDATE users SET username=$1 WHERE user_id=$2",
                                message.from_user.username, u_id)
+            agreed_tos = exists["agreed_tos"] or False
+
+    if not agreed_tos:
+        await message.answer(
+            f"🌏 {hbold('TrubaVPN')}\n\n"
+            "Прежде чем продолжить, ознакомьтесь с документами и подтвердите согласие:",
+            reply_markup=tos_agree_kb(), parse_mode="HTML",
+        )
+        return
 
     if not await is_subscribed(u_id):
         await message.answer(
@@ -825,11 +844,25 @@ async def cmd_start(message: types.Message, command: CommandObject):
         )
         return
 
-    await message.answer(
-        f"🌏 Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
-        "⚡️ Высокоскоростной VPN.\nВыберите действие:",
-        reply_markup=main_kb(u_id in ADMIN_IDS), parse_mode="HTML",
-    )
+    text, kb = await _build_profile_view(u_id)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@router.callback_query(F.data == "agree_tos")
+async def agree_tos_cb(cb: CallbackQuery):
+    await cb.answer()
+    u_id = cb.from_user.id
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE users SET agreed_tos=TRUE WHERE user_id=$1", u_id)
+
+    if not await is_subscribed(u_id):
+        await cb.message.edit_text(
+            f"🌏 {hbold('TrubaVPN')}\n\nПодпишитесь на канал чтобы пользоваться ботом.",
+            reply_markup=sub_required_kb(), parse_mode="HTML",
+        )
+        return
+
+    text, kb = await _build_profile_view(u_id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_cb(cb: CallbackQuery):
@@ -837,11 +870,8 @@ async def check_sub_cb(cb: CallbackQuery):
     if not await is_subscribed(cb.from_user.id):
         await cb.answer("Вы ещё не подписаны.", show_alert=True)
         return
-    await cb.message.edit_text(
-        f"��� Добро пожаловать в {hbold('TrubaVPN')}!\n\n"
-        "⚡️ Высокоскоростной VPN.\nВыберите действие:",
-        reply_markup=main_kb(cb.from_user.id in ADMIN_IDS), parse_mode="HTML",
-    )
+    text, kb = await _build_profile_view(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data == "back")
 async def back_to_main(cb: CallbackQuery, state: FSMContext):
@@ -1085,9 +1115,9 @@ async def order_apply_discount(cb: CallbackQuery):
 #  ПРОФИЛЬ
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "profile")
-async def profile_tab(cb: CallbackQuery):
-    await cb.answer()
-    user = await remna_get_user(cb.from_user.id)
+async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Общий рендер профиля — используется и в /start, и в кнопке «Профиль»."""
+    user = await remna_get_user(user_id)
     now  = int(time.time())
     if user and parse_dt(user.get("expireAt")) > now and user.get("status") != "DISABLED":
         expire    = parse_dt(user.get("expireAt"))
@@ -1109,10 +1139,17 @@ async def profile_tab(cb: CallbackQuery):
             "👤 <b>Профиль</b>\n\n❌ Подписка не активна.\n"
             "Нажмите «💰 Купить VPN» для оформления."
         )
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Купить VPN", callback_data="tariffs")],
-        [InlineKeyboardButton(text="← Назад", callback_data="back")],
-    ]))
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back")],
+    ])
+    return text, kb
+
+@router.callback_query(F.data == "profile")
+async def profile_tab(cb: CallbackQuery):
+    await cb.answer()
+    text, kb = await _build_profile_view(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 async def _show_sub_info_inplace(message: types.Message, user_id: int):
     user = await remna_get_user(user_id)
@@ -3520,6 +3557,65 @@ async def admin_debug_bandwidth(message: types.Message, command: CommandObject):
     text = "\n\n━━━━━━━━━━\n\n".join(results)
     if len(text) > 3800:
         text = text[:3800] + "\n\n<i>…обрезано</i>"
+    await message.answer(text, parse_mode="HTML")
+
+# ─────────────────────────────────────────────
+#  /debug_hwid — ищем рабочий endpoint для списка устройств
+# ─────────────────────────────────────────────
+@router.message(Command("debug_hwid"))
+async def admin_debug_hwid(message: types.Message, command: CommandObject):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    target = (command.args or "").strip().lstrip("@")
+    if not target:
+        await message.answer("Формат: <code>/debug_hwid username</code> или <code>/debug_hwid user_id</code>", parse_mode="HTML")
+        return
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM users WHERE user_id=$1" if target.isdigit() else "SELECT user_id FROM users WHERE username=$1",
+            int(target) if target.isdigit() else target,
+        )
+    if not row:
+        await message.answer(f"❌ {target} не найден в базе.")
+        return
+
+    remna = await remna_get_user(row["user_id"])
+    if not remna:
+        await message.answer("❌ Не найден в Remnawave.")
+        return
+    uuid_ = remna["uuid"]
+
+    await message.answer(f"Проверяю endpoint'ы для uuid <code>{uuid_}</code>...", parse_mode="HTML")
+
+    candidates = [
+        f"/api/users/{uuid_}/hwid",
+        f"/api/hwid/devices/{uuid_}",
+        f"/api/hwid/devices?userUuid={uuid_}",
+        f"/api/hwid/user/{uuid_}",
+        f"/api/hwid?userUuid={uuid_}",
+    ]
+
+    results = []
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            for ep in candidates:
+                try:
+                    r = await client.get(
+                        f"{REMNAWAVE_URL}{ep}",
+                        headers=_remna_headers(), timeout=15,
+                    )
+                    preview = r.text[:600]
+                    results.append(f"<b>{ep}</b>\nStatus: {r.status_code}\n{preview}")
+                except Exception as ex:
+                    results.append(f"<b>{ep}</b>\nERR: {ex}")
+    except Exception as e:
+        await message.answer(f"Error: {e}")
+        return
+
+    text = "\n\n━━━━━━━━━━\n\n".join(results)
+    if len(text) > 3800:
+        text = text[:3800] + "\n\n<i>…обрезано, читай по частям выше</i>"
     await message.answer(text, parse_mode="HTML")
 
 # ─────────────────────────────────────────────
