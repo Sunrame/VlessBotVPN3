@@ -155,6 +155,17 @@ class BuyDevicesState(StatesGroup):
 class WithdrawState(StatesGroup):
     waiting_confirm = State()
 
+class AdminGiveState(StatesGroup):
+    waiting_username = State()
+    waiting_days     = State()
+    waiting_devices  = State()
+
+class AdminFindState(StatesGroup):
+    waiting_query = State()
+
+class SurveyState(StatesGroup):
+    waiting_comment = State()
+
 # ─────────────────────────────────────────────
 #  INIT
 # ─────────────────────────────────────────────
@@ -222,6 +233,16 @@ async def init_db():
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
                 amount NUMERIC,
+                created_at BIGINT DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS survey_responses (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                username TEXT,
+                rating INTEGER,
+                comment TEXT,
                 created_at BIGINT DEFAULT 0
             )
         """)
@@ -1221,10 +1242,17 @@ async def info_tab(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 def admin_panel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Подписчики", callback_data="admin_subs")],
-        [InlineKeyboardButton(text="Промокоды", callback_data="admin_promos")],
-        [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals")],
-        [InlineKeyboardButton(text="Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="Статистика", callback_data="admin_stats"),
+         InlineKeyboardButton(text="Отчёт", callback_data="admin_report")],
+        [InlineKeyboardButton(text="Подписчики", callback_data="admin_subs"),
+         InlineKeyboardButton(text="Выдать", callback_data="admin_give_start")],
+        [InlineKeyboardButton(text="Найти юзера", callback_data="admin_find_start"),
+         InlineKeyboardButton(text="Кто онлайн", callback_data="admin_online")],
+        [InlineKeyboardButton(text="Промокоды", callback_data="admin_promos"),
+         InlineKeyboardButton(text="Опрос", callback_data="admin_survey")],
+        [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals"),
+         InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast_start")],
+        [InlineKeyboardButton(text="Настройки", callback_data="admin_settings")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
 
@@ -2048,6 +2076,335 @@ async def admin_payout(message: types.Message, command: CommandObject):
         await bot.send_message(row["user_id"], f"Ваш реферальный баланс {balance:.2f} руб. выплачен.")
     except Exception:
         pass
+
+# ─────────────────────────────────────────────
+#  ОТЧЁТ (кнопка панели — отправить сразу)
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_report")
+async def admin_report_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await cb.message.edit_text("Формирую отчёт...")
+    await send_daily_report()
+    await cb.message.edit_text("Отчёт отправлен в личные сообщения.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ]))
+
+# ─────────────────────────────────────────────
+#  ВЫДАТЬ (кнопка панели — conversational flow)
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_give_start")
+async def admin_give_start_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminGiveState.waiting_username)
+    await cb.message.answer("Выдача подписки\n\nВведите username (без @):\n/cancel — отмена")
+
+@router.message(Command("cancel"), AdminGiveState.waiting_username)
+@router.message(Command("cancel"), AdminGiveState.waiting_days)
+@router.message(Command("cancel"), AdminGiveState.waiting_devices)
+async def admin_give_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
+
+@router.message(AdminGiveState.waiting_username)
+async def admin_give_username(message: types.Message, state: FSMContext):
+    username = message.text.strip().lstrip("@")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT user_id FROM users WHERE username=$1", username)
+    if not row:
+        await message.answer(f"@{username} не найден. Введите другой username или /cancel.")
+        return
+    await state.update_data(target_id=row["user_id"], target_username=username)
+    await state.set_state(AdminGiveState.waiting_days)
+    await message.answer(f"@{username}\n\nСколько дней выдать?")
+
+@router.message(AdminGiveState.waiting_days)
+async def admin_give_days(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.strip().lstrip("-").isdigit():
+        await message.answer("Введите целое число дней.")
+        return
+    days = int(message.text.strip())
+    await state.update_data(days=days)
+    await state.set_state(AdminGiveState.waiting_devices)
+    await message.answer("Сколько устройств выставить? (0 = не менять текущее значение)")
+
+@router.message(AdminGiveState.waiting_devices)
+async def admin_give_devices(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Введите целое число (0 = не менять).")
+        return
+    devices = int(message.text.strip())
+    data = await state.get_data()
+    await state.clear()
+    target_id  = data["target_id"]
+    target_uname = data["target_username"]
+    days = data["days"]
+    hwid = devices if devices > 0 else None
+    user = await activate_subscription(target_id, days, hwid or 1, squad_uuid=None)
+    if not user:
+        await message.answer("Ошибка активации.")
+        return
+    expire   = parse_dt(user.get("expireAt"))
+    date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
+    await message.answer(f"@{target_uname} выдано {days} дн. До: {date_str}")
+    try:
+        await bot.send_message(target_id, f"Администратор выдал вам {days} дней.")
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────
+#  НАЙТИ ЮЗЕРА (кнопка панели)
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_find_start")
+async def admin_find_start_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminFindState.waiting_query)
+    await cb.message.answer("Введите username или user_id для поиска:\n/cancel — отмена")
+
+@router.message(Command("cancel"), AdminFindState.waiting_query)
+async def admin_find_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
+
+@router.message(AdminFindState.waiting_query)
+async def admin_find_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    target = message.text.strip().lstrip("@")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM users WHERE user_id=$1" if target.isdigit() else "SELECT user_id FROM users WHERE username=$1",
+            int(target) if target.isdigit() else target,
+        )
+    if not row:
+        await message.answer(f"Пользователь {target} не найден.")
+        return
+    await _render_check(message, row["user_id"])
+
+# ─────────────────────────────────────────────
+#  КТО ОНЛАЙН
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_online")
+async def admin_online_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await cb.message.edit_text("Запрашиваю...")
+    now = int(time.time())
+    all_users = await remna_get_all_users()
+    online = [
+        u for u in all_users
+        if u.get("username", "").startswith("truba_")
+        and parse_dt(u.get("userTraffic", {}).get("onlineAt")) > (now - 180)
+    ]
+    if not online:
+        await cb.message.edit_text("Сейчас никто не подключён.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+        ]))
+        return
+    lines = [f"Онлайн: {len(online)} чел.", ""]
+    for u in online[:40]:
+        uid  = u["username"].replace("truba_", "")
+        last = fmt_dt(parse_dt(u.get("userTraffic", {}).get("onlineAt")), "%H:%M:%S")
+        async with pool.acquire() as conn:
+            db = await conn.fetchrow("SELECT username FROM users WHERE user_id=$1", int(uid) if uid.isdigit() else 0)
+        tg = f"@{db['username']}" if db and db["username"] else f"ID:{uid}"
+        lines.append(f"{tg} · {last}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n... обрезано"
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обновить", callback_data="admin_online")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ]))
+
+# ─────────────────────────────────────────────
+#  РАССЫЛКА (запуск кнопкой из панели)
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_broadcast_start")
+async def admin_broadcast_start_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(BroadcastState.waiting_text)
+    await cb.message.answer("Рассылка\n\nВведите текст.\n/cancel — отмена.")
+
+# ─────────────────────────────────────────────
+#  НАСТРОЙКИ
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_settings")
+async def admin_settings_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    sale_notify = await is_admin_sale_notify(cb.from_user.id)
+    text = f"Настройки\n\nУведомления о покупках: {'вкл' if sale_notify else 'выкл'}"
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Выключить уведомления" if sale_notify else "Включить уведомления",
+            callback_data="admin_toggle_sale_notify",
+        )],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ]))
+
+@router.callback_query(F.data == "admin_toggle_sale_notify")
+async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    admin_id = cb.from_user.id
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT sale_notify FROM admin_settings WHERE admin_id=$1", admin_id)
+        current = row["sale_notify"] if row and row["sale_notify"] is not None else True
+        new_val = not current
+        if row:
+            await conn.execute("UPDATE admin_settings SET sale_notify=$1 WHERE admin_id=$2", new_val, admin_id)
+        else:
+            await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
+    text = f"Настройки\n\nУведомления о покупках: {'вкл' if new_val else 'выкл'}"
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Выключить уведомления" if new_val else "Включить уведомления",
+            callback_data="admin_toggle_sale_notify",
+        )],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ]))
+
+# ─────────────────────────────────────────────
+#  ОПРОС (рейтинг сервиса среди платников)
+# ─────────────────────────────────────────────
+def _rating_kb() -> InlineKeyboardMarkup:
+    row1 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(1, 6)]
+    row2 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(6, 11)]
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+
+@router.callback_query(F.data == "admin_survey")
+async def admin_survey_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await cb.message.edit_text("Опрос", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Разослать опрос платникам", callback_data="admin_survey_send")],
+        [InlineKeyboardButton(text="Результаты", callback_data="admin_survey_results")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ]))
+
+@router.callback_query(F.data == "admin_survey_send")
+async def admin_survey_send_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await cb.message.edit_text("Рассылаю опрос платникам...")
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id FROM users WHERE has_paid=1")
+    ok = fail = 0
+    for row in users:
+        try:
+            await bot.send_message(
+                row["user_id"],
+                "Оцените работу TrubaVPN\n\nНасколько вы довольны сервисом? Выберите оценку от 1 до 10:",
+                reply_markup=_rating_kb(),
+            )
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await cb.message.edit_text(f"Опрос разослан.\nДоставлено: {ok} · Ошибок: {fail}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
+    ]))
+
+@router.callback_query(F.data.startswith("survey_rate_"))
+async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT has_paid FROM users WHERE user_id=$1", cb.from_user.id)
+    if not row or not row["has_paid"]:
+        await cb.answer("Опрос доступен только для платных подписчиков.", show_alert=True)
+        return
+    rating = int(cb.data.removeprefix("survey_rate_"))
+    await state.set_state(SurveyState.waiting_comment)
+    await state.update_data(survey_rating=rating)
+    await cb.message.edit_text(
+        f"Вы поставили оценку {rating}/10.\n\n"
+        "Напишите короткий комментарий — что понравилось или что можно улучшить.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить", callback_data="survey_skip_comment")],
+        ]),
+    )
+
+@router.callback_query(F.data == "survey_skip_comment")
+async def survey_skip_comment_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    rating = data.get("survey_rating", 0)
+    await state.clear()
+    await _save_survey(cb.from_user, rating, None)
+    await cb.message.edit_text("Спасибо за вашу оценку.")
+
+@router.message(SurveyState.waiting_comment)
+async def survey_comment_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    rating = data.get("survey_rating", 0)
+    comment = message.text.strip()
+    await state.clear()
+    await _save_survey(message.from_user, rating, comment)
+    await message.answer("Спасибо за ваш отзыв.")
+
+async def _save_survey(user, rating: int, comment: str | None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO survey_responses (user_id, username, rating, comment, created_at) VALUES ($1,$2,$3,$4,$5)",
+            user.id, user.username, rating, comment, int(time.time()),
+        )
+    for admin_id in ADMIN_IDS:
+        try:
+            uname = f"@{user.username}" if user.username else f"ID:{user.id}"
+            text = f"Новый отзыв\n\n{uname}\nОценка: {rating}/10"
+            text += f"\nКомментарий: {comment}" if comment else "\nБез комментария"
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
+
+@router.callback_query(F.data == "admin_survey_results")
+async def admin_survey_results_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM survey_responses") or 0
+        if not total:
+            await cb.message.edit_text("Ответов на опрос пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
+            ]))
+            return
+        avg = await conn.fetchval("SELECT AVG(rating) FROM survey_responses") or 0
+        dist = await conn.fetch("SELECT rating, COUNT(*) as cnt FROM survey_responses GROUP BY rating ORDER BY rating DESC")
+        comments = await conn.fetch(
+            "SELECT username, rating, comment, created_at FROM survey_responses "
+            "WHERE comment IS NOT NULL ORDER BY created_at DESC LIMIT 10"
+        )
+    avg_r = round(float(avg), 2)
+    lines = [f"Результаты опроса", "", f"Всего ответов: {total}", f"Средняя оценка: {avg_r}/10", "", "Распределение:"]
+    for r in dist:
+        bar = "#" * min(r["cnt"], 20)
+        lines.append(f"  {r['rating']:2d}/10 · {r['cnt']:3d} чел.  {bar}")
+    if comments:
+        lines += ["", "Последние комментарии:"]
+        for c in comments:
+            uname = f"@{c['username']}" if c["username"] else "аноним"
+            dt = fmt_dt(c["created_at"], "%d.%m")
+            preview = c["comment"][:120] + "..." if len(c["comment"]) > 120 else c["comment"]
+            lines.append(f"  {c['rating']}/10 · {uname} [{dt}]: {preview}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n... обрезано"
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
+    ]))
 
 # ─────────────────────────────────────────────
 #  СТАТИСТИКА
