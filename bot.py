@@ -140,11 +140,12 @@ class SurveyState(StatesGroup):
     waiting_comment = State()
 
 class CheckActionState(StatesGroup):
-    waiting_days_add = State()
-    waiting_days_sub = State()
-    waiting_days_set = State()
-    waiting_hwid_set = State()
-    waiting_search   = State()
+    waiting_days_add    = State()
+    waiting_days_sub    = State()
+    waiting_days_set    = State()
+    waiting_hwid_set    = State()
+    waiting_search      = State()
+    waiting_whitelist_gb = State()
 
 class MediaState(StatesGroup):
     waiting_username = State()
@@ -721,7 +722,7 @@ def support_ticket_kb(ticket_id: int, user_id: int):
         [InlineKeyboardButton(text="✅ Закрыть",  callback_data=f"sclose_{ticket_id}")],
     ])
 
-def _check_kb(user_id: int, hwid: int) -> InlineKeyboardMarkup:
+def _check_kb(user_id: int, hwid: int, has_whitelist: bool = False) -> InlineKeyboardMarkup:
     preset_rows = []
     row = []
     for limit, label in HWID_OPTIONS.items():
@@ -734,6 +735,7 @@ def _check_kb(user_id: int, hwid: int) -> InlineKeyboardMarkup:
             preset_rows.append(row); row = []
     if row:
         preset_rows.append(row)
+    whitelist_btn_text = "📡 Забрать белые списки" if has_whitelist else "📡 Дать белые списки"
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="➕ Дни",  callback_data=f"ca_adddays_{user_id}"),
@@ -742,6 +744,7 @@ def _check_kb(user_id: int, hwid: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="📱 Устройства — ввести число", callback_data=f"ca_sethwid_{user_id}")],
         [InlineKeyboardButton(text="📋 Список устройств",          callback_data=f"ca_devices_{user_id}")],
+        [InlineKeyboardButton(text=whitelist_btn_text, callback_data=f"ca_whitelist_{user_id}")],
         *preset_rows,
         [InlineKeyboardButton(text="🚫 Забрать подписку", callback_data=f"quicktake_{user_id}")],
         [
@@ -2210,6 +2213,7 @@ async def _render_check(target_send, user_id: int):
             "WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5", user_id)
         ref_count    = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id=$1", user_id)
         ticket_count = await conn.fetchval("SELECT COUNT(*) FROM support_tickets WHERE user_id=$1", user_id)
+        wl_row       = await conn.fetchrow("SELECT gb_limit, period_start, cut_off FROM whitelist_limits WHERE user_id=$1", user_id)
     if not db_row:
         txt = f"❌ Пользователь <code>{user_id}</code> не найден."
         if isinstance(target_send, types.Message):
@@ -2225,6 +2229,7 @@ async def _render_check(target_send, user_id: int):
         f"👥 Рефералов: <b>{ref_count}</b>  🎫 Тикетов: <b>{ticket_count}</b>",
     ]
     hwid = 1
+    has_whitelist_squad = False
     if remna:
         expire    = parse_dt(remna.get("expireAt"))
         days_left = max(0, (expire - now) // 86400)
@@ -2235,6 +2240,8 @@ async def _render_check(target_send, user_id: int):
         online_at = parse_dt(remna.get("userTraffic", {}).get("onlineAt"))
         is_online = online_at > (now - 180)
         sub_url   = format_sub_url(remna)
+        current_squads = remna.get("activeInternalSquads") or []
+        has_whitelist_squad = SQUAD_UUID_WHITELIST in current_squads
         lines += [
             "", f"📡 <b>Подписка:</b> {status}",
             f"📅 До: <b>{date_str}</b> ({days_left} дн.)",
@@ -2249,6 +2256,18 @@ async def _render_check(target_send, user_id: int):
             lines.append(f"⚫️ Офлайн (был: {last})")
         if sub_url:
             lines += ["", f"🌐 <code>{sub_url}</code>"]
+        # Статус белых списков
+        wl_icon = "✅" if has_whitelist_squad else "🚫"
+        lines.append(f"📡 <b>Белые списки:</b> {wl_icon} {'есть доступ' if has_whitelist_squad else 'нет доступа'}")
+        if wl_row:
+            since_ts = wl_row["period_start"]
+            records  = await fetch_whitelist_daily_records(days_back=40)
+            used_wl  = sum_whitelist_bytes_for_user(records, user_id, since_ts)
+            used_wl_gb = used_wl / 1024 ** 3
+            lines.append(
+                f"   Лимит: <b>{used_wl_gb:.1f}/{wl_row['gb_limit']} GB</b>"
+                f"{' · ⛔ ОТКЛЮЧЁН' if wl_row['cut_off'] else ''} (с {fmt_dt(since_ts, '%d.%m')})"
+            )
     else:
         lines.append("\n📡 <b>Подписки нет</b>")
     if payments:
@@ -2261,7 +2280,7 @@ async def _render_check(target_send, user_id: int):
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n\n<i>… обрезано</i>"
-    kb   = _check_kb(user_id, hwid)
+    kb   = _check_kb(user_id, hwid, has_whitelist_squad)
     if isinstance(target_send, types.Message):
         await target_send.answer(text, parse_mode="HTML", reply_markup=kb)
     else:
@@ -2286,8 +2305,9 @@ async def set_hwid_limit(cb: CallbackQuery):
     await cb.answer(f"✅ Лимит: {HWID_OPTIONS.get(new_hwid, str(new_hwid))}", show_alert=True)
     remna2 = await remna_get_user(user_id)
     hwid2  = remna2.get("hwidDeviceLimit", new_hwid) if remna2 else new_hwid
+    has_wl = SQUAD_UUID_WHITELIST in (remna2.get("activeInternalSquads") or []) if remna2 else False
     try:
-        await cb.message.edit_reply_markup(reply_markup=_check_kb(user_id, hwid2))
+        await cb.message.edit_reply_markup(reply_markup=_check_kb(user_id, hwid2, has_wl))
     except Exception: pass
 
 # ─────────────────────────────────────────────
@@ -2506,6 +2526,100 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
     await _render_check(message, user_id)
+
+# ─────────────────────────────────────────────
+#  Ручная выдача/отзыв доступа к "белым спискам" + лимит ГБ
+# ─────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ca_whitelist_"))
+async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    user_id = int(cb.data.removeprefix("ca_whitelist_"))
+    remna = await remna_get_user(user_id)
+    if not remna:
+        await cb.message.answer("❌ Пользователь не найден в Remnawave.")
+        return
+    current_squads = remna.get("activeInternalSquads") or []
+    has_whitelist  = SQUAD_UUID_WHITELIST in current_squads
+
+    if has_whitelist:
+        new_squads = [s for s in current_squads if s != SQUAD_UUID_WHITELIST]
+        if SQUAD_UUID_BASIC not in new_squads:
+            new_squads.append(SQUAD_UUID_BASIC)
+        result = await remna_update_user(remna["uuid"], {"activeInternalSquads": new_squads})
+        if not result:
+            await cb.message.answer("❌ Ошибка обновления.")
+            return
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
+        await cb.message.answer(f"✅ ID:{user_id} — доступ к «белым спискам» отозван.")
+        await _render_check(cb, user_id)
+    else:
+        if not WHITELIST_NODE_UUID:
+            await cb.message.answer(
+                "⚠️ WHITELIST_NODE_UUID не задан — лимит отслеживаться не будет, "
+                "но доступ всё равно можно выдать.\n\n"
+                "Введите лимит в ГБ (0 = без лимита, без отслеживания):\n/cancel — отмена"
+            )
+        else:
+            await cb.message.answer(
+                f"📡 <b>Выдать доступ к «белым спискам»</b> для ID:{user_id}\n\n"
+                f"Введите лимит трафика в ГБ именно на этом сервере "
+                f"(0 = без лимита, без отслеживания):\n/cancel — отмена",
+                parse_mode="HTML",
+            )
+        await state.set_state(CheckActionState.waiting_whitelist_gb)
+        await state.update_data(ca_uid=user_id)
+
+@router.message(CheckActionState.waiting_whitelist_gb)
+async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("❌ Введите целое число (0 = без лимита).")
+        return
+    gb_limit = int(message.text.strip())
+    data     = await state.get_data()
+    user_id  = data["ca_uid"]
+    await state.clear()
+
+    remna = await remna_get_user(user_id)
+    if not remna:
+        await message.answer("❌ Пользователь не найден в Remnawave.")
+        return
+    current_squads = remna.get("activeInternalSquads") or []
+    new_squads = list(current_squads)
+    if SQUAD_UUID_WHITELIST not in new_squads:
+        new_squads.append(SQUAD_UUID_WHITELIST)
+    result = await remna_update_user(remna["uuid"], {"activeInternalSquads": new_squads})
+    if not result:
+        await message.answer("❌ Ошибка обновления сквада.")
+        return
+
+    async with pool.acquire() as conn:
+        if gb_limit > 0:
+            await conn.execute(
+                "INSERT INTO whitelist_limits (user_id, gb_limit, period_start, cut_off) "
+                "VALUES ($1,$2,$3,FALSE) "
+                "ON CONFLICT (user_id) DO UPDATE SET gb_limit=$2, period_start=$3, cut_off=FALSE",
+                user_id, gb_limit, int(time.time()),
+            )
+        else:
+            await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
+
+    limit_label = f"{gb_limit} GB" if gb_limit > 0 else "без лимита"
+    await message.answer(
+        f"✅ ID:{user_id} — доступ к «белым спискам» выдан.\n"
+        f"Лимит: <b>{limit_label}</b>",
+        parse_mode="HTML",
+    )
+    await _render_check(message, user_id)
+
+@router.message(Command("cancel"), CheckActionState.waiting_whitelist_gb)
+async def ca_whitelist_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
 
 # ─────────────────────────────────────────���───
 #  Список устройств пользователя (HWID inspector)
