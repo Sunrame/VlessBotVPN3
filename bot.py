@@ -625,26 +625,22 @@ def calc_plan_price(plan_key: str, months: int) -> int:
     """Линейная цена без скидок за срок: price_month * months."""
     return PLANS[plan_key]["price_month"] * months
 
-def calc_upgrade_price(days_left: int, extra_devices: int) -> int:
+def calc_upgrade_price(extra_devices: int) -> int:
     """
     Доплата за апгрейд VPN -> VPN с обходом белых списков.
 
-    ДОПУЩЕНИЕ (формула не была задана явно в ТЗ, реализована по смыслу
-    "доплата к лучшему тарифу + доплата за устройства, если есть разница"):
-      1) Пропорциональная доплата за оставшиеся дни текущей подписки:
-         (price_month_bypass - price_month_vpn) / 30 * days_left
-      2) Доплата за уже купленные доп. устройства, у которых различается
-         device_price между тарифами:
-         (device_price_bypass - device_price_vpn) * extra_devices
-    Итог округляется до рубля. Если формула должна быть другой — поправь ТЗ,
-    легко переписать под конкретную схему.
+    Дни подписки при апгрейде не пересчитываются и не трогаются — остаются
+    ровно те же, что были. Поэтому доплата — просто фиксированная разница
+    между тарифами:
+      1) Разница цены тарифов за месяц: price_month_bypass - price_month_vpn
+      2) Плюс разница в цене устройства, умноженная на кол-во уже купленных
+         доп. устройств: (device_price_bypass - device_price_vpn) * extra_devices
     """
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
-    plan_diff_per_day = (bypass["price_month"] - vpn["price_month"]) / 30
-    prorated_plan_diff = plan_diff_per_day * max(days_left, 0)
+    plan_diff   = bypass["price_month"] - vpn["price_month"]
     device_diff = max(0, bypass["device_price"] - vpn["device_price"]) * max(extra_devices, 0)
-    return round(prorated_plan_diff + device_diff)
+    return plan_diff + device_diff
 
 # ─────────────────────────────────────────────
 #  КЛАВИАТУРЫ
@@ -1134,12 +1130,7 @@ async def plan_upgrade_cb(cb: CallbackQuery):
     if not remna:
         await cb.answer("Подписка не найдена.", show_alert=True)
         return
-    expire    = parse_dt(remna.get("expireAt"))
-    days_left = max(0, (expire - int(time.time())) // 86400)
-    price = calc_upgrade_price(days_left, row["extra_devices"] or 0)
-    if price <= 0:
-        await cb.answer("Улучшение недоступно для текущего срока подписки.", show_alert=True)
-        return
+    price = calc_upgrade_price(row["extra_devices"] or 0)
     await _create_payment_page(
         cb, kind="upgrade", item_name="Улучшение тарифа до VPN с обходом белых списков",
         price=price, days=0,
