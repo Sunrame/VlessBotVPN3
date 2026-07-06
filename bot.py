@@ -351,7 +351,7 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
     base       = max(current, now)
     new_expire = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire}
+    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "status": "ACTIVE"}
     if squad_uuid is not None:
         payload["activeInternalSquads"] = [squad_uuid]
     if hwid is not None:
@@ -1566,7 +1566,7 @@ async def ca_adddays_handler(message: types.Message, state: FSMContext):
     current = datetime.fromisoformat(remna["expireAt"].replace("Z", "+00:00"))
     base    = max(current, now_utc)
     new_exp = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp})
+    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp, "status": "ACTIVE"})
     if not result:
         await message.answer("Ошибка обновления.")
         return
@@ -1608,7 +1608,7 @@ async def ca_subdays_handler(message: types.Message, state: FSMContext):
     if new_exp_dt <= now_utc:
         new_exp_dt = now_utc + timedelta(minutes=5)
     new_exp = new_exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp})
+    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp, "status": "ACTIVE"})
     if not result:
         await message.answer("Ошибка обновления.")
         return
@@ -1648,7 +1648,7 @@ async def ca_setdate_handler(message: types.Message, state: FSMContext):
     if not remna:
         await message.answer("Пользователь не найден в Remnawave.")
         return
-    result = await remna_update_user(remna["uuid"], {"expireAt": dt_utc_str})
+    result = await remna_update_user(remna["uuid"], {"expireAt": dt_utc_str, "status": "ACTIVE"})
     if not result:
         await message.answer("Ошибка обновления.")
         return
