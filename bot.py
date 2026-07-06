@@ -112,11 +112,9 @@ PLANS = {
 
 MONTH_CHOICES = [1, 3, 6, 12]
 
-# Цена докупки доп. трафика на белых списках для тарифа "VPN с обходом".
-# Цена не была указана в ТЗ — ЗАПОЛНИ перед использованием этой функции,
-# иначе кнопка будет показывать заглушку и не даст оплатить.
-WHITELIST_TOPUP_GB     = int(os.environ.get("WHITELIST_TOPUP_GB", "10"))
-WHITELIST_TOPUP_PRICE  = int(os.environ.get("WHITELIST_TOPUP_PRICE", "0"))  # 0 = цена не задана
+# Докупка трафика на белых списках: цена за 1 ГБ. Пользователь сам вводит
+# сколько ГБ хочет купить, итоговая цена = кол-во * цена за ГБ.
+WHITELIST_PRICE_PER_GB = int(os.environ.get("WHITELIST_PRICE_PER_GB", "3"))
 
 # Реферальная система: процент с оплаты друга и порог вывода
 REFERRAL_PERCENT      = 50
@@ -165,6 +163,12 @@ class AdminFindState(StatesGroup):
 
 class SurveyState(StatesGroup):
     waiting_comment = State()
+
+class DeviceTopupState(StatesGroup):
+    waiting_count = State()
+
+class WhitelistTopupState(StatesGroup):
+    waiting_gb = State()
 
 # ─────────────────────────────────────────────
 #  INIT
@@ -783,13 +787,16 @@ async def profile_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 #  ОБЩАЯ СТРАНИЦА ОПЛАТЫ (YooKassa)
 # ─────────────────────────────────────────────
-async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
+async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | None = None, whitelist_gb: int = 0,
-                                plan_key: str | None = None, is_trial: bool = False):
+                                plan_key: str | None = None, is_trial: bool = False,
+                                qty: int = 0):
     """
     kind: "trial" | "plan" | "device" | "upgrade" | "wl_topup"
-    Единая точка создания платежа ЮKassa для всех видов покупок в новой схеме.
+    qty — для kind="device": сколько устройств докупается; для kind="wl_topup"
+    смотри whitelist_gb (сколько ГБ докупается) — там оно и так уже есть.
+    Возвращает (payment, kb) либо (None, None) при ошибке создания платежа.
     """
     try:
         payment = Payment.create({
@@ -798,7 +805,7 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
             "capture":      True,
             "description":  f"TrubaVPN — {item_name}",
             "metadata": {
-                "user_id":      str(cb.from_user.id),
+                "user_id":      str(user_id),
                 "kind":         kind,
                 "days":         str(days),
                 "hwid":         str(hwid) if hwid is not None else "",
@@ -808,19 +815,52 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                 "price":        str(price),
                 "is_trial":     "1" if is_trial else "0",
                 "item_name":    item_name,
+                "qty":          str(qty),
             },
         }, str(uuid.uuid4()))
     except Exception as e:
         log.exception("Payment create error: %s", e)
-        await cb.answer("Ошибка создания платежа.", show_alert=True)
-        return
+        return None, None
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Оплатить", url=payment.confirmation.confirmation_url)],
         [InlineKeyboardButton(text="Проверить оплату", callback_data=f"paycheck_{payment.id}")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
+    return payment, kb
+
+async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
+                                price: int, days: int = 0, hwid: int | None = None,
+                                squad: str | None = None, whitelist_gb: int = 0,
+                                plan_key: str | None = None, is_trial: bool = False,
+                                qty: int = 0):
+    payment, kb = await _create_payment_core(
+        cb.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
+        squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
+    )
+    if not payment:
+        await cb.answer("Ошибка создания платежа.", show_alert=True)
+        return
     await cb.message.edit_text(
+        f"{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
+async def _create_payment_page_from_message(message: types.Message, *, kind: str, item_name: str,
+                                             price: int, days: int = 0, hwid: int | None = None,
+                                             squad: str | None = None, whitelist_gb: int = 0,
+                                             plan_key: str | None = None, is_trial: bool = False,
+                                             qty: int = 0):
+    """То же самое, что _create_payment_page, но когда вызов идёт из ответа на
+    текстовое сообщение (ввод количества), а не из нажатия кнопки."""
+    payment, kb = await _create_payment_core(
+        message.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
+        squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
+    )
+    if not payment:
+        await message.answer("Ошибка создания платежа.")
+        return
+    await message.answer(
         f"{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
         parse_mode="HTML", reply_markup=kb,
     )
@@ -851,6 +891,7 @@ async def check_payment_cb(cb: CallbackQuery):
     price       = float(md.get("price", 0))
     is_trial    = md.get("is_trial", "0") == "1"
     item_name   = md.get("item_name", "Покупка")
+    qty         = int(md.get("qty", 0) or 0)
 
     async with pool.acquire() as conn:
         db_row = await conn.fetchrow(
@@ -884,14 +925,15 @@ async def check_payment_cb(cb: CallbackQuery):
         if not remna:
             await cb.answer("Пользователь не найден в панели.", show_alert=True)
             return
-        new_hwid = remna.get("hwidDeviceLimit", 1) + 1
+        add_count = qty if qty > 0 else 1
+        new_hwid = remna.get("hwidDeviceLimit", 1) + add_count
         result_user = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
         if not result_user:
             await cb.answer("Ошибка обновления устройств.", show_alert=True)
             return
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE users SET extra_devices = extra_devices + 1 WHERE user_id=$1", u_id
+                "UPDATE users SET extra_devices = extra_devices + $1 WHERE user_id=$2", add_count, u_id
             )
 
     elif kind == "upgrade":
@@ -914,18 +956,19 @@ async def check_payment_cb(cb: CallbackQuery):
             )
 
     elif kind == "wl_topup":
+        add_gb = whitelist_gb if whitelist_gb > 0 else 1
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT gb_limit FROM whitelist_limits WHERE user_id=$1", u_id)
             if row:
                 await conn.execute(
                     "UPDATE whitelist_limits SET gb_limit = gb_limit + $1, cut_off=FALSE WHERE user_id=$2",
-                    WHITELIST_TOPUP_GB, u_id,
+                    add_gb, u_id,
                 )
             else:
                 await conn.execute(
                     "INSERT INTO whitelist_limits (user_id, gb_limit, period_start, cut_off) "
                     "VALUES ($1,$2,$3,FALSE)",
-                    u_id, WHITELIST_TOPUP_GB, int(time.time()),
+                    u_id, add_gb, int(time.time()),
                 )
         remna = await remna_get_user(u_id)
         if remna:
@@ -1031,17 +1074,48 @@ async def buymonths_cb(cb: CallbackQuery):
 #  ДОБАВИТЬ УСТРОЙСТВА
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "dev_add")
-async def dev_add_cb(cb: CallbackQuery):
+async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     async with pool.acquire() as conn:
         plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
     if plan not in PLANS:
         await cb.answer("Сначала оформите подписку.", show_alert=True)
         return
-    price = PLANS[plan]["device_price"]
-    await _create_payment_page(
-        cb, kind="device", item_name=f"Доп. устройство ({PLANS[plan]['name']})",
-        price=price, days=0,
+    device_price = PLANS[plan]["device_price"]
+    await state.set_state(DeviceTopupState.waiting_count)
+    await state.update_data(plan=plan)
+    await cb.message.edit_text(
+        f"Добавить устройства\n\n"
+        f"Цена одного устройства на вашем тарифе: {device_price} руб.\n\n"
+        f"Введите, сколько устройств хотите докупить:\n/cancel — отмена"
+    )
+
+@router.message(Command("cancel"), DeviceTopupState.waiting_count)
+async def dev_add_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
+
+@router.message(DeviceTopupState.waiting_count)
+async def dev_add_count_handler(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Введите целое положительное число.")
+        return
+    count = int(message.text.strip())
+    if count <= 0:
+        await message.answer("Число должно быть больше 0.")
+        return
+    data = await state.get_data()
+    plan = data.get("plan")
+    await state.clear()
+    if plan not in PLANS:
+        await message.answer("Тариф не найден, попробуйте снова из профиля.")
+        return
+    device_price = PLANS[plan]["device_price"]
+    price = device_price * count
+    word = "устройство" if count == 1 else ("устройства" if 2 <= count % 10 <= 4 and not (11 <= count % 100 <= 14) else "устройств")
+    await _create_payment_page_from_message(
+        message, kind="device", item_name=f"+{count} {word} ({PLANS[plan]['name']})",
+        price=price, days=0, qty=count,
     )
 
 # ─────────────────────────────────────────────
@@ -1075,23 +1149,39 @@ async def plan_upgrade_cb(cb: CallbackQuery):
 #  ДОКУПИТЬ ТРАФИК НА БЕЛЫХ СПИСКАХ
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "wl_topup")
-async def wl_topup_cb(cb: CallbackQuery):
+async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     async with pool.acquire() as conn:
         plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
     if plan != "vpn_bypass":
         await cb.answer("Докупка доступна только на тарифе VPN с обходом.", show_alert=True)
         return
-    if WHITELIST_TOPUP_PRICE <= 0:
-        await cb.message.answer(
-            "Цена докупки трафика ещё не настроена администратором. "
-            "Обратитесь в поддержку."
-        )
+    await state.set_state(WhitelistTopupState.waiting_gb)
+    await cb.message.edit_text(
+        f"Докупить трафик (белые списки)\n\n"
+        f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
+        f"Введите, сколько ГБ хотите докупить:\n/cancel — отмена"
+    )
+
+@router.message(Command("cancel"), WhitelistTopupState.waiting_gb)
+async def wl_topup_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
+
+@router.message(WhitelistTopupState.waiting_gb)
+async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Введите целое положительное число.")
         return
-    await _create_payment_page(
-        cb, kind="wl_topup",
-        item_name=f"+{WHITELIST_TOPUP_GB} ГБ на белых списках",
-        price=WHITELIST_TOPUP_PRICE, days=0,
+    gb = int(message.text.strip())
+    if gb <= 0:
+        await message.answer("Число должно быть больше 0.")
+        return
+    await state.clear()
+    price = gb * WHITELIST_PRICE_PER_GB
+    await _create_payment_page_from_message(
+        message, kind="wl_topup", item_name=f"+{gb} ГБ на белых списках",
+        price=price, days=0, whitelist_gb=gb,
     )
 
 # ─────────────────────────────────────────────
