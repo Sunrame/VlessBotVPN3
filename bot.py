@@ -64,6 +64,30 @@ def msk_now() -> datetime:
     return datetime.now(MSK)
 
 # ─────────────────────────────────────────────
+#  PREMIUM-ЭМОДЗИ
+#
+#  Работают только в тексте сообщений (parse_mode="HTML"), НЕ в кнопках —
+#  кнопки Telegram принимают только простой текст без форматирования.
+#  Для непремиум-пользователей и старых клиентов показывается fallback-символ
+#  вместо кастомного эмодзи. Расставлены по одному разу на смысловой момент,
+#  без перегруза одного и того же места несколькими штуками.
+# ─────────────────────────────────────────────
+def premium_emoji(emoji_id: str, fallback: str) -> str:
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+EMOJI_PROFILE       = premium_emoji("5280615440928758599", "\u2b50")   # заголовок "Профиль"
+EMOJI_PAY_SUCCESS   = premium_emoji("5377746319601324795", "\u2705")   # "Оплата прошла успешно"
+EMOJI_PLAN_VPN      = premium_emoji("5274055917766202507", "\U0001f535")  # заголовок тарифа VPN
+EMOJI_PLAN_BYPASS   = premium_emoji("5206607081334906820", "\U0001f7e3")  # заголовок тарифа VPN с обходом
+EMOJI_EARN          = premium_emoji("5210952531676504517", "\U0001f4b0")  # заголовок "Заработать"
+EMOJI_INFO          = premium_emoji("5467539229468793355", "\u2728")   # заголовок "О сервисе"
+EMOJI_ADMIN         = premium_emoji("5197288647275071607", "\u2699\ufe0f")  # заголовок "Админ-панель"
+EMOJI_GIFT          = premium_emoji("5341715473882955310", "\U0001f381")  # "Администратор выдал вам N дней"
+EMOJI_SURVEY        = premium_emoji("5443038326535759644", "\U0001f4ca")  # приглашение пройти опрос
+EMOJI_DIAMOND       = premium_emoji("5334544901428229844", "\U0001f48e")  # реф. баланс достиг порога вывода
+EMOJI_WARNING       = premium_emoji("5402186569006210455", "\u26a0\ufe0f")  # лимит белых списков исчерпан
+
+# ─────────────────────────────────────────────
 #  ТАРИФЫ
 #
 #  Два постоянных плана + разовый пробный доступ. Цены за месяц берутся из
@@ -715,7 +739,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     remna = await remna_get_user(user_id)
     now   = int(time.time())
 
-    lines = [hbold("Профиль"), ""]
+    lines = [f"{EMOJI_PROFILE} {hbold('Профиль')}", ""]
     if remna and parse_dt(remna.get("expireAt")) > now and remna.get("status") != "DISABLED":
         expire   = parse_dt(remna.get("expireAt"))
         date_str = fmt_dt(expire, "%d.%m.%Y")
@@ -748,7 +772,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     if plan not in PLANS:
         if not trial_used:
             rows.append([InlineKeyboardButton(text="Пробная подписка", callback_data="trial_buy")])
-        rows.append([InlineKeyboardButton(text="Купить VPN", callback_data="buy_open")])
+        rows.append([InlineKeyboardButton(text="\U0001f7e2 Купить VPN", callback_data="buy_open")])
     else:
         rows.append([InlineKeyboardButton(text="Добавить устройства", callback_data="dev_add")])
         if plan == "vpn":
@@ -987,7 +1011,7 @@ async def check_payment_cb(cb: CallbackQuery):
 
     text, kb = await _build_profile_view(u_id)
     await cb.message.edit_text(
-        f"Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
+        f"{EMOJI_PAY_SUCCESS} Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
     )
 
 # ─────────────────────────────────────────────
@@ -1015,8 +1039,8 @@ async def buy_open_cb(cb: CallbackQuery):
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
     text = (
-        f"{hbold(vpn['name'])}\n{vpn['desc']}\nОт {vpn['price_month']} руб./мес.\n\n"
-        f"{hbold(bypass['name'])}\n{bypass['desc']}\nОт {bypass['price_month']} руб./мес.\n\n"
+        f"{EMOJI_PLAN_VPN} {hbold(vpn['name'])}\n{vpn['desc']}\nОт {vpn['price_month']} руб./мес.\n\n"
+        f"{EMOJI_PLAN_BYPASS} {hbold(bypass['name'])}\n{bypass['desc']}\nОт {bypass['price_month']} руб./мес.\n\n"
         f"Дополнительные устройства и трафик для обхода белых списков "
         f"докупаются в главном меню после покупки тарифа."
     )
@@ -1190,7 +1214,7 @@ async def earn_open_cb(cb: CallbackQuery):
     balance = float(balance)
 
     text = (
-        f"{hbold('Заработать')}\n\n"
+        f"{EMOJI_EARN} {hbold('Заработать')}\n\n"
         f"Приглашайте друзей — получайте {REFERRAL_PERCENT}% с их оплат.\n\n"
         f"Ваша ссылка:\n{hcode(link)}\n\n"
         f"Приглашено: {ref_count}\n"
@@ -1199,6 +1223,7 @@ async def earn_open_cb(cb: CallbackQuery):
     )
     rows = []
     if balance >= REFERRAL_MIN_WITHDRAW:
+        text += f"\n\n{EMOJI_DIAMOND} Порог вывода достигнут!"
         withdraw_text = f"Хочу вывести реферальный баланс ({balance:.2f} руб.)"
         withdraw_url  = f"{SUPPORT_URL}?text={withdraw_text.replace(' ', '%20')}"
         rows.append([InlineKeyboardButton(text="Написать для вывода", url=withdraw_url)])
@@ -1317,7 +1342,8 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
 async def info_tab(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
-        "О сервисе",
+        f"{EMOJI_INFO} О сервисе",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Канал с инструкциями", url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="Пользовательское соглашение",
@@ -1353,7 +1379,7 @@ async def admin_panel_cb(cb: CallbackQuery):
     await cb.answer()
     if cb.from_user.id not in ADMIN_IDS:
         return
-    await cb.message.edit_text("Админ-панель", reply_markup=admin_panel_kb())
+    await cb.message.edit_text(f"{EMOJI_ADMIN} Админ-панель", parse_mode="HTML", reply_markup=admin_panel_kb())
 
 # ─────────────────────────────────────────────
 #  ПОДПИСЧИКИ — кнопки с пагинацией (только активные)
@@ -2302,7 +2328,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
     label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN с обходом", "trial": "пробный доступ"}[choice]
     await cb.message.edit_text(f"@{target_uname} выдано {days} дн. ({label}). До: {date_str}")
     try:
-        await bot.send_message(target_id, f"Администратор выдал вам {days} дней.")
+        await bot.send_message(target_id, f"{EMOJI_GIFT} Администратор выдал вам {days} дней.", parse_mode="HTML")
     except Exception:
         pass
 
@@ -2457,7 +2483,8 @@ async def admin_survey_send_cb(cb: CallbackQuery):
         try:
             await bot.send_message(
                 row["user_id"],
-                "Оцените работу TrubaVPN\n\nНасколько вы довольны сервисом? Выберите оценку от 1 до 10:",
+                f"{EMOJI_SURVEY} Оцените работу TrubaVPN\n\nНасколько вы довольны сервисом? Выберите оценку от 1 до 10:",
+                parse_mode="HTML",
                 reply_markup=_rating_kb(),
             )
             ok += 1
@@ -2625,7 +2652,7 @@ async def admin_give(message: types.Message, command: CommandObject):
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     await message.answer(f"@{target} выдано {days} дн. До: {date_str}")
     try:
-        await bot.send_message(row["user_id"], f"Администратор выдал вам {days} дней.")
+        await bot.send_message(row["user_id"], f"{EMOJI_GIFT} Администратор выдал вам {days} дней.", parse_mode="HTML")
     except Exception:
         pass
 
@@ -2679,9 +2706,10 @@ async def check_whitelist_limits():
                     try:
                         await bot.send_message(
                             user_id,
-                            f"Вы исчерпали лимит трафика на белых списках "
+                            f"{EMOJI_WARNING} Вы исчерпали лимит трафика на белых списках "
                             f"({used_gb:.1f}/{gb_limit} GB за текущий период). "
                             f"Доступ к остальным серверам сохранён.",
+                            parse_mode="HTML",
                         )
                     except Exception:
                         pass
