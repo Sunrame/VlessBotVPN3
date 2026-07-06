@@ -877,10 +877,7 @@ async def check_sub_cb(cb: CallbackQuery):
 async def back_to_main(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
-    await cb.message.edit_text(
-        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
-        reply_markup=main_kb(cb.from_user.id in ADMIN_IDS), parse_mode="HTML",
-    )
+    await _show_home(cb)
 
 # ─────────────────────────────────────────────
 #  ТАРИФЫ И ОПЛАТА
@@ -1116,7 +1113,10 @@ async def order_apply_discount(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "profile")
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Общий рендер профиля — используется и в /start, и в кнопке «Профиль»."""
+    """
+    Профиль = единственный домашний экран. Здесь и статус подписки, и ВСЕ
+    опции меню сразу (без отдельного 'главного меню', на которое нужно уходить).
+    """
     user = await remna_get_user(user_id)
     now  = int(time.time())
     if user and parse_dt(user.get("expireAt")) > now and user.get("status") != "DISABLED":
@@ -1139,17 +1139,29 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             "👤 <b>Профиль</b>\n\n❌ Подписка не активна.\n"
             "Нажмите «💰 Купить VPN» для оформления."
         )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Купить VPN", callback_data="tariffs")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back")],
-    ])
+
+    is_admin = user_id in ADMIN_IDS
+    rows = [
+        [InlineKeyboardButton(text="💰 Купить VPN", callback_data="tariffs"),
+         InlineKeyboardButton(text="🤝 Рефералы",   callback_data="ref_program")],
+        [InlineKeyboardButton(text="📞 Промокод",   callback_data="promo_enter"),
+         InlineKeyboardButton(text="💬 Поддержка",  callback_data="support_open")],
+        [InlineKeyboardButton(text="ℹ️ Инфо",       callback_data="info_tab")],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="admin_panel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
+
+async def _show_home(cb: CallbackQuery):
+    """Единый способ вернуться на домашний экран (профиль+меню) из любого места бота."""
+    text, kb = await _build_profile_view(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data == "profile")
 async def profile_tab(cb: CallbackQuery):
     await cb.answer()
-    text, kb = await _build_profile_view(cb.from_user.id)
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await _show_home(cb)
 
 async def _show_sub_info_inplace(message: types.Message, user_id: int):
     user = await remna_get_user(user_id)
@@ -1207,10 +1219,7 @@ async def promo_enter(cb: CallbackQuery, state: FSMContext):
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
-    await cb.message.edit_text(
-        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
-        reply_markup=main_kb(cb.from_user.id in ADMIN_IDS), parse_mode="HTML",
-    )
+    await _show_home(cb)
 
 @router.message(PromoState.waiting_code)
 async def handle_promo(message: types.Message, state: FSMContext):
@@ -1350,19 +1359,13 @@ async def support_close_user(cb: CallbackQuery, state: FSMContext):
                 int(time.time()), data["ticket_id"],
             )
     await state.clear()
-    await cb.message.edit_text(
-        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
-        reply_markup=main_kb(cb.from_user.id in ADMIN_IDS), parse_mode="HTML",
-    )
+    await _show_home(cb)
 
 @router.callback_query(F.data == "support_to_main")
 async def support_to_main_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
-    await cb.message.edit_text(
-        f"🌏 {hbold('TrubaVPN')} — быстрый и надёжный VPN.",
-        reply_markup=main_kb(cb.from_user.id in ADMIN_IDS), parse_mode="HTML",
-    )
+    await _show_home(cb)
 
 async def _process_support_message(message: types.Message, state: FSMContext):
     u_id  = message.from_user.id
