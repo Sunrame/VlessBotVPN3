@@ -3157,19 +3157,45 @@ async def admin_debug_bandwidth(message: types.Message, command: CommandObject):
         return
 
     await message.answer(f"Проверяю bandwidth-stats для ноды <code>{node_uuid}</code>...", parse_mode="HTML")
+
+    now_dt   = datetime.now(timezone.utc)
+    start_dt = now_dt - timedelta(days=90)
+
+    # Пробуем разные форматы дат — эндпоинт помечен как "legacy",
+    # формат не задокументирован явно.
+    attempts = [
+        ("ISO с миллисекундами", start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"), now_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")),
+        ("ISO без миллисекунд",  start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),      now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        ("Просто дата",          start_dt.strftime("%Y-%m-%d"),                now_dt.strftime("%Y-%m-%d")),
+        ("Unix timestamp (сек)", str(int(start_dt.timestamp())),               str(int(now_dt.timestamp()))),
+    ]
+
+    results = []
     try:
         async with httpx.AsyncClient(verify=True) as client:
-            r = await client.get(
-                f"{REMNAWAVE_URL}/api/bandwidth-stats/nodes/{node_uuid}/users/legacy",
-                headers=_remna_headers(), timeout=20,
-            )
-            body_preview = r.text[:3500]
-            await message.answer(
-                f"Status: {r.status_code}\n\nBody:\n<code>{body_preview}</code>",
-                parse_mode="HTML",
-            )
+            for label, start_val, end_val in attempts:
+                try:
+                    r = await client.get(
+                        f"{REMNAWAVE_URL}/api/bandwidth-stats/nodes/{node_uuid}/users/legacy",
+                        params={"start": start_val, "end": end_val},
+                        headers=_remna_headers(), timeout=20,
+                    )
+                    preview = r.text[:800]
+                    results.append(f"<b>{label}</b> (start={start_val})\nStatus: {r.status_code}\n{preview}")
+                    if r.status_code == 200:
+                        break  # нашли рабочий формат — не тратим лишние запросы
+                except Exception as ex:
+                    results.append(f"<b>{label}</b>\nERR: {ex}")
     except Exception as e:
         await message.answer(f"Error: {e}")
+        return
+
+    text = "\n\n━━━━━━━━━━\n\n".join(results)
+    if len(text) > 3800:
+        text = text[:3800] + "\n\n<i>…обрезано</i>"
+    await message.answer(text, parse_mode="HTML")
+
+
 
 
 
