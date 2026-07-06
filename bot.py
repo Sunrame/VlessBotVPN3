@@ -721,7 +721,12 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         date_str = fmt_dt(expire, "%d.%m.%Y")
         hwid     = remna.get("hwidDeviceLimit", 1)
         sub_url  = format_sub_url(remna)
-        plan_name = PLANS.get(plan, {}).get("name", "Пробная подписка" if not plan else "—")
+        if plan == "trial":
+            plan_name = "Пробная подписка"
+        elif plan in PLANS:
+            plan_name = PLANS[plan]["name"]
+        else:
+            plan_name = "не оформлена"
         lines += [
             f"Вариант подписки: {plan_name}",
             f"Устройств: {hwid}",
@@ -736,7 +741,11 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     text = "\n".join(lines)
 
     rows = []
-    if plan is None:
+    # Кнопки "Купить VPN"/"Пробная" показываются, пока не куплен РЕАЛЬНЫЙ тариф
+    # (vpn / vpn_bypass). Пробная подписка (plan == "trial") — это не покупка
+    # тарифа, поэтому кнопки не пропадают, только пропадает сама кнопка триала,
+    # если он уже использован.
+    if plan not in PLANS:
         if not trial_used:
             rows.append([InlineKeyboardButton(text="Пробная подписка", callback_data="trial_buy")])
         rows.append([InlineKeyboardButton(text="Купить VPN", callback_data="buy_open")])
@@ -861,7 +870,9 @@ async def check_payment_cb(cb: CallbackQuery):
             return
         async with pool.acquire() as conn:
             if kind == "trial":
-                await conn.execute("UPDATE users SET trial_used=TRUE WHERE user_id=$1", u_id)
+                await conn.execute(
+                    "UPDATE users SET trial_used=TRUE, plan='trial' WHERE user_id=$1", u_id
+                )
             else:
                 await conn.execute(
                     "UPDATE users SET plan=$1, extra_devices=0, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
@@ -2137,19 +2148,78 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
         await message.answer("Введите целое число (0 = не менять).")
         return
     devices = int(message.text.strip())
-    data = await state.get_data()
-    await state.clear()
-    target_id  = data["target_id"]
-    target_uname = data["target_username"]
-    days = data["days"]
-    hwid = devices if devices > 0 else None
-    user = await activate_subscription(target_id, days, hwid or 1, squad_uuid=None)
-    if not user:
-        await message.answer("Ошибка активации.")
+    await state.update_data(devices=devices)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
+        [InlineKeyboardButton(text="VPN", callback_data="giveplan_vpn")],
+        [InlineKeyboardButton(text="VPN с обходом белых списков", callback_data="giveplan_vpn_bypass")],
+        [InlineKeyboardButton(text="Пробный доступ (белые списки, 3 ГБ)", callback_data="giveplan_trial")],
+    ])
+    await message.answer(
+        "Какой тариф/доступ выставить?\n\n"
+        "«Не менять» — только продлить дни, сквад и вариант подписки останутся как есть.\n"
+        "«VPN» / «VPN с обходом» — выставит соответствующий тариф и профиль пользователя "
+        "переключится в купленное состояние (появятся кнопки «Добавить устройства» и т.д.).\n"
+        "«Пробный доступ» — доступ к белым спискам с лимитом 3 ГБ, но БЕЗ пометки как "
+        "купленный тариф (кнопки покупки в профиле останутся).",
+        reply_markup=kb,
+    )
+
+@router.callback_query(F.data.startswith("giveplan_"))
+async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
         return
+    choice = cb.data.removeprefix("giveplan_")
+    data = await state.get_data()
+    if "target_id" not in data:
+        await cb.message.edit_text("Сессия истекла, начните заново через «Выдать».")
+        return
+    await state.clear()
+
+    target_id    = data["target_id"]
+    target_uname = data["target_username"]
+    days         = data["days"]
+    devices      = data.get("devices", 0)
+    hwid         = devices if devices > 0 else None
+
+    squad_uuid   = None
+    whitelist_gb = 0
+    new_plan     = None       # None = не трогать поле plan в БД
+    clear_plan   = False      # explicit сброс plan на NULL (для "не менять" не используется)
+
+    if choice == "vpn":
+        squad_uuid = SQUAD_UUID_BASIC
+        new_plan   = "vpn"
+    elif choice == "vpn_bypass":
+        squad_uuid   = SQUAD_UUID_WHITELIST
+        whitelist_gb = PLANS["vpn_bypass"]["whitelist_gb"]
+        new_plan     = "vpn_bypass"
+    elif choice == "trial":
+        squad_uuid   = SQUAD_UUID_WHITELIST
+        whitelist_gb = TRIAL["whitelist_gb"]
+        new_plan     = "trial"
+    # choice == "none": оставляем squad_uuid=None, new_plan=None (ничего не трогаем)
+
+    user = await activate_subscription(
+        target_id, days, hwid or 1, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
+    )
+    if not user:
+        await cb.message.edit_text("Ошибка активации.")
+        return
+
+    async with pool.acquire() as conn:
+        if new_plan is not None:
+            extra_devices = max(0, (hwid or 1) - 1)
+            await conn.execute(
+                "UPDATE users SET plan=$1, extra_devices=$2 WHERE user_id=$3",
+                new_plan, extra_devices, target_id,
+            )
+
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
-    await message.answer(f"@{target_uname} выдано {days} дн. До: {date_str}")
+    label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN с обходом", "trial": "пробный доступ"}[choice]
+    await cb.message.edit_text(f"@{target_uname} выдано {days} дн. ({label}). До: {date_str}")
     try:
         await bot.send_message(target_id, f"Администратор выдал вам {days} дней.")
     except Exception:
@@ -2484,7 +2554,8 @@ async def admin_help(message: types.Message):
         return
     await message.answer(
         "Команды администратора:\n\n"
-        "/give username дни [уст.] — выдать дни вручную\n"
+        "/give username дни [уст.] — быстро выдать дни (тариф/сквад не меняет; "
+        "для выбора тарифа используйте кнопку «Выдать» в панели)\n"
         "/check username|id — карточка подписчика\n"
         "/add_promo, /genpromo, /list_promos — промокоды\n"
         "/broadcast — рассылка\n"
