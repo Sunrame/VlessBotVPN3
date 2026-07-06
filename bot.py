@@ -75,11 +75,17 @@ def msk_now() -> datetime:
 #  ТАРИФЫ
 # ─────────────────────────────────────────────
 TARIFFS: dict = {
-    "trial":  {"name": "Пробный",      "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа",                              "trial": True, "hwid": 1},
-    "1_dev":  {"name": "1 устройство", "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 1},
-    "2_dev":  {"name": "2 устройства", "price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 2},
-    "5_dev":  {"name": "5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 5},
-    "family": {"name": "Семейный",     "price": 449, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость\n👨‍👩‍👧‍👦 До 10 устройств", "hwid": 10},
+    # squad — какой сквад серверов получает юзер при покупке этого тарифа.
+    #   SQUAD_UUID_BASIC     — без сервера "белые списки"
+    #   SQUAD_UUID_WHITELIST — с сервером "белые списки"
+    # whitelist_gb — лимит трафика (в ГБ) ИМЕННО на сервере "белые списки" для этого
+    #   тарифа. 0 = лимит не отслеживается (либо нет доступа к серверу, либо безлимит на нём).
+    #   Работает независимо от общего трафика на остальных серверах.
+    "trial":  {"name": "Пробный",      "price": 10,  "days": 1,  "desc": "⏱️ Тестовый доступ на 24 часа",                              "trial": True, "hwid": 1,  "squad": SQUAD_UUID_BASIC, "whitelist_gb": 0},
+    "1_dev":  {"name": "1 устройство", "price": 99,  "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 1,  "squad": SQUAD_UUID_BASIC, "whitelist_gb": 0},
+    "2_dev":  {"name": "2 устройства", "price": 179, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 2,  "squad": SQUAD_UUID_BASIC, "whitelist_gb": 0},
+    "5_dev":  {"name": "5 устройств",  "price": 349, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость",                  "hwid": 5,  "squad": SQUAD_UUID_BASIC, "whitelist_gb": 0},
+    "family": {"name": "Семейный",     "price": 449, "days": 30, "desc": "🔒 Безлимитный трафик\n🌐 Высокая скорость\n👨‍👩‍👧‍👦 До 10 устройств", "hwid": 10, "squad": SQUAD_UUID_BASIC, "whitelist_gb": 0},
 }
 
 MONTH_OPTIONS = {
@@ -231,6 +237,15 @@ async def init_db():
                 created_at BIGINT DEFAULT 0
             )
         """)
+        # Лимит трафика ИМЕННО на сервере "белые списки" (не общий по аккаунту)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS whitelist_limits (
+                user_id      BIGINT PRIMARY KEY,
+                gb_limit     INTEGER DEFAULT 0,
+                period_start BIGINT DEFAULT 0,
+                cut_off      BOOLEAN DEFAULT FALSE
+            )
+        """)
         # Миграции
         for col in ["remna_uuid TEXT", "created_at BIGINT DEFAULT 0"]:
             try:
@@ -294,7 +309,7 @@ async def remna_get_user_by_uuid(uuid_: str) -> dict | None:
         log.error("[Remna] get_user_by_uuid: %s", e)
         return None
 
-async def remna_create_user(user_id: int, days: int, hwid: int = 1) -> dict | None:
+async def remna_create_user(user_id: int, days: int, hwid: int = 1, squad_uuid: str = SQUAD_UUID) -> dict | None:
     payload = {
         "username":             remna_username(user_id),
         "trafficLimitBytes":    0,
@@ -302,7 +317,7 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1) -> dict | No
         "expireAt":             _expire_at(days),
         "hwidDeviceLimit":      hwid,
         "telegramId":           user_id,
-        "activeInternalSquads": [SQUAD_UUID],
+        "activeInternalSquads": [squad_uuid],
     }
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -311,24 +326,29 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1) -> dict | No
                 json=payload, headers=_remna_headers(), timeout=15,
             )
             if r.status_code == 409:
-                return await remna_extend_user(user_id, days, hwid)
+                return await remna_extend_user(user_id, days, hwid, squad_uuid)
             r.raise_for_status()
             return r.json().get("response")
     except Exception as e:
         log.error("[Remna] create_user: %s", e)
         return None
 
-async def remna_extend_user(user_id: int, days: int, hwid: int | None = None) -> dict | None:
+async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
+                             squad_uuid: str | None = None) -> dict | None:
     user = await remna_get_user(user_id)
     if not user:
-        return await remna_create_user(user_id, days, hwid or 1)
+        return await remna_create_user(user_id, days, hwid or 1, squad_uuid or SQUAD_UUID)
 
     now        = datetime.now(timezone.utc)
     current    = datetime.fromisoformat(user["expireAt"].replace("Z", "+00:00"))
     base       = max(current, now)
     new_expire = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "activeInternalSquads": [SQUAD_UUID]}
+    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire}
+    # Сквад меняем только если явно передан — иначе не трогаем текущий
+    # (важно для команд типа /give, ca_adddays, где squad_uuid не указывается)
+    if squad_uuid is not None:
+        payload["activeInternalSquads"] = [squad_uuid]
     if hwid is not None:
         payload["hwidDeviceLimit"] = hwid
 
@@ -411,33 +431,82 @@ async def remna_get_user_hwid(uuid_: str) -> list:
         log.error("[Remna] get_user_hwid: %s", e)
         return []
 
-async def remna_get_node_bandwidth(node_uuid: str) -> list:
+async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: datetime) -> list:
     """
-    Трафик по каждому юзеру на КОНКРЕТНОЙ ноде (не по всему аккаунту).
-    GET /api/bandwidth-stats/nodes/{uuid}/users/legacy
-    Точная структура ответа проверяется командой /debug_bandwidth.
+    Трафик по каждому юзеру на КОНКРЕТНОЙ ноде, по дням.
+    GET /api/bandwidth-stats/nodes/{uuid}/users/legacy?start=...&end=...
+    Формат дат подтверждён: ISO с миллисекундами, например 2026-04-07T10:33:25.000Z
+    Ответ — плоский список записей вида:
+        {"userUuid": "...", "nodeUuid": "...", "username": "truba_123", "total": 12345, "date": "2026-07-05T00:00:00.000Z"}
+    Один юзер встречается НЕСКОЛЬКО раз — по одной записи на каждый день,
+    total — байты ЗА ЭТОТ ДЕНЬ (не накопительно), нужно суммировать самим.
     """
     if not node_uuid:
         return []
+    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     try:
         async with httpx.AsyncClient(verify=True) as client:
             r = await client.get(
                 f"{REMNAWAVE_URL}/api/bandwidth-stats/nodes/{node_uuid}/users/legacy",
-                headers=_remna_headers(), timeout=20,
+                params={"start": start_str, "end": end_str},
+                headers=_remna_headers(), timeout=30,
             )
             r.raise_for_status()
             data = r.json().get("response", [])
-            return data if isinstance(data, list) else data.get("users", []) if isinstance(data, dict) else []
+            return data if isinstance(data, list) else []
     except Exception as e:
         log.error("[Remna] get_node_bandwidth: %s", e)
         return []
 
-async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict | None:
+async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
+    """
+    Сырые записи по дням для ВСЕХ юзеров на ноде 'белые списки' за широкое окно
+    (с запасом на самый длинный возможный тарифный период). Один вызов на всех,
+    дальше каждый юзер фильтруется по своему period_start локально —
+    т.к. у разных юзеров разное время начала периода.
+    Возвращает список {username, ts (unix, начало дня), bytes}.
+    """
+    if not WHITELIST_NODE_UUID:
+        return []
+    end_dt   = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days_back)
+    raw = await remna_get_node_bandwidth(WHITELIST_NODE_UUID, start_dt, end_dt)
+
+    out = []
+    for rec in raw:
+        uname = rec.get("username", "")
+        date_str = rec.get("date", "")
+        try:
+            day_ts = int(datetime.fromisoformat(date_str.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            continue
+        out.append({
+            "username": uname,
+            "ts": day_ts,
+            "bytes": int(rec.get("total", 0) or 0),
+        })
+    return out
+
+def sum_whitelist_bytes_for_user(records: list[dict], user_id: int, since_ts: int) -> int:
+    """Суммирует байты юзера из уже полученных daily-записей, начиная с since_ts."""
+    uname = remna_username(user_id)  # "truba_<id>"
+    return sum(r["bytes"] for r in records if r["username"] == uname and r["ts"] >= since_ts)
+
+async def activate_subscription(user_id: int, days: int, hwid: int = 1,
+                                 squad_uuid: str | None = None,
+                                 whitelist_gb: int = 0) -> dict | None:
+    """
+    squad_uuid=None — не менять текущий сквад юзера (для /give, ca_adddays и т.п.,
+    где явного тарифа нет).
+    whitelist_gb>0 — тариф включает доступ к серверу "белые списки" с лимитом
+    в ГБ именно на нём; заводим/обновляем запись в whitelist_limits.
+    """
     user = await remna_get_user(user_id)
     if user:
-        result = await remna_extend_user(user_id, days, hwid)
+        result = await remna_extend_user(user_id, days, hwid, squad_uuid)
     else:
-        result = await remna_create_user(user_id, days, hwid)
+        result = await remna_create_user(user_id, days, hwid, squad_uuid or SQUAD_UUID)
 
     if result:
         async with pool.acquire() as conn:
@@ -445,6 +514,17 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1) -> dict 
                 "UPDATE users SET remna_uuid=$1 WHERE user_id=$2",
                 result.get("uuid"), user_id,
             )
+            if whitelist_gb > 0:
+                # Новый период отсчёта лимита "белых списков" — с текущего момента
+                await conn.execute(
+                    "INSERT INTO whitelist_limits (user_id, gb_limit, period_start, cut_off) "
+                    "VALUES ($1,$2,$3,FALSE) "
+                    "ON CONFLICT (user_id) DO UPDATE SET gb_limit=$2, period_start=$3, cut_off=FALSE",
+                    user_id, whitelist_gb, int(time.time()),
+                )
+            elif squad_uuid is not None and squad_uuid != SQUAD_UUID_WHITELIST:
+                # Купили тариф БЕЗ белых списков — снимаем отслеживание, если было
+                await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
     return result
 
 # ─────────────────────────────────────────────
@@ -839,7 +919,11 @@ async def check_payment(cb: CallbackQuery):
     t_key    = payment.metadata.get("tariff_key", "")
     is_trial = payment.metadata.get("is_trial", "0") == "1"
 
-    user = await activate_subscription(u_id, days, hwid)
+    tariff_info  = TARIFFS.get(t_key, {})
+    squad_uuid   = tariff_info.get("squad", SQUAD_UUID_BASIC)
+    whitelist_gb = tariff_info.get("whitelist_gb", 0)
+
+    user = await activate_subscription(u_id, days, hwid, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb)
     if not user:
         await cb.answer("Ошибка активации. Напишите в поддержку.", show_alert=True)
         return
@@ -1069,7 +1153,11 @@ async def handle_promo(message: types.Message, state: FSMContext):
     if promo_type == "free_tariff" and tariff_key and tariff_key in TARIFFS:
         await state.clear()
         info = TARIFFS[tariff_key]
-        user = await activate_subscription(message.from_user.id, days, info.get("hwid", 1))
+        user = await activate_subscription(
+            message.from_user.id, days, info.get("hwid", 1),
+            squad_uuid=info.get("squad", SQUAD_UUID_BASIC),
+            whitelist_gb=info.get("whitelist_gb", 0),
+        )
         await _decrement_promo(code, uses)
         await message.answer(
             f"✅ Промокод <b>{code}</b> активирован!\n"
@@ -1105,7 +1193,11 @@ async def handle_free_tariff_choice(cb: CallbackQuery, state: FSMContext):
     if t_key not in TARIFFS:
         await cb.answer("Тариф не найден.", show_alert=True); return
     info = TARIFFS[t_key]
-    user = await activate_subscription(cb.from_user.id, days, info.get("hwid", 1))
+    user = await activate_subscription(
+        cb.from_user.id, days, info.get("hwid", 1),
+        squad_uuid=info.get("squad", SQUAD_UUID_BASIC),
+        whitelist_gb=info.get("whitelist_gb", 0),
+    )
     await _decrement_promo(promo_code, uses)
     await cb.message.edit_text(
         f"✅ ��ромокод <b>{promo_code}</b> активирован!\n"
@@ -1633,6 +1725,75 @@ async def daily_report_scheduler():
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
         await send_daily_report()
+
+# ─────────────────────────────────────────────
+#  ЛИМИТ ТРАФИКА НА СЕРВЕРЕ "БЕЛЫЕ СПИСКИ"
+# ─────────────────────────────────────────────
+async def check_whitelist_limits():
+    """
+    Раз в цикл: смотрит расход каждого отслеживаемого юзера ИМЕННО на ноде
+    'белые списки' с момента его period_start. Если лимит превышен —
+    убирает ТОЛЬКО SQUAD_UUID_WHITELIST из его сквадов (доступ к остальным
+    серверам не трогается). Если юзер уже отключён (cut_off=TRUE), но
+    почему-то снова в SQUAD_UUID_WHITELIST — тоже поправит.
+    """
+    if not WHITELIST_NODE_UUID:
+        return
+    try:
+        async with pool.acquire() as conn:
+            tracked = await conn.fetch(
+                "SELECT user_id, gb_limit, period_start, cut_off FROM whitelist_limits"
+            )
+        if not tracked:
+            return
+
+        # Одним запросом тянем сырые дневные записи для всех юзеров разом
+        records = await fetch_whitelist_daily_records(days_back=40)
+
+        for row in tracked:
+            user_id      = row["user_id"]
+            gb_limit     = row["gb_limit"]
+            period_start = row["period_start"]
+            already_cut  = row["cut_off"]
+
+            used_bytes  = sum_whitelist_bytes_for_user(records, user_id, period_start)
+            limit_bytes = gb_limit * 1024 ** 3
+
+            if used_bytes >= limit_bytes and not already_cut:
+                remna = await remna_get_user(user_id)
+                if not remna:
+                    continue
+                current_squads = remna.get("activeInternalSquads") or []
+                # Убираем ТОЛЬКО whitelist-сквад, остальные (basic) оставляем как есть
+                new_squads = [s for s in current_squads if s != SQUAD_UUID_WHITELIST]
+                if SQUAD_UUID_BASIC not in new_squads:
+                    new_squads.append(SQUAD_UUID_BASIC)
+                result = await remna_update_user(remna["uuid"], {"activeInternalSquads": new_squads})
+                if result:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE whitelist_limits SET cut_off=TRUE WHERE user_id=$1", user_id
+                        )
+                    used_gb = round(used_bytes / 1024 ** 3, 2)
+                    log.info("[Whitelist] user=%s exceeded limit (%s/%sGB) — squad removed",
+                             user_id, used_gb, gb_limit)
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            f"⚠️ Вы исчерпали лимит трафика на сервере «белые списки» "
+                            f"({used_gb:.1f}/{gb_limit} GB за текущий период).\n"
+                            f"Доступ к остальным серверам сохранён без изменений.",
+                        )
+                    except Exception:
+                        pass
+    except Exception as e:
+        log.error("check_whitelist_limits error: %s", e)
+
+async def whitelist_limit_scheduler():
+    """Проверка расхода на 'белых списках' каждые 30 минут."""
+    while True:
+        await asyncio.sleep(30 * 60)
+        await check_whitelist_limits()
 
 # ─────────────────────────────────────────────
 #  SUBS — все подписчики (inline editing)
@@ -3195,14 +3356,71 @@ async def admin_debug_bandwidth(message: types.Message, command: CommandObject):
         text = text[:3800] + "\n\n<i>…обрезано</i>"
     await message.answer(text, parse_mode="HTML")
 
+# ─────────────────────────────────────────────
+#  /whitelist_check — принудительно запустить проверку прямо сейчас
+# ─────────────────────────────────────────────
+@router.message(Command("whitelist_check"))
+async def admin_whitelist_check_now(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not WHITELIST_NODE_UUID:
+        await message.answer("❌ WHITELIST_NODE_UUID не задан.")
+        return
+    await message.answer("⏳ Проверяю лимиты 'белых списков'...")
+    await check_whitelist_limits()
+    await message.answer("✅ Готово. Смотри /whitelist_status для деталей.")
 
+# ─────────────────────────────────────────────
+#  /whitelist_status — расход по всем отслеживаемым юзерам
+# ─────────────────────────────────────────────
+@router.message(Command("whitelist_status"))
+async def admin_whitelist_status(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not WHITELIST_NODE_UUID:
+        await message.answer(
+            "❌ WHITELIST_NODE_UUID не задан.\n\n"
+            "Задай переменную окружения с UUID ноды 'белые списки'.",
+        )
+        return
+    async with pool.acquire() as conn:
+        tracked = await conn.fetch(
+            "SELECT wl.user_id, wl.gb_limit, wl.period_start, wl.cut_off, u.username "
+            "FROM whitelist_limits wl LEFT JOIN users u ON u.user_id = wl.user_id "
+            "ORDER BY wl.period_start DESC"
+        )
+    if not tracked:
+        await message.answer("Пока никто не отслеживается по лимиту 'белых списков'.")
+        return
 
+    await message.answer("⏳ Считаю расход...")
+    records = await fetch_whitelist_daily_records(days_back=40)
+
+    lines = ["📡 <b>Лимиты 'белые списки'</b>\n"]
+    for row in tracked:
+        used = sum_whitelist_bytes_for_user(records, row["user_id"], row["period_start"])
+        used_gb  = used / 1024 ** 3
+        limit_gb = row["gb_limit"]
+        pct = round(used_gb / limit_gb * 100) if limit_gb > 0 else 0
+        uname = f"@{row['username']}" if row["username"] else f"ID:{row['user_id']}"
+        status_icon = "🚫" if row["cut_off"] else ("⚠️" if pct >= 90 else "✅")
+        since = fmt_dt(row["period_start"], "%d.%m")
+        lines.append(
+            f"{status_icon} {uname} — <b>{used_gb:.1f}/{limit_gb} GB</b> ({pct}%)"
+            f"{' — ОТКЛЮЧЁН' if row['cut_off'] else ''} · с {since}"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n<i>…обрезано</i>"
+    await message.answer(text, parse_mode="HTML")
 
 
 async def main():
     await init_db()
     dp.include_router(router)
     asyncio.create_task(daily_report_scheduler())
+    asyncio.create_task(whitelist_limit_scheduler())
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
