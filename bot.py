@@ -373,11 +373,33 @@ async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
                 f"{REMNAWAVE_URL}/api/users",
                 json=payload, headers=_remna_headers(), timeout=15,
             )
+            if r.status_code >= 400:
+                log.error("[Remna] update_user %s: %s", r.status_code, r.text[:500])
             r.raise_for_status()
             return r.json().get("response")
     except Exception as e:
         log.error("[Remna] update_user: %s", e)
         return None
+
+async def remna_update_user_verbose(uuid_: str, payload: dict) -> tuple[dict | None, str]:
+    """Как remna_update_user, но дополнительно возвращает текст ответа для диагностики."""
+    payload = dict(payload)
+    payload["uuid"] = uuid_
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            r = await client.patch(
+                f"{REMNAWAVE_URL}/api/users",
+                json=payload, headers=_remna_headers(), timeout=15,
+            )
+            body = r.text[:500]
+            if r.status_code >= 400:
+                log.error("[Remna] update_user %s: %s", r.status_code, body)
+                return None, f"HTTP {r.status_code}: {body}"
+            r.raise_for_status()
+            return r.json().get("response"), "OK"
+    except Exception as e:
+        log.error("[Remna] update_user: %s", e)
+        return None, str(e)
 
 async def remna_disable_user(uuid_: str) -> bool:
     result = await remna_update_user(uuid_, {"status": "DISABLED"})
@@ -2547,9 +2569,14 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
         new_squads = [s for s in current_squads if s != SQUAD_UUID_WHITELIST]
         if SQUAD_UUID_BASIC not in new_squads:
             new_squads.append(SQUAD_UUID_BASIC)
-        result = await remna_update_user(remna["uuid"], {"activeInternalSquads": new_squads})
+        result, err_text = await remna_update_user_verbose(remna["uuid"], {"activeInternalSquads": new_squads})
         if not result:
-            await cb.message.answer("❌ Ошибка обновления.")
+            await cb.message.answer(
+                f"❌ Ошибка обновления.\n\n"
+                f"<code>Отправленный список: {new_squads}</code>\n\n"
+                f"Ответ Remnawave:\n<code>{err_text}</code>",
+                parse_mode="HTML",
+            )
             return
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
@@ -2592,9 +2619,15 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
     new_squads = list(current_squads)
     if SQUAD_UUID_WHITELIST not in new_squads:
         new_squads.append(SQUAD_UUID_WHITELIST)
-    result = await remna_update_user(remna["uuid"], {"activeInternalSquads": new_squads})
+    result, err_text = await remna_update_user_verbose(remna["uuid"], {"activeInternalSquads": new_squads})
     if not result:
-        await message.answer("❌ Ошибка обновления сквада.")
+        await message.answer(
+            f"❌ Ошибка обновления сквада.\n\n"
+            f"<code>SQUAD_UUID_WHITELIST = {SQUAD_UUID_WHITELIST}</code>\n"
+            f"<code>Отправленный список: {new_squads}</code>\n\n"
+            f"Ответ Remnawave:\n<code>{err_text}</code>",
+            parse_mode="HTML",
+        )
         return
 
     async with pool.acquire() as conn:
