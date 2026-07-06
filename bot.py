@@ -945,7 +945,9 @@ async def buy_open_cb(cb: CallbackQuery):
     bypass = PLANS["vpn_bypass"]
     text = (
         f"{hbold(vpn['name'])}\n{vpn['desc']}\nОт {vpn['price_month']} руб./мес.\n\n"
-        f"{hbold(bypass['name'])}\n{bypass['desc']}\nОт {bypass['price_month']} руб./мес."
+        f"{hbold(bypass['name'])}\n{bypass['desc']}\nОт {bypass['price_month']} руб./мес.\n\n"
+        f"Дополнительные устройства и трафик для обхода белых списков "
+        f"докупаются в главном меню после покупки тарифа."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=vpn["name"], callback_data="buyplan_vpn")],
@@ -969,7 +971,10 @@ async def buyplan_cb(cb: CallbackQuery):
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buymonths_{plan_key}_{months}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="buy_open")])
     await cb.message.edit_text(
-        f"{hbold(plan['name'])}\n{plan['desc']}\n\nВыберите срок:",
+        f"{hbold(plan['name'])}\n{plan['desc']}\n\n"
+        f"Дополнительные устройства и трафик для обхода белых списков "
+        f"докупаются в главном меню после покупки.\n\n"
+        f"Выберите срок:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
