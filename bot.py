@@ -790,7 +790,10 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     now   = int(time.time())
 
     lines = [f"{EMOJI_PROFILE} {hbold('Профиль')}", ""]
-    if remna and parse_dt(remna.get("expireAt")) > now and remna.get("status") != "DISABLED":
+    subscription_active = bool(
+        remna and parse_dt(remna.get("expireAt")) > now and remna.get("status") != "DISABLED"
+    )
+    if subscription_active:
         expire   = parse_dt(remna.get("expireAt"))
         date_str = fmt_dt(expire, "%d.%m.%Y")
         hwid     = remna.get("hwidDeviceLimit", 1)
@@ -819,8 +822,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         plan = live_plan
 
         lines += [
-            f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}",
-            f"Устройств: {hwid}",
+            f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}, устройств: {hwid}",
             f"{EMOJI_ACTIVE_UNTIL} Активна до: {date_str}",
         ]
         if sub_url:
@@ -833,10 +835,12 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     rows = []
     # Кнопки "Купить VPN"/"Пробная" показываются, пока не куплен РЕАЛЬНЫЙ тариф
-    # (vpn / vpn_bypass). Пробная подписка (plan == "trial") — это не покупка
-    # тарифа, поэтому кнопки не пропадают, только пропадает сама кнопка триала,
-    # если он уже использован.
-    if plan not in PLANS:
+    # (vpn / vpn_bypass) И подписка при этом реально активна. Проверка именно
+    # subscription_active (а не только plan) защищает от случая, когда старое
+    # значение plan осталось в БД после отзыва подписки ("Забрать подписку") —
+    # без этого кнопки "Добавить устройства"/"Улучшить тариф" продолжали бы
+    # показываться, хотя подписки уже нет.
+    if not subscription_active or plan not in PLANS:
         if not trial_used:
             rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
                              callback_data="trial_buy")])
@@ -864,6 +868,19 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 async def _show_home(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+def cancel_kb() -> InlineKeyboardMarkup:
+    """Универсальная кнопка отмены — очищает любое активное FSM-состояние и
+    возвращает в профиль. Используется вместо текстовой подсказки /cancel."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отмена", callback_data="cancel_to_profile")]
+    ])
+
+@router.callback_query(F.data == "cancel_to_profile")
+async def cancel_to_profile_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    await _show_home(cb)
 
 @router.callback_query(F.data == "back")
 async def back_to_home(cb: CallbackQuery, state: FSMContext):
@@ -1184,8 +1201,8 @@ async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         f"{EMOJI_DEV_TOPUP} Добавить устройства\n\n"
         f"Цена одного устройства на вашем тарифе: {device_price} руб.\n\n"
-        f"Введите, сколько устройств хотите докупить:\n/cancel — отмена",
-        parse_mode="HTML",
+        f"Введите, сколько устройств хотите докупить:",
+        parse_mode="HTML", reply_markup=cancel_kb(),
     )
 
 @router.message(Command("cancel"), DeviceTopupState.waiting_count)
@@ -1253,8 +1270,8 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
         f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
-        f"Введите, сколько ГБ хотите докупить:\n/cancel — отмена",
-        parse_mode="HTML",
+        f"Введите, сколько ГБ хотите докупить:",
+        parse_mode="HTML", reply_markup=cancel_kb(),
     )
 
 @router.message(Command("cancel"), WhitelistTopupState.waiting_gb)
@@ -1728,7 +1745,7 @@ async def ca_adddays_start(cb: CallbackQuery, state: FSMContext):
     user_id = int(cb.data.removeprefix("ca_adddays_"))
     await state.set_state(CheckActionState.waiting_days_add)
     await state.update_data(ca_uid=user_id)
-    await cb.message.answer(f"Добавить дни для ID:{user_id}\n\nВведите количество дней:\n/cancel — отмена")
+    await cb.message.answer(f"Добавить дни для ID:{user_id}\n\nВведите количество дней:", reply_markup=cancel_kb())
 
 @router.message(CheckActionState.waiting_days_add)
 async def ca_adddays_handler(message: types.Message, state: FSMContext):
@@ -1768,7 +1785,7 @@ async def ca_subdays_start(cb: CallbackQuery, state: FSMContext):
     user_id = int(cb.data.removeprefix("ca_subdays_"))
     await state.set_state(CheckActionState.waiting_days_sub)
     await state.update_data(ca_uid=user_id)
-    await cb.message.answer(f"Убрать дни у ID:{user_id}\n\nВведите количество дней:\n/cancel — отмена")
+    await cb.message.answer(f"Убрать дни у ID:{user_id}\n\nВведите количество дней:", reply_markup=cancel_kb())
 
 @router.message(CheckActionState.waiting_days_sub)
 async def ca_subdays_handler(message: types.Message, state: FSMContext):
@@ -1812,7 +1829,8 @@ async def ca_setdate_start(cb: CallbackQuery, state: FSMContext):
     await state.update_data(ca_uid=user_id)
     await cb.message.answer(
         f"Установить дату истечения для ID:{user_id}\n\n"
-        f"Введите дату в формате ДД.ММ.ГГГГ (по МСК, время 23:59):\n/cancel — отмена"
+        f"Введите дату в формате ДД.ММ.ГГГГ (по МСК, время 23:59):",
+        reply_markup=cancel_kb(),
     )
 
 @router.message(CheckActionState.waiting_days_set)
@@ -1852,7 +1870,7 @@ async def ca_sethwid_start(cb: CallbackQuery, state: FSMContext):
     user_id = int(cb.data.removeprefix("ca_sethwid_"))
     await state.set_state(CheckActionState.waiting_hwid_set)
     await state.update_data(ca_uid=user_id)
-    await cb.message.answer(f"Установить лимит устройств для ID:{user_id}\n\nВведите число (0 = без лимита):\n/cancel — отмена")
+    await cb.message.answer(f"Установить лимит устройств для ID:{user_id}\n\nВведите число (0 = без лимита):", reply_markup=cancel_kb())
 
 @router.message(CheckActionState.waiting_hwid_set)
 async def ca_sethwid_handler(message: types.Message, state: FSMContext):
@@ -1947,7 +1965,8 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
     else:
         await cb.message.answer(
             f"Выдать доступ к белым спискам для ID:{user_id}\n\n"
-            f"Введите лимит в ГБ (0 = без лимита, без отслеживания):\n/cancel — отмена"
+            f"Введите лимит в ГБ (0 = без лимита, без отслеживания):",
+            reply_markup=cancel_kb(),
         )
         await state.set_state(CheckActionState.waiting_whitelist_gb)
         await state.update_data(ca_uid=user_id)
@@ -2004,6 +2023,14 @@ async def quick_take(cb: CallbackQuery):
     remna = await remna_get_user(user_id)
     if remna:
         await remna_disable_user(remna["uuid"])
+    # Сбрасываем классификацию тарифа — иначе в профиле остаются кнопки
+    # "Добавить устройства"/"Улучшить тариф" от старого plan в БД, хотя
+    # подписка уже отключена.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET plan=NULL, extra_devices=0 WHERE user_id=$1", user_id
+        )
+        await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
     await cb.message.answer(f"Подписка ID:{user_id} отозвана.")
     try:
         await bot.send_message(user_id, "Ваша подписка отозвана администратором.")
@@ -2067,7 +2094,8 @@ async def admin_genpromo(message: types.Message, state: FSMContext):
         "КОД ДНИ [исп.] — добавляет дни\n"
         "КОД ДНИ [исп.] free:vpn|vpn_bypass|choice — бесплатный тариф\n"
         "КОД 0 [исп.] discount:ПРОЦЕНТ — скидка %\n\n"
-        "Число вместо кода → авто генерация\n/cancel — отмена"
+        "Число вместо кода → авто генерация",
+        reply_markup=cancel_kb(),
     )
 
 @router.message(Command("cancel"), AdminPromoState.waiting_input)
@@ -2136,7 +2164,7 @@ async def broadcast_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(BroadcastState.waiting_text)
-    await message.answer("Рассылка\n\nВведите текст.\n/cancel — отмена.")
+    await message.answer("Рассылка\n\nВведите текст.", reply_markup=cancel_kb())
 
 @router.message(Command("cancel"), BroadcastState.waiting_text)
 async def broadcast_cancel(message: types.Message, state: FSMContext):
@@ -2297,7 +2325,7 @@ async def admin_give_start_cb(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(AdminGiveState.waiting_username)
-    await cb.message.answer("Выдача подписки\n\nВведите username (без @):\n/cancel — отмена")
+    await cb.message.answer("Выдача подписки\n\nВведите username (без @):", reply_markup=cancel_kb())
 
 @router.message(Command("cancel"), AdminGiveState.waiting_username)
 @router.message(Command("cancel"), AdminGiveState.waiting_days)
@@ -2312,21 +2340,21 @@ async def admin_give_username(message: types.Message, state: FSMContext):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT user_id FROM users WHERE username=$1", username)
     if not row:
-        await message.answer(f"@{username} не найден. Введите другой username или /cancel.")
+        await message.answer(f"@{username} не найден. Введите другой username.", reply_markup=cancel_kb())
         return
     await state.update_data(target_id=row["user_id"], target_username=username)
     await state.set_state(AdminGiveState.waiting_days)
-    await message.answer(f"@{username}\n\nСколько дней выдать?")
+    await message.answer(f"@{username}\n\nСколько дней выдать?", reply_markup=cancel_kb())
 
 @router.message(AdminGiveState.waiting_days)
 async def admin_give_days(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().lstrip("-").isdigit():
-        await message.answer("Введите целое число дней.")
+        await message.answer("Введите целое число дней.", reply_markup=cancel_kb())
         return
     days = int(message.text.strip())
     await state.update_data(days=days)
     await state.set_state(AdminGiveState.waiting_devices)
-    await message.answer("Сколько устройств выставить? (0 = не менять текущее значение)")
+    await message.answer("Сколько устройств выставить? (0 = не менять текущее значение)", reply_markup=cancel_kb())
 
 @router.message(AdminGiveState.waiting_devices)
 async def admin_give_devices(message: types.Message, state: FSMContext):
@@ -2420,7 +2448,7 @@ async def admin_find_start_cb(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(AdminFindState.waiting_query)
-    await cb.message.answer("Введите username или user_id для поиска:\n/cancel — отмена")
+    await cb.message.answer("Введите username или user_id для поиска:", reply_markup=cancel_kb())
 
 @router.message(Command("cancel"), AdminFindState.waiting_query)
 async def admin_find_cancel(message: types.Message, state: FSMContext):
@@ -2487,7 +2515,7 @@ async def admin_broadcast_start_cb(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(BroadcastState.waiting_text)
-    await cb.message.answer("Рассылка\n\nВведите текст.\n/cancel — отмена.")
+    await cb.message.answer("Рассылка\n\nВведите текст.", reply_markup=cancel_kb())
 
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ
