@@ -75,17 +75,37 @@ def msk_now() -> datetime:
 def premium_emoji(emoji_id: str, fallback: str) -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
 
-EMOJI_PROFILE       = premium_emoji("5280615440928758599", "\u2b50")   # заголовок "Профиль"
-EMOJI_PAY_SUCCESS   = premium_emoji("5377746319601324795", "\u2705")   # "Оплата прошла успешно"
-EMOJI_PLAN_VPN      = premium_emoji("5274055917766202507", "\U0001f535")  # заголовок тарифа VPN
-EMOJI_PLAN_BYPASS   = premium_emoji("5206607081334906820", "\U0001f7e3")  # заголовок тарифа VPN с обходом
-EMOJI_EARN          = premium_emoji("5210952531676504517", "\U0001f4b0")  # заголовок "Заработать"
-EMOJI_INFO          = premium_emoji("5467539229468793355", "\u2728")   # заголовок "О сервисе"
-EMOJI_ADMIN         = premium_emoji("5197288647275071607", "\u2699\ufe0f")  # заголовок "Админ-панель"
-EMOJI_GIFT          = premium_emoji("5341715473882955310", "\U0001f381")  # "Администратор выдал вам N дней"
-EMOJI_SURVEY        = premium_emoji("5443038326535759644", "\U0001f4ca")  # приглашение пройти опрос
-EMOJI_DIAMOND       = premium_emoji("5334544901428229844", "\U0001f48e")  # реф. баланс достиг порога вывода
-EMOJI_WARNING       = premium_emoji("5402186569006210455", "\u26a0\ufe0f")  # лимит белых списков исчерпан
+EMOJI_TRUBAVPN      = premium_emoji("5224450179368767019", "\U0001f310")  # "TrubaVPN" в приветствии
+EMOJI_INFO          = premium_emoji("5334544901428229844", "\u2728")   # заголовок "О сервисе"
+EMOJI_EARN          = premium_emoji("5287231198098117669", "\U0001f4b0")  # заголовок "Заработать"
+EMOJI_PROFILE       = premium_emoji("5341715473882955310", "\u2b50")   # заголовок "Профиль"
+EMOJI_PLAN_BYPASS   = premium_emoji("5447410659077661506", "\U0001f7e3")  # заголовок "VPN с обходом белых списков"
+EMOJI_PLAN_VPN      = premium_emoji("5427168083074628963", "\U0001f535")  # заголовок "VPN"
+EMOJI_CHOOSE_TERM   = premium_emoji("5382194935057372936", "\U0001f4c5")  # "Выберите срок"
+EMOJI_SUB_LINK      = premium_emoji("5271604874419647061", "\U0001f517")  # "Ссылка на подписку:"
+EMOJI_ACTIVE_UNTIL  = premium_emoji("5274055917766202507", "\U0001f4c6")  # "Активна до:"
+EMOJI_PLAN_LABEL    = premium_emoji("5197288647275071607", "\U0001f4cb")  # "Вариант подписки:"
+EMOJI_ADMIN         = premium_emoji("5231200819986047254", "\u2699\ufe0f")  # заголовок "Админ-панель"
+EMOJI_DEV_TOPUP     = premium_emoji("5407025283456835913", "\U0001f4f1")  # заголовок "Добавить устройства"
+EMOJI_GB_TOPUP      = premium_emoji("5283080528818360566", "\U0001f4ca")  # заголовок "Докупить трафик"
+EMOJI_UPGRADE       = premium_emoji("5449683594425410231", "\u2b06\ufe0f")  # "Улучшение тарифа" (оплата)
+EMOJI_INVITE        = premium_emoji("5264713049637409446", "\U0001f465")  # "Приглашайте друзей.."
+
+# ─────────────────────────────────────────────
+#  Технически невозможно вставить (кнопки Telegram не поддерживают формати-
+#  рование/кастомные эмодзи, только plain text) — оставлено для справки,
+#  какие ID из присланного списка на что были рассчитаны:
+#    5424818078833715060 — "Подписаться на канал" / "Канал с инструкциями" (кнопки)
+#    5206607081334906820 — "Я подписался" / "Проверить оплату" (кнопки)
+#    5280615440928758599 — "Пробная подписка" (кнопка)
+#    5197269100878907942 — "Пользовательское соглашение" (кнопка)
+#    5443038326535759644 — "Тех.Поддержка" (кнопка)
+#    5251203410396458957 — "Политика конфиденциальности" (кнопка)
+#    5445353829304387411 — "Оплатить" (кнопка)
+#    5312361253610475399 — "Купить VPN" (кнопка)
+#    5465169893580086142 — "Промокод" (кнопка)
+# ─────────────────────────────────────────────
+
 
 # ─────────────────────────────────────────────
 #  ТАРИФЫ
@@ -706,7 +726,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
 
     if not await is_subscribed(u_id):
         await message.answer(
-            f"{hbold('TrubaVPN')}\n\nПодпишитесь на канал, чтобы пользоваться ботом.",
+            f"{EMOJI_TRUBAVPN} {hbold('TrubaVPN')}\n\nПодпишитесь на канал, чтобы пользоваться ботом.",
             reply_markup=sub_required_kb(), parse_mode="HTML",
         )
         return
@@ -745,19 +765,36 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         date_str = fmt_dt(expire, "%d.%m.%Y")
         hwid     = remna.get("hwidDeviceLimit", 1)
         sub_url  = format_sub_url(remna)
+
+        # Тариф определяется ЖИВОЙ проверкой сквадов на каждый показ профиля
+        # (не по значению в БД) — так текст и кнопки всегда соответствуют
+        # реальному состоянию в Remnawave, даже если plan в БД устарел/не
+        # задан. Триал — единственное исключение (тот же сквад белых списков,
+        # что и у vpn_bypass, поэтому его нельзя отличить по скваду и он
+        # хранится отдельным явным флагом).
         if plan == "trial":
-            plan_name = "Пробная подписка"
-        elif plan in PLANS:
-            plan_name = PLANS[plan]["name"]
+            plan_name  = "Пробная подписка"
+            live_plan  = "trial"
         else:
-            plan_name = "не оформлена"
+            current_squads = _squad_uuids(remna.get("activeInternalSquads"))
+            live_plan = "vpn_bypass" if SQUAD_UUID_WHITELIST in current_squads else "vpn"
+            plan_name = PLANS[live_plan]["name"]
+
+        if plan != live_plan:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE users SET plan=$1, extra_devices=$2 WHERE user_id=$3",
+                    live_plan, max(0, hwid - 1), user_id,
+                )
+        plan = live_plan
+
         lines += [
-            f"Вариант подписки: {plan_name}",
+            f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}",
             f"Устройств: {hwid}",
-            f"Активна до: {date_str}",
+            f"{EMOJI_ACTIVE_UNTIL} Активна до: {date_str}",
         ]
         if sub_url:
-            lines += ["", "Ссылка на подписку:", hcode(sub_url)]
+            lines += ["", f"{EMOJI_SUB_LINK} Ссылка на подписку:", hcode(sub_url)]
     else:
         lines += ["Подписка не активна."]
 
@@ -853,7 +890,9 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
-                                qty: int = 0):
+                                qty: int = 0, display_prefix: str = ""):
+    """display_prefix — необязательный HTML-префикс (например premium-эмодзи)
+    ТОЛЬКО для заголовка в Telegram; в описание/метаданные ЮKassa не попадает."""
     payment, kb = await _create_payment_core(
         cb.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
@@ -861,8 +900,9 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
     if not payment:
         await cb.answer("Ошибка создания платежа.", show_alert=True)
         return
+    prefix = f"{display_prefix} " if display_prefix else ""
     await cb.message.edit_text(
-        f"{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
+        f"{prefix}{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
         parse_mode="HTML", reply_markup=kb,
     )
 
@@ -870,7 +910,7 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
                                              price: int, days: int = 0, hwid: int | None = None,
                                              squad: str | None = None, whitelist_gb: int = 0,
                                              plan_key: str | None = None, is_trial: bool = False,
-                                             qty: int = 0):
+                                             qty: int = 0, display_prefix: str = ""):
     """То же самое, что _create_payment_page, но когда вызов идёт из ответа на
     текстовое сообщение (ввод количества), а не из нажатия кнопки."""
     payment, kb = await _create_payment_core(
@@ -880,8 +920,9 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
     if not payment:
         await message.answer("Ошибка создания платежа.")
         return
+    prefix = f"{display_prefix} " if display_prefix else ""
     await message.answer(
-        f"{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
+        f"{prefix}{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
         parse_mode="HTML", reply_markup=kb,
     )
 
@@ -1011,7 +1052,7 @@ async def check_payment_cb(cb: CallbackQuery):
 
     text, kb = await _build_profile_view(u_id)
     await cb.message.edit_text(
-        f"{EMOJI_PAY_SUCCESS} Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
+        f"Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
     )
 
 # ─────────────────────────────────────────────
@@ -1059,6 +1100,7 @@ async def buyplan_cb(cb: CallbackQuery):
         await cb.answer("Тариф не найден.", show_alert=True)
         return
     plan = PLANS[plan_key]
+    plan_emoji = EMOJI_PLAN_BYPASS if plan_key == "vpn_bypass" else EMOJI_PLAN_VPN
     rows = []
     for months in MONTH_CHOICES:
         price = calc_plan_price(plan_key, months)
@@ -1066,10 +1108,10 @@ async def buyplan_cb(cb: CallbackQuery):
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buymonths_{plan_key}_{months}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="buy_open")])
     await cb.message.edit_text(
-        f"{hbold(plan['name'])}\n{plan['desc']}\n\n"
+        f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n\n"
         f"Дополнительные устройства и трафик для обхода белых списков "
         f"докупаются в главном меню после покупки.\n\n"
-        f"Выберите срок:",
+        f"{EMOJI_CHOOSE_TERM} Выберите срок:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -1105,9 +1147,10 @@ async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
     await state.set_state(DeviceTopupState.waiting_count)
     await state.update_data(plan=plan)
     await cb.message.edit_text(
-        f"Добавить устройства\n\n"
+        f"{EMOJI_DEV_TOPUP} Добавить устройства\n\n"
         f"Цена одного устройства на вашем тарифе: {device_price} руб.\n\n"
-        f"Введите, сколько устройств хотите докупить:\n/cancel — отмена"
+        f"Введите, сколько устройств хотите докупить:\n/cancel — отмена",
+        parse_mode="HTML",
     )
 
 @router.message(Command("cancel"), DeviceTopupState.waiting_count)
@@ -1157,7 +1200,7 @@ async def plan_upgrade_cb(cb: CallbackQuery):
     price = calc_upgrade_price(row["extra_devices"] or 0)
     await _create_payment_page(
         cb, kind="upgrade", item_name="Улучшение тарифа до VPN с обходом белых списков",
-        price=price, days=0,
+        price=price, days=0, display_prefix=EMOJI_UPGRADE,
     )
 
 # ─────────────────────────────────────────────
@@ -1173,9 +1216,10 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(WhitelistTopupState.waiting_gb)
     await cb.message.edit_text(
-        f"Докупить трафик (белые списки)\n\n"
+        f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
         f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
-        f"Введите, сколько ГБ хотите докупить:\n/cancel — отмена"
+        f"Введите, сколько ГБ хотите докупить:\n/cancel — отмена",
+        parse_mode="HTML",
     )
 
 @router.message(Command("cancel"), WhitelistTopupState.waiting_gb)
@@ -1215,7 +1259,7 @@ async def earn_open_cb(cb: CallbackQuery):
 
     text = (
         f"{EMOJI_EARN} {hbold('Заработать')}\n\n"
-        f"Приглашайте друзей — получайте {REFERRAL_PERCENT}% с их оплат.\n\n"
+        f"{EMOJI_INVITE} Приглашайте друзей — получайте {REFERRAL_PERCENT}% с их оплат.\n\n"
         f"Ваша ссылка:\n{hcode(link)}\n\n"
         f"Приглашено: {ref_count}\n"
         f"Баланс: {balance:.2f} руб.\n"
@@ -1223,7 +1267,7 @@ async def earn_open_cb(cb: CallbackQuery):
     )
     rows = []
     if balance >= REFERRAL_MIN_WITHDRAW:
-        text += f"\n\n{EMOJI_DIAMOND} Порог вывода достигнут!"
+        text += f"\n\nПорог вывода достигнут!"
         withdraw_text = f"Хочу вывести реферальный баланс ({balance:.2f} руб.)"
         withdraw_url  = f"{SUPPORT_URL}?text={withdraw_text.replace(' ', '%20')}"
         rows.append([InlineKeyboardButton(text="Написать для вывода", url=withdraw_url)])
@@ -2328,7 +2372,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
     label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN с обходом", "trial": "пробный доступ"}[choice]
     await cb.message.edit_text(f"@{target_uname} выдано {days} дн. ({label}). До: {date_str}")
     try:
-        await bot.send_message(target_id, f"{EMOJI_GIFT} Администратор выдал вам {days} дней.", parse_mode="HTML")
+        await bot.send_message(target_id, f"Администратор выдал вам {days} дней.", parse_mode="HTML")
     except Exception:
         pass
 
@@ -2483,7 +2527,7 @@ async def admin_survey_send_cb(cb: CallbackQuery):
         try:
             await bot.send_message(
                 row["user_id"],
-                f"{EMOJI_SURVEY} Оцените работу TrubaVPN\n\nНасколько вы довольны сервисом? Выберите оценку от 1 до 10:",
+                f"Оцените работу TrubaVPN\n\nНасколько вы довольны сервисом? Выберите оценку от 1 до 10:",
                 parse_mode="HTML",
                 reply_markup=_rating_kb(),
             )
@@ -2652,7 +2696,7 @@ async def admin_give(message: types.Message, command: CommandObject):
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     await message.answer(f"@{target} выдано {days} дн. До: {date_str}")
     try:
-        await bot.send_message(row["user_id"], f"{EMOJI_GIFT} Администратор выдал вам {days} дней.", parse_mode="HTML")
+        await bot.send_message(row["user_id"], f"Администратор выдал вам {days} дней.", parse_mode="HTML")
     except Exception:
         pass
 
@@ -2706,7 +2750,7 @@ async def check_whitelist_limits():
                     try:
                         await bot.send_message(
                             user_id,
-                            f"{EMOJI_WARNING} Вы исчерпали лимит трафика на белых списках "
+                            f"Вы исчерпали лимит трафика на белых списках "
                             f"({used_gb:.1f}/{gb_limit} GB за текущий период). "
                             f"Доступ к остальным серверам сохранён.",
                             parse_mode="HTML",
