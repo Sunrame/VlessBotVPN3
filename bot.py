@@ -964,9 +964,11 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
-                                qty: int = 0, display_prefix: str = ""):
+                                qty: int = 0, display_prefix: str = "", extra_desc: str = ""):
     """display_prefix — необязательный HTML-префикс (например premium-эмодзи)
-    ТОЛЬКО для заголовка в Telegram; в описание/метаданные ЮKassa не попадает."""
+    ТОЛЬКО для заголовка в Telegram; в описание/метаданные ЮKassa не попадает.
+    extra_desc — доп. текст-описание (например состав тарифа), показывается
+    сразу на этом же экране, вместе с кнопками оплаты — тоже не уходит в ЮKassa."""
     payment, kb = await _create_payment_core(
         cb.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
@@ -975,8 +977,9 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
         await cb.answer("Ошибка создания платежа.", show_alert=True)
         return
     prefix = f"{display_prefix} " if display_prefix else ""
+    desc_block = f"\n{extra_desc}\n" if extra_desc else ""
     await cb.message.edit_text(
-        f"{prefix}{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
+        f"{prefix}{hbold(item_name)}\n{desc_block}\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
         parse_mode="HTML", reply_markup=kb,
     )
 
@@ -1140,26 +1143,10 @@ async def trial_buy_cb(cb: CallbackQuery):
     if used:
         await cb.answer("Пробная подписка уже использована.", show_alert=True)
         return
-    await cb.message.edit_text(
-        f"{hbold(TRIAL['name'])}\n{TRIAL['desc']}\n\nЦена: {TRIAL['price']} руб.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Оформить", callback_data="trial_confirm")],
-            [InlineKeyboardButton(text="Назад", callback_data="back")],
-        ]),
-    )
-
-@router.callback_query(F.data == "trial_confirm")
-async def trial_confirm_cb(cb: CallbackQuery):
-    await cb.answer()
-    async with pool.acquire() as conn:
-        used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", cb.from_user.id)
-    if used:
-        await cb.answer("Пробная подписка уже использована.", show_alert=True)
-        return
     await _create_payment_page(
         cb, kind="trial", item_name=TRIAL["name"], price=TRIAL["price"], days=TRIAL["days"],
         hwid=TRIAL["hwid"], squad=TRIAL["squad"], whitelist_gb=TRIAL["whitelist_gb"], is_trial=True,
+        extra_desc=TRIAL["desc"],
     )
 
 # ─────────────────────────────────────────────
