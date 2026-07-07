@@ -155,8 +155,8 @@ TRIAL = {
     "squad":        SQUAD_UUID_WHITELIST,
     "whitelist_gb": 3,
     "desc": (
-        "24 часа доступа ко всем серверам, включая сервер белых списков. "
-        "Лимит трафика на белых списках — 3 ГБ."
+        "24 часа доступа ко всем серверам. Трафик VPN не ограничен, трафик "
+        "на обход белых списков ограничен 3 ГБ. Лимит устройств — 1."
     ),
 }
 
@@ -827,13 +827,10 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 )
         plan = live_plan
 
-        lines += [
-            f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}, устройств: {hwid}",
-            f"{EMOJI_ACTIVE_UNTIL} Активна до: {date_str}",
-        ]
-
         # Остаток трафика на белых списках — только если реально отслеживается
-        # (есть строка в whitelist_limits с лимитом > 0).
+        # (есть строка в whitelist_limits с лимитом > 0). Считается заранее,
+        # чтобы вписать в ту же строку, что и тариф/устройства, через запятую.
+        gb_part = ""
         if has_whitelist:
             async with pool.acquire() as conn:
                 wl_row = await conn.fetchrow(
@@ -843,7 +840,12 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 records   = await fetch_whitelist_daily_records(days_back=40)
                 used_gb   = sum_whitelist_bytes_for_user(records, user_id, wl_row["period_start"]) / 1024 ** 3
                 remaining = max(0.0, wl_row["gb_limit"] - used_gb)
-                lines.append(f"Осталось трафика на белых списках: {remaining:.1f} ГБ из {wl_row['gb_limit']}")
+                gb_part = f", осталось трафика на белых списках: {remaining:.1f}/{wl_row['gb_limit']} ГБ"
+
+        lines += [
+            f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}, устройств: {hwid}{gb_part}",
+            f"{EMOJI_ACTIVE_UNTIL} Активна до: {date_str}",
+        ]
 
         if sub_url:
             lines += ["", f"{EMOJI_SUB_LINK} Ссылка на подписку:", hcode(sub_url)]
@@ -1138,6 +1140,23 @@ async def trial_buy_cb(cb: CallbackQuery):
     if used:
         await cb.answer("Пробная подписка уже использована.", show_alert=True)
         return
+    await cb.message.edit_text(
+        f"{hbold(TRIAL['name'])}\n{TRIAL['desc']}\n\nЦена: {TRIAL['price']} руб.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Оформить", callback_data="trial_confirm")],
+            [InlineKeyboardButton(text="Назад", callback_data="back")],
+        ]),
+    )
+
+@router.callback_query(F.data == "trial_confirm")
+async def trial_confirm_cb(cb: CallbackQuery):
+    await cb.answer()
+    async with pool.acquire() as conn:
+        used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", cb.from_user.id)
+    if used:
+        await cb.answer("Пробная подписка уже использована.", show_alert=True)
+        return
     await _create_payment_page(
         cb, kind="trial", item_name=TRIAL["name"], price=TRIAL["price"], days=TRIAL["days"],
         hwid=TRIAL["hwid"], squad=TRIAL["squad"], whitelist_gb=TRIAL["whitelist_gb"], is_trial=True,
@@ -1152,8 +1171,8 @@ async def buy_open_cb(cb: CallbackQuery):
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
     text = (
-        f"{EMOJI_PLAN_VPN} {hbold(vpn['name'])}\n{vpn['desc']}\nОт {vpn['price_month']} руб./мес.\n\n"
-        f"{EMOJI_PLAN_BYPASS} {hbold(bypass['name'])}\n{bypass['desc']}\nОт {bypass['price_month']} руб./мес.\n\n"
+        f"{EMOJI_PLAN_VPN} {hbold(vpn['name'])}\n{vpn['desc']}\n{vpn['price_month']} руб./мес.\n\n"
+        f"{EMOJI_PLAN_BYPASS} {hbold(bypass['name'])}\n{bypass['desc']}\n{bypass['price_month']} руб./мес.\n\n"
         f"Дополнительные устройства и трафик для обхода белых списков "
         f"докупаются в главном меню после покупки тарифа."
     )
