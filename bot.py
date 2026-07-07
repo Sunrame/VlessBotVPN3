@@ -75,6 +75,36 @@ def msk_now() -> datetime:
 def premium_emoji(emoji_id: str, fallback: str) -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
 
+def btn(text: str, *, emoji_id: str | None = None, style: str | None = None, **kwargs) -> InlineKeyboardButton:
+    """
+    Обёртка над InlineKeyboardButton с premium-иконкой (icon_custom_emoji_id) и/или
+    цветом (style: 'primary'/'success'/'danger') — Bot API 9.4, требует aiogram>=3.29.0.
+    icon_custom_emoji_id доступен только если у аккаунта бота есть Telegram Premium
+    либо куплен доп. юзернейм на Fragment.
+    """
+    return InlineKeyboardButton(text=text, icon_custom_emoji_id=emoji_id, style=style, **kwargs)
+
+# ─────────────────────────────────────────────
+#  ID КАСТОМНЫХ EMOJI ДЛЯ КНОПОК (icon_custom_emoji_id)
+# ─────────────────────────────────────────────
+BTN_ICON_CHANNEL_SUB     = "5424818078833715060"  # Подписаться на канал / Канал с инструкциями
+BTN_ICON_CHECK_SUB       = "5206607081334906820"  # Я подписался / Проверить оплату
+BTN_ICON_TRIAL           = "5280615440928758599"  # Пробная подписка
+BTN_ICON_TOS             = "5197269100878907942"  # Пользовательское соглашение
+BTN_ICON_SUPPORT         = "5443038326535759644"  # Тех.Поддержка
+BTN_ICON_PRIVACY         = "5251203410396458957"  # Политика конфиденциальности
+BTN_ICON_PAY             = "5445353829304387411"  # Оплатить
+BTN_ICON_BUY_VPN         = "5312361253610475399"  # Купить VPN
+BTN_ICON_PROMO           = "5465169893580086142"  # Промокод
+BTN_ICON_INFO            = "5334544901428229844"  # О сервисе
+BTN_ICON_EARN            = "5287231198098117669"  # Заработать
+BTN_ICON_PLAN_BYPASS     = "5447410659077661506"  # VPN с обходом белых списков
+BTN_ICON_PLAN_VPN        = "5427168083074628963"  # VPN
+BTN_ICON_ADMIN           = "5231200819986047254"  # Панель (админ)
+BTN_ICON_DEV_TOPUP       = "5407025283456835913"  # Добавить устройства
+BTN_ICON_GB_TOPUP        = "5283080528818360566"  # Докупить трафик
+BTN_ICON_UPGRADE         = "5449683594425410231"  # Улучшить тариф
+
 EMOJI_TRUBAVPN      = premium_emoji("5224450179368767019", "\U0001f310")  # "TrubaVPN" в приветствии
 EMOJI_INFO          = premium_emoji("5334544901428229844", "\u2728")   # заголовок "О сервисе"
 EMOJI_EARN          = premium_emoji("5287231198098117669", "\U0001f4b0")  # заголовок "Заработать"
@@ -691,8 +721,8 @@ def calc_upgrade_price(extra_devices: int) -> int:
 # ─────────────────────────────────────────────
 def sub_required_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Подписаться на канал", url=CHANNEL_LINK)],
-        [InlineKeyboardButton(text="Я подписался", callback_data="check_sub")],
+        [btn("Подписаться на канал", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
+        [btn("Я подписался", emoji_id=BTN_ICON_CHECK_SUB, callback_data="check_sub")],
     ])
 
 def back_kb():
@@ -808,20 +838,25 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     # если он уже использован.
     if plan not in PLANS:
         if not trial_used:
-            rows.append([InlineKeyboardButton(text="Пробная подписка", callback_data="trial_buy")])
-        rows.append([InlineKeyboardButton(text="\U0001f7e2 Купить VPN", callback_data="buy_open")])
+            rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
+                             callback_data="trial_buy")])
+        rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN, style="success",
+                         callback_data="buy_open")])
     else:
-        rows.append([InlineKeyboardButton(text="Добавить устройства", callback_data="dev_add")])
+        rows.append([btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
+                         callback_data="dev_add")])
         if plan == "vpn":
-            rows.append([InlineKeyboardButton(text="Улучшить тариф", callback_data="plan_upgrade")])
+            rows.append([btn("Улучшить тариф", emoji_id=BTN_ICON_UPGRADE,
+                             callback_data="plan_upgrade")])
         elif plan == "vpn_bypass":
-            rows.append([InlineKeyboardButton(text="Докупить трафик (белые списки)", callback_data="wl_topup")])
+            rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
+                             callback_data="wl_topup")])
 
-    rows.append([InlineKeyboardButton(text="Заработать", callback_data="earn_open")])
-    rows.append([InlineKeyboardButton(text="Промокод", callback_data="promo_enter")])
-    rows.append([InlineKeyboardButton(text="О сервисе", callback_data="info_tab")])
+    rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
+    rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
+    rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
     if user_id in ADMIN_IDS:
-        rows.append([InlineKeyboardButton(text="Панель", callback_data="admin_panel")])
+        rows.append([btn("Панель", emoji_id=BTN_ICON_ADMIN, callback_data="admin_panel")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
@@ -880,8 +915,8 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
         return None, None
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Оплатить", url=payment.confirmation.confirmation_url)],
-        [InlineKeyboardButton(text="Проверить оплату", callback_data=f"paycheck_{payment.id}")],
+        [btn("Оплатить", emoji_id=BTN_ICON_PAY, style="success", url=payment.confirmation.confirmation_url)],
+        [btn("Проверить оплату", emoji_id=BTN_ICON_CHECK_SUB, callback_data=f"paycheck_{payment.id}")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
     return payment, kb
@@ -1086,8 +1121,8 @@ async def buy_open_cb(cb: CallbackQuery):
         f"докупаются в главном меню после покупки тарифа."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=vpn["name"], callback_data="buyplan_vpn")],
-        [InlineKeyboardButton(text=bypass["name"], callback_data="buyplan_vpn_bypass")],
+        [btn(vpn["name"], emoji_id=BTN_ICON_PLAN_VPN, callback_data="buyplan_vpn")],
+        [btn(bypass["name"], emoji_id=BTN_ICON_PLAN_BYPASS, callback_data="buyplan_vpn_bypass")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1389,12 +1424,12 @@ async def info_tab(cb: CallbackQuery):
         f"{EMOJI_INFO} О сервисе",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Канал с инструкциями", url=CHANNEL_LINK)],
-            [InlineKeyboardButton(text="Пользовательское соглашение",
-                                  url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
-            [InlineKeyboardButton(text="Политика конфиденциальности",
-                                  url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
-            [InlineKeyboardButton(text="Тех.Поддержка", url=SUPPORT_URL)],
+            [btn("Канал с инструкциями", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
+            [btn("Пользовательское соглашение", emoji_id=BTN_ICON_TOS,
+                url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
+            [btn("Политика конфиденциальности", emoji_id=BTN_ICON_PRIVACY,
+                url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+            [btn("Тех.Поддержка", emoji_id=BTN_ICON_SUPPORT, url=SUPPORT_URL)],
             [InlineKeyboardButton(text="Назад", callback_data="back")],
         ]),
     )
