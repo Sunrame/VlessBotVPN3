@@ -211,6 +211,11 @@ class BroadcastState(StatesGroup):
 class AdminPromoState(StatesGroup):
     waiting_input = State()
 
+class PromoGenState(StatesGroup):
+    waiting_days       = State()
+    waiting_uses_custom = State()
+    waiting_code       = State()
+
 class OrderPromoState(StatesGroup):
     waiting_code = State()
 
@@ -798,6 +803,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         date_str = fmt_dt(expire, "%d.%m.%Y")
         hwid     = remna.get("hwidDeviceLimit", 1)
         sub_url  = format_sub_url(remna)
+        current_squads = _squad_uuids(remna.get("activeInternalSquads"))
+        has_whitelist  = SQUAD_UUID_WHITELIST in current_squads
 
         # Тариф определяется ЖИВОЙ проверкой сквадов на каждый показ профиля
         # (не по значению в БД) — так текст и кнопки всегда соответствуют
@@ -809,8 +816,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             plan_name  = "Пробная подписка"
             live_plan  = "trial"
         else:
-            current_squads = _squad_uuids(remna.get("activeInternalSquads"))
-            live_plan = "vpn_bypass" if SQUAD_UUID_WHITELIST in current_squads else "vpn"
+            live_plan = "vpn_bypass" if has_whitelist else "vpn"
             plan_name = PLANS[live_plan]["name"]
 
         if plan != live_plan:
@@ -825,6 +831,20 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}, устройств: {hwid}",
             f"{EMOJI_ACTIVE_UNTIL} Активна до: {date_str}",
         ]
+
+        # Остаток трафика на белых списках — только если реально отслеживается
+        # (есть строка в whitelist_limits с лимитом > 0).
+        if has_whitelist:
+            async with pool.acquire() as conn:
+                wl_row = await conn.fetchrow(
+                    "SELECT gb_limit, period_start FROM whitelist_limits WHERE user_id=$1", user_id
+                )
+            if wl_row and wl_row["gb_limit"] > 0:
+                records   = await fetch_whitelist_daily_records(days_back=40)
+                used_gb   = sum_whitelist_bytes_for_user(records, user_id, wl_row["period_start"]) / 1024 ** 3
+                remaining = max(0.0, wl_row["gb_limit"] - used_gb)
+                lines.append(f"Осталось трафика на белых списках: {remaining:.1f} ГБ из {wl_row['gb_limit']}")
+
         if sub_url:
             lines += ["", f"{EMOJI_SUB_LINK} Ссылка на подписку:", hcode(sub_url)]
     else:
@@ -844,7 +864,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if not trial_used:
             rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
                              callback_data="trial_buy")])
-        rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN, style="success",
+        rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                          callback_data="buy_open")])
     else:
         rows.append([btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
@@ -2151,10 +2171,162 @@ async def admin_promos_cb(cb: CallbackQuery):
         for r in rows:
             days_str = f"{r['days']} дн." if r["days"] else "-"
             lines.append(f"{r['code']} — {days_str}, {r['uses']} исп. ({r['promo_type']})")
-    lines += ["", "Команды: /add_promo, /genpromo, /list_promos"]
     await cb.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Создать промокод", callback_data="promogen_start")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
+
+# ─────────────────────────────────────────────
+#  ГЕНЕРАЦИЯ ПРОМОКОДА КНОПКАМИ (без текстовых команд)
+#
+#  Шаги: тип → (если "бесплатный тариф" — ещё и какой план) → дни (текстом,
+#  число нельзя выбрать кнопкой) → кол-во использований (пресеты кнопкой или
+#  своё число) → код (текстом, либо 0 для автогенерации) → готово.
+#  Тип "скидка" не предлагается — в текущей версии бота скидочные промокоды
+#  нигде не обрабатываются при активации, создавать их значит создавать
+#  нерабочую функциональность.
+# ─────────────────────────────────────────────
+async def _create_promo(code: str, days: int, uses: int, promo_type: str, tariff_key: str | None = None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO promos (code,days,uses,promo_type,tariff_key,discount_percent) "
+            "VALUES ($1,$2,$3,$4,$5,0) "
+            "ON CONFLICT (code) DO UPDATE SET days=$2,uses=$3,promo_type=$4,tariff_key=$5,discount_percent=0",
+            code, days, uses, promo_type, tariff_key,
+        )
+
+@router.callback_query(F.data == "promogen_start")
+async def promogen_start_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await cb.message.edit_text(
+        "Создание промокода\n\nЧто должен давать промокод?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Дни к текущей подписке", callback_data="promogen_type_days")],
+            [InlineKeyboardButton(text="Бесплатный тариф", callback_data="promogen_type_free")],
+            [InlineKeyboardButton(text="Назад", callback_data="admin_promos")],
+        ]),
+    )
+
+@router.callback_query(F.data == "promogen_type_days")
+async def promogen_type_days_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await state.update_data(promo_type="days", tariff_key=None)
+    await state.set_state(PromoGenState.waiting_days)
+    await cb.message.edit_text(
+        "Сколько дней добавляет промокод? Введите число:", reply_markup=cancel_kb()
+    )
+
+@router.callback_query(F.data == "promogen_type_free")
+async def promogen_type_free_cb(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    await cb.message.edit_text(
+        "Какой тариф выдавать бесплатно?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="promogen_freeplan_vpn")],
+            [InlineKeyboardButton(text=PLANS["vpn_bypass"]["name"], callback_data="promogen_freeplan_vpn_bypass")],
+            [InlineKeyboardButton(text="Пользователь выбирает сам", callback_data="promogen_freeplan_choice")],
+            [InlineKeyboardButton(text="Назад", callback_data="promogen_start")],
+        ]),
+    )
+
+@router.callback_query(F.data.startswith("promogen_freeplan_"))
+async def promogen_freeplan_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    choice = cb.data.removeprefix("promogen_freeplan_")
+    if choice == "choice":
+        await state.update_data(promo_type="free_choice", tariff_key=None)
+    else:
+        await state.update_data(promo_type="free_tariff", tariff_key=choice)
+    await state.set_state(PromoGenState.waiting_days)
+    await cb.message.edit_text(
+        "Сколько дней бесплатного доступа? Введите число:", reply_markup=cancel_kb()
+    )
+
+def _uses_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1", callback_data="promogen_uses_1"),
+         InlineKeyboardButton(text="5", callback_data="promogen_uses_5"),
+         InlineKeyboardButton(text="10", callback_data="promogen_uses_10"),
+         InlineKeyboardButton(text="50", callback_data="promogen_uses_50")],
+        [InlineKeyboardButton(text="Своё число", callback_data="promogen_uses_custom")],
+        [InlineKeyboardButton(text="Отмена", callback_data="cancel_to_profile")],
+    ])
+
+@router.message(PromoGenState.waiting_days)
+async def promogen_days_handler(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Введите целое положительное число.", reply_markup=cancel_kb())
+        return
+    days = int(message.text.strip())
+    if days <= 0:
+        await message.answer("Число должно быть больше 0.", reply_markup=cancel_kb())
+        return
+    await state.update_data(days=days)
+    await message.answer("Сколько раз можно использовать промокод?", reply_markup=_uses_kb())
+
+@router.callback_query(F.data.startswith("promogen_uses_"))
+async def promogen_uses_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    choice = cb.data.removeprefix("promogen_uses_")
+    if choice == "custom":
+        await state.set_state(PromoGenState.waiting_uses_custom)
+        await cb.message.edit_text("Введите число использований:", reply_markup=cancel_kb())
+        return
+    await state.update_data(uses=int(choice))
+    await state.set_state(PromoGenState.waiting_code)
+    await cb.message.edit_text(
+        "Введите код промокода (латиница/цифры), либо отправьте 0 для автогенерации:",
+        reply_markup=cancel_kb(),
+    )
+
+@router.message(PromoGenState.waiting_uses_custom)
+async def promogen_uses_custom_handler(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Введите целое положительное число.", reply_markup=cancel_kb())
+        return
+    uses = int(message.text.strip())
+    if uses <= 0:
+        await message.answer("Число должно быть больше 0.", reply_markup=cancel_kb())
+        return
+    await state.update_data(uses=uses)
+    await state.set_state(PromoGenState.waiting_code)
+    await message.answer(
+        "Введите код промокода (латиница/цифры), либо отправьте 0 для автогенерации:",
+        reply_markup=cancel_kb(),
+    )
+
+@router.message(PromoGenState.waiting_code)
+async def promogen_code_handler(message: types.Message, state: FSMContext):
+    raw = message.text.strip()
+    code = uuid.uuid4().hex[:8].upper() if raw == "0" else raw.upper()
+    data = await state.get_data()
+    await state.clear()
+    await _create_promo(
+        code=code, days=data["days"], uses=data["uses"],
+        promo_type=data["promo_type"], tariff_key=data.get("tariff_key"),
+    )
+    type_label = {
+        "days": "дни к подписке",
+        "free_tariff": PLANS.get(data.get("tariff_key"), {}).get("name", "бесплатный тариф"),
+        "free_choice": "бесплатный тариф на выбор",
+    }.get(data["promo_type"], data["promo_type"])
+    await message.answer(
+        f"Промокод {hcode(code)} создан.\nТип: {type_label}\nДней: {data['days']} · Исп.: {data['uses']}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="К списку промокодов", callback_data="admin_promos")],
+        ]),
+    )
 
 # ─────────────────────────────────────────────
 #  РАССЫЛКА
