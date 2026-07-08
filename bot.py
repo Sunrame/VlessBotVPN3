@@ -170,7 +170,7 @@ TRIAL = {
     "price":        10,
     "days":         1,
     "hwid":         1,
-    "squad":        SQUAD_UUID_WHITELIST,
+    "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
     "whitelist_gb": 3,
     "desc": (
         "24 часа доступа ко всем серверам. Трафик VPN не ограничен, трафик "
@@ -184,7 +184,7 @@ PLANS = {
         "name":         "VPN",
         "price_month":  99,
         "device_price": 50,
-        "squad":        SQUAD_UUID_BASIC,
+        "squad":        [SQUAD_UUID_BASIC],
         "whitelist_gb": 0,
         "desc": "Более трёх локаций, 1 устройство, трафик не ограничен.",
     },
@@ -193,7 +193,7 @@ PLANS = {
         "name":         "VPN с обходом белых списков",
         "price_month":  149,
         "device_price": 70,
-        "squad":        SQUAD_UUID_WHITELIST,
+        "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
         "whitelist_gb": 20,
         "desc": (
             "Более трёх локаций, 1 устройство, трафик не ограничен. "
@@ -441,7 +441,16 @@ async def remna_get_user(user_id: int) -> dict | None:
         log.error("[Remna] get_user: %s", e)
         return None
 
-async def remna_create_user(user_id: int, days: int, hwid: int = 1, squad_uuid: str = SQUAD_UUID_BASIC) -> dict | None:
+def _normalize_squads(squad_uuid) -> list[str]:
+    """squad_uuid может быть одной строкой (старый формат) или списком строк
+    (нужно для vpn_bypass/trial — им нужен доступ сразу к 2 скваdам). Всегда
+    возвращает список для activeInternalSquads."""
+    if isinstance(squad_uuid, list):
+        return squad_uuid
+    return [squad_uuid]
+
+async def remna_create_user(user_id: int, days: int, hwid: int = 1,
+                             squad_uuid: str | list[str] = SQUAD_UUID_BASIC) -> dict | None:
     payload = {
         "username":             remna_username(user_id),
         "trafficLimitBytes":    0,
@@ -449,7 +458,7 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1, squad_uuid: 
         "expireAt":             _expire_at(days),
         "hwidDeviceLimit":      hwid,
         "telegramId":           user_id,
-        "activeInternalSquads": [squad_uuid],
+        "activeInternalSquads": _normalize_squads(squad_uuid),
     }
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -466,7 +475,7 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1, squad_uuid: 
         return None
 
 async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
-                             squad_uuid: str | None = None) -> dict | None:
+                             squad_uuid: str | list[str] | None = None) -> dict | None:
     user = await remna_get_user(user_id)
     if not user:
         return await remna_create_user(user_id, days, hwid or 1, squad_uuid or SQUAD_UUID_BASIC)
@@ -478,7 +487,7 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
 
     payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "status": "ACTIVE"}
     if squad_uuid is not None:
-        payload["activeInternalSquads"] = [squad_uuid]
+        payload["activeInternalSquads"] = _normalize_squads(squad_uuid)
     if hwid is not None:
         payload["hwidDeviceLimit"] = hwid
 
@@ -628,10 +637,12 @@ def sum_whitelist_bytes_for_user(records: list[dict], user_id: int, since_ts: in
     return sum(r["bytes"] for r in records if r["username"] == uname and r["ts"] >= since_ts)
 
 async def activate_subscription(user_id: int, days: int, hwid: int = 1,
-                                 squad_uuid: str | None = None,
+                                 squad_uuid: str | list[str] | None = None,
                                  whitelist_gb: int = 0) -> dict | None:
     """
     squad_uuid=None — не менять текущий сквад (для admin-действий без явного тарифа).
+    squad_uuid может быть одной строкой или списком (vpn_bypass/trial нужны сразу
+    и Basic, и White List сквады одновременно, а не замена одного на другой).
     whitelist_gb>0 — заводим/обновляем отслеживание лимита белых списков.
     """
     user = await remna_get_user(user_id)
@@ -653,7 +664,7 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1,
                     "ON CONFLICT (user_id) DO UPDATE SET gb_limit=$2, period_start=$3, cut_off=FALSE",
                     user_id, whitelist_gb, int(time.time()),
                 )
-            elif squad_uuid is not None and squad_uuid != SQUAD_UUID_WHITELIST:
+            elif squad_uuid is not None and SQUAD_UUID_WHITELIST not in _normalize_squads(squad_uuid):
                 await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
     return result
 
@@ -965,7 +976,7 @@ async def profile_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
-                                squad: str | None = None, whitelist_gb: int = 0,
+                                squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
                                 qty: int = 0):
     """
@@ -985,7 +996,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                 "kind":         kind,
                 "days":         str(days),
                 "hwid":         str(hwid) if hwid is not None else "",
-                "squad":        squad or "",
+                "squad":        ",".join(squad) if isinstance(squad, list) else (squad or ""),
                 "whitelist_gb": str(whitelist_gb),
                 "plan_key":     plan_key or "",
                 "price":        str(price),
@@ -1007,7 +1018,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
 
 async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
-                                squad: str | None = None, whitelist_gb: int = 0,
+                                squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
                                 qty: int = 0, display_prefix: str = "", extra_desc: str = ""):
     """display_prefix — необязательный HTML-префикс (например premium-эмодзи)
@@ -1030,7 +1041,7 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
 
 async def _create_payment_page_from_message(message: types.Message, *, kind: str, item_name: str,
                                              price: int, days: int = 0, hwid: int | None = None,
-                                             squad: str | None = None, whitelist_gb: int = 0,
+                                             squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                              plan_key: str | None = None, is_trial: bool = False,
                                              qty: int = 0, display_prefix: str = ""):
     """То же самое, что _create_payment_page, но когда вызов идёт из ответа на
@@ -1068,7 +1079,8 @@ async def check_payment_cb(cb: CallbackQuery):
     days        = int(md.get("days", 0) or 0)
     hwid_str    = md.get("hwid", "")
     hwid        = int(hwid_str) if hwid_str.isdigit() else None
-    squad       = md.get("squad") or None
+    squad_raw   = md.get("squad") or None
+    squad       = squad_raw.split(",") if squad_raw and "," in squad_raw else squad_raw
     whitelist_gb= int(md.get("whitelist_gb", 0) or 0)
     plan_key    = md.get("plan_key") or None
     price       = float(md.get("price", 0))
@@ -1138,7 +1150,7 @@ async def check_payment_cb(cb: CallbackQuery):
             if not remna:
                 await cb.answer("Пользователь не найден в панели.", show_alert=True)
                 return
-            result_user = await remna_update_user(remna["uuid"], {"activeInternalSquads": [SQUAD_UUID_WHITELIST]})
+            result_user = await remna_update_user(remna["uuid"], {"activeInternalSquads": [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]})
             if not result_user:
                 await cb.answer("Ошибка обновления тарифа.", show_alert=True)
                 return
@@ -2754,11 +2766,11 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         squad_uuid = SQUAD_UUID_BASIC
         new_plan   = "vpn"
     elif choice == "vpn_bypass":
-        squad_uuid   = SQUAD_UUID_WHITELIST
+        squad_uuid   = [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]
         whitelist_gb = PLANS["vpn_bypass"]["whitelist_gb"]
         new_plan     = "vpn_bypass"
     elif choice == "trial":
-        squad_uuid   = SQUAD_UUID_WHITELIST
+        squad_uuid   = [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]
         whitelist_gb = TRIAL["whitelist_gb"]
         new_plan     = "trial"
     # choice == "none": оставляем squad_uuid=None, new_plan=None (ничего не трогаем)
