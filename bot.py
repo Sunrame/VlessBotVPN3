@@ -79,6 +79,9 @@ SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 # Например: http://89.34.219.134:5001  —  если пусто, кнопка кабинета не показывается.
 SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
 
+# Сколько минут действует одноразовый код для входа в личный кабинет.
+LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
+
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
 # Основной сквад (все сервера, кроме белых списков)
@@ -323,6 +326,24 @@ async def init_db():
                 user_id    BIGINT PRIMARY KEY,
                 code       TEXT UNIQUE NOT NULL,
                 created_at BIGINT DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cabinet_login_codes (
+                user_id    BIGINT PRIMARY KEY,
+                code       TEXT NOT NULL,
+                expires_at BIGINT DEFAULT 0,
+                attempts   INTEGER DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id         BIGSERIAL PRIMARY KEY,
+                user_id    BIGINT,
+                kind       TEXT,
+                text       TEXT,
+                created_at BIGINT DEFAULT 0,
+                seen       BOOLEAN DEFAULT FALSE
             )
         """)
         await conn.execute("""
@@ -914,6 +935,53 @@ async def get_cabinet_url(user_id: int) -> str | None:
         logging.error("get_cabinet_url: %s", e)
     return None
 
+# Алфавит для кода входа (без похожих символов I, O, 0, 1).
+_LOGIN_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+_LOGIN_DIGITS  = "23456789"
+
+def _gen_login_code() -> str:
+    """Код вида XXXX-YYYY: в каждой половине ровно 2 буквы и 2 цифры."""
+    rng = secrets.SystemRandom()
+    def half() -> str:
+        chars = [secrets.choice(_LOGIN_LETTERS) for _ in range(2)] + \
+                [secrets.choice(_LOGIN_DIGITS) for _ in range(2)]
+        rng.shuffle(chars)
+        return "".join(chars)
+    return f"{half()}-{half()}"
+
+@router.callback_query(F.data == "cabinet_login")
+async def cabinet_login_cb(cb: CallbackQuery):
+    await cb.answer()
+    user_id = cb.from_user.id
+    cab_url = await get_cabinet_url(user_id)
+    if not cab_url:
+        await cb.answer("Личный кабинет временно недоступен.", show_alert=True)
+        return
+    code = _gen_login_code()
+    expires = int(time.time()) + LOGIN_CODE_TTL_MIN * 60
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO cabinet_login_codes (user_id, code, expires_at, attempts) VALUES ($1,$2,$3,0) "
+                "ON CONFLICT (user_id) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at, attempts=0",
+                user_id, code, expires,
+            )
+    except Exception as e:
+        logging.error("cabinet_login_cb: %s", e)
+        await cb.answer("Ошибка, попробуйте позже.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Открыть личный кабинет", emoji_id="5841530748082851696", url=cab_url)]
+    ])
+    await cb.message.answer(
+        "🔐 <b>Вход в личный кабинет</b>\n\n"
+        f"Ваш код для входа: <code>{code}</code>\n\n"
+        "1) Нажмите кнопку ниже, чтобы открыть сайт.\n"
+        "2) Введите этот код на сайте.\n\n"
+        f"⏱ Код действует {LOGIN_CODE_TTL_MIN} мин. После входа сессия активна 1 час.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """
     Профиль = единственный домашний экран. Показывает вариант подписки,
@@ -1019,7 +1087,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     cab_url = await get_cabinet_url(user_id)
     if cab_url:
-        rows.append([btn("Личный кабинет", emoji_id="5841530748082851696", url=cab_url)])
+        rows.append([btn("Личный кабинет", emoji_id="5841530748082851696", callback_data="cabinet_login")])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
@@ -1465,7 +1533,7 @@ async def wl_topup_cancel(message: types.Message, state: FSMContext):
 @router.message(WhitelistTopupState.waiting_gb)
 async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().isdigit():
-        await message.answer("Введите целое положительное число.")
+        await message.answer("Введите целое положите  ьное число.")
         return
     gb = int(message.text.strip())
     if gb <= 0:
@@ -2797,7 +2865,7 @@ async def admin_payout(message: types.Message, command: CommandObject):
         pass
 
 # ─────────────────────────────────────────────
-#  ОТЧЁТ (кнопка панели — отправить сразу)
+#  ОТЧЁТ (  нопка панели — отправить сразу)
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_report")
 async def admin_report_cb(cb: CallbackQuery):
