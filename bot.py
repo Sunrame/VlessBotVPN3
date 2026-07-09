@@ -1,5 +1,7 @@
 import os
 import uuid
+import string
+import secrets
 import logging
 import time
 import asyncio
@@ -60,6 +62,11 @@ CHANNEL_ID   = os.environ.get("CHANNEL_ID", "@Truba_VPN")
 # Юзернейм поддержки — кнопка "Тех.Поддержка" ведёт в личку с этим аккаунтом
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
 SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
+
+# Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
+# задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
+SITE_URL           = os.environ.get("SITE_URL", "").rstrip("/")
+LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
@@ -359,6 +366,31 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS processed_payments (
                 payment_id   TEXT PRIMARY KEY,
                 processed_at BIGINT DEFAULT 0
+            )
+        """)
+        # Токены личного кабинета на сайте (общий с веб-панелью механизм входа).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cabinet_tokens (
+                user_id    BIGINT PRIMARY KEY,
+                code       TEXT UNIQUE NOT NULL,
+                created_at BIGINT DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cabinet_login_codes (
+                user_id    BIGINT PRIMARY KEY,
+                code       TEXT NOT NULL,
+                expires_at BIGINT DEFAULT 0,
+                attempts   INTEGER DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id         BIGSERIAL PRIMARY KEY,
+                user_id    BIGINT,
+                kind       TEXT,
+                text       TEXT,
+                created_at BIGINT DEFAULT 0
             )
         """)
         # Миграции на случай старой БД
@@ -934,6 +966,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
 
+    rows.append([btn("Личный кабинет", emoji_id="5282843764451195532", callback_data="cabinet_login")])
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
     rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
@@ -942,6 +975,84 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
+
+# ─────────────────────────────────────────────
+#  ЛИЧНЫЙ КАБИНЕТ (веб-панель, отдельная от бота)
+# ─────────────────────────────────────────────
+_CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
+
+async def get_cabinet_url(user_id: int) -> str | None:
+    """Ссылка на личный кабинет пользователя на сайте.
+    Генерирует (или берёт существующий) 16-символьный код в cabinet_tokens.
+    Если SITE_URL не задан — возвращает None (при нажатии кнопки покажет
+    'временно недоступен', сама кнопка при этом всё равно показывается)."""
+    if not SITE_URL:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
+            if row and row["code"]:
+                return f"{SITE_URL}/cab/{row['code']}"
+            for _ in range(6):
+                code = "".join(secrets.choice(_CAB_ALPHABET) for _ in range(16))
+                await conn.execute(
+                    "INSERT INTO cabinet_tokens (user_id, code, created_at) VALUES ($1,$2,$3) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    user_id, code, int(time.time()),
+                )
+                row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
+                if row and row["code"]:
+                    return f"{SITE_URL}/cab/{row['code']}"
+    except Exception as e:
+        log.error("get_cabinet_url: %s", e)
+    return None
+
+# Алфавит для кода входа (без похожих символов I, O, 0, 1).
+_LOGIN_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+_LOGIN_DIGITS  = "23456789"
+
+def _gen_login_code() -> str:
+    """Код вида XXXX-YYYY: в каждой половине ровно 2 буквы и 2 цифры."""
+    rng = secrets.SystemRandom()
+    def half() -> str:
+        chars = [secrets.choice(_LOGIN_LETTERS) for _ in range(2)] + \
+                [secrets.choice(_LOGIN_DIGITS) for _ in range(2)]
+        rng.shuffle(chars)
+        return "".join(chars)
+    return f"{half()}-{half()}"
+
+@router.callback_query(F.data == "cabinet_login")
+async def cabinet_login_cb(cb: CallbackQuery):
+    await cb.answer()
+    user_id = cb.from_user.id
+    cab_url = await get_cabinet_url(user_id)
+    if not cab_url:
+        await cb.answer("Личный кабинет временно недоступен.", show_alert=True)
+        return
+    code = _gen_login_code()
+    expires = int(time.time()) + LOGIN_CODE_TTL_MIN * 60
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO cabinet_login_codes (user_id, code, expires_at, attempts) VALUES ($1,$2,$3,0) "
+                "ON CONFLICT (user_id) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at, attempts=0",
+                user_id, code, expires,
+            )
+    except Exception as e:
+        log.error("cabinet_login_cb: %s", e)
+        await cb.answer("Ошибка, попробуйте позже.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Открыть личный кабинет", emoji_id="5282843764451195532", url=cab_url)]
+    ])
+    await cb.message.answer(
+        f"{premium_emoji('5282843764451195532', '🖥')} Вход в личный кабинет\n\n"
+        f"Ваш код для входа: {hcode(code)}\n\n"
+        "1) Нажмите кнопку ниже, чтобы открыть сайт.\n"
+        "2) Введите этот код на сайте.\n\n"
+        f"Код действует {LOGIN_CODE_TTL_MIN} мин. После входа сессия активна 1 час.",
+        parse_mode="HTML", reply_markup=kb,
+    )
 
 async def _show_home(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
