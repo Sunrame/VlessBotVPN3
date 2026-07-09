@@ -1,7 +1,5 @@
 import os
 import uuid
-import secrets
-import string
 import logging
 import time
 import asyncio
@@ -32,23 +30,11 @@ REMNAWAVE_TOKEN  = os.environ["REMNAWAVE_TOKEN"]
 REMNAWAVE_COOKIE = os.environ["REMNAWAVE_COOKIE"]
 SUB_BASE_URL     = os.environ["SUB_BASE_URL"].rstrip("/")
 
-# Главные админы из окружения — сколько угодно.
-# Поддерживаются два формата (можно смешивать):
-#   1) ADMIN_IDS=111,222,333 — список через запятую/пробел/;
-#   2) ADMIN_ID_1, ADMIN_ID_2, ADMIN_ID_3, ... — по одному ID (сколько угодно)
-import re as _re_admin
 ADMIN_IDS: list[int] = []
-
-def _add_admin_id(_raw: str) -> None:
-    _raw = (_raw or "").strip()
-    if _raw.isdigit() and int(_raw) not in ADMIN_IDS:
-        ADMIN_IDS.append(int(_raw))
-
-for _part in _re_admin.split(r"[\s,;]+", os.environ.get("ADMIN_IDS", "")):
-    _add_admin_id(_part)
-for _key, _val in os.environ.items():
-    if _re_admin.fullmatch(r"ADMIN_ID_\d+", _key):
-        _add_admin_id(_val)
+for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
+    _val = os.environ.get(_key, "")
+    if _val.isdigit():
+        ADMIN_IDS.append(int(_val))
 
 # Динамически добавленные админы (через панель) — хранятся в БД, кэшируются
 # в память при старте и при каждом добавлении/удалении, чтобы не дёргать БД
@@ -75,13 +61,6 @@ CHANNEL_ID   = os.environ.get("CHANNEL_ID", "@Truba_VPN")
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
 SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 
-# Публичный адрес пользовательского сайта (личный кабинет).
-# Например: http://89.34.219.134:5001  —  если пусто, кнопка кабинета не показывается.
-SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
-
-# Сколько минут действует одноразовый код для входа в личный кабинет.
-LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
-
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
 # Основной сквад (все сервера, кроме белых списков)
@@ -105,7 +84,7 @@ def msk_now() -> datetime:
 # ─────────────────────────────────────────────
 #  PREMIUM-ЭМОДЗИ
 #
-#  Работают только в тексте с  общений (parse_mode="HTML"), НЕ в кнопках —
+#  Работают только в тексте сообщений (parse_mode="HTML"), НЕ в кнопках —
 #  кнопки Telegram принимают только простой текст без форматирования.
 #  Для непремиум-пользователей и старых клиентов показывается fallback-символ
 #  вместо кастомного эмодзи. Расставлены по одному разу на смысловой момент,
@@ -191,7 +170,7 @@ TRIAL = {
     "price":        10,
     "days":         1,
     "hwid":         1,
-    "squad":        SQUAD_UUID_WHITELIST,
+    "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
     "whitelist_gb": 3,
     "desc": (
         "24 часа доступа ко всем серверам. Трафик VPN не ограничен, трафик "
@@ -205,7 +184,7 @@ PLANS = {
         "name":         "VPN",
         "price_month":  99,
         "device_price": 50,
-        "squad":        SQUAD_UUID_BASIC,
+        "squad":        [SQUAD_UUID_BASIC],
         "whitelist_gb": 0,
         "desc": "Более трёх локаций, 1 устройство, трафик не ограничен.",
     },
@@ -214,7 +193,7 @@ PLANS = {
         "name":         "VPN с обходом белых списков",
         "price_month":  149,
         "device_price": 70,
-        "squad":        SQUAD_UUID_WHITELIST,
+        "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
         "whitelist_gb": 20,
         "desc": (
             "Более трёх локаций, 1 устройство, трафик не ограничен. "
@@ -320,32 +299,6 @@ async def init_db():
                 referral_balance NUMERIC DEFAULT 0
             )
         """)
-        # Токены личного кабинета на сайте (общие с веб-панелью).
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS cabinet_tokens (
-                user_id    BIGINT PRIMARY KEY,
-                code       TEXT UNIQUE NOT NULL,
-                created_at BIGINT DEFAULT 0
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS cabinet_login_codes (
-                user_id    BIGINT PRIMARY KEY,
-                code       TEXT NOT NULL,
-                expires_at BIGINT DEFAULT 0,
-                attempts   INTEGER DEFAULT 0
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_activity (
-                id         BIGSERIAL PRIMARY KEY,
-                user_id    BIGINT,
-                kind       TEXT,
-                text       TEXT,
-                created_at BIGINT DEFAULT 0,
-                seen       BOOLEAN DEFAULT FALSE
-            )
-        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS promos (
                 code TEXT PRIMARY KEY, days INTEGER,
@@ -408,17 +361,6 @@ async def init_db():
                 processed_at BIGINT DEFAULT 0
             )
         """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS admin_logs (
-                id         SERIAL PRIMARY KEY,
-                admin_id   BIGINT,
-                admin_name TEXT,
-                action     TEXT,
-                target_id  BIGINT,
-                details    TEXT,
-                created_at BIGINT DEFAULT 0
-            )
-        """)
         # Миграции на случай старой БД
         for col in [
             "remna_uuid TEXT", "created_at BIGINT DEFAULT 0",
@@ -433,11 +375,6 @@ async def init_db():
             await conn.execute("ALTER TABLE promos ADD COLUMN discount_percent INTEGER DEFAULT 0")
         except Exception:
             pass
-        for col in ["source TEXT DEFAULT 'purchase'", "note TEXT"]:
-            try:
-                await conn.execute(f"ALTER TABLE payments ADD COLUMN {col}")
-            except Exception:
-                pass
         try:
             await conn.execute("ALTER TABLE admin_settings ADD COLUMN sale_notify BOOLEAN DEFAULT TRUE")
         except Exception:
@@ -485,29 +422,6 @@ def _squad_uuids(raw_squads) -> list[str]:
             out.append(s)
     return out
 
-def _expand_squads(squad_uuid) -> list[str]:
-    """Разворачивает выбранный сквад в итоговый список сквадов.
-
-    Доступ к белым спискам всегда должен идти ВМЕСТЕ с обычными серверами:
-    если назначается сквад белых списков, обязательно добавляем и базовый сквад,
-    чтобы у пользователя работали и обычные VPN-сервера, и сервер белых
-    списков одновременно.
-    """
-    if isinstance(squad_uuid, (list, tuple, set)):
-        ids = [s for s in squad_uuid if s]
-    elif squad_uuid:
-        ids = [squad_uuid]
-    else:
-        ids = []
-    if SQUAD_UUID_WHITELIST and SQUAD_UUID_WHITELIST in ids:
-        if SQUAD_UUID_BASIC and SQUAD_UUID_BASIC not in ids:
-            ids.insert(0, SQUAD_UUID_BASIC)
-    seen: list[str] = []
-    for s in ids:
-        if s not in seen:
-            seen.append(s)
-    return seen
-
 def _expire_at(days: int) -> str:
     dt = datetime.now(timezone.utc) + timedelta(days=days)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -527,7 +441,16 @@ async def remna_get_user(user_id: int) -> dict | None:
         log.error("[Remna] get_user: %s", e)
         return None
 
-async def remna_create_user(user_id: int, days: int, hwid: int = 1, squad_uuid: str = SQUAD_UUID_BASIC) -> dict | None:
+def _normalize_squads(squad_uuid) -> list[str]:
+    """squad_uuid может быть одной строкой (старый формат) или списком строк
+    (нужно для vpn_bypass/trial — им нужен доступ сразу к 2 скваdам). Всегда
+    возвращает список для activeInternalSquads."""
+    if isinstance(squad_uuid, list):
+        return squad_uuid
+    return [squad_uuid]
+
+async def remna_create_user(user_id: int, days: int, hwid: int = 1,
+                             squad_uuid: str | list[str] = SQUAD_UUID_BASIC) -> dict | None:
     payload = {
         "username":             remna_username(user_id),
         "trafficLimitBytes":    0,
@@ -535,7 +458,7 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1, squad_uuid: 
         "expireAt":             _expire_at(days),
         "hwidDeviceLimit":      hwid,
         "telegramId":           user_id,
-        "activeInternalSquads": _expand_squads(squad_uuid),
+        "activeInternalSquads": _normalize_squads(squad_uuid),
     }
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -552,7 +475,7 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1, squad_uuid: 
         return None
 
 async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
-                             squad_uuid: str | None = None) -> dict | None:
+                             squad_uuid: str | list[str] | None = None) -> dict | None:
     user = await remna_get_user(user_id)
     if not user:
         return await remna_create_user(user_id, days, hwid or 1, squad_uuid or SQUAD_UUID_BASIC)
@@ -564,9 +487,7 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
 
     payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "status": "ACTIVE"}
     if squad_uuid is not None:
-        squads = _expand_squads(squad_uuid)
-        if squads:
-            payload["activeInternalSquads"] = squads
+        payload["activeInternalSquads"] = _normalize_squads(squad_uuid)
     if hwid is not None:
         payload["hwidDeviceLimit"] = hwid
 
@@ -716,10 +637,12 @@ def sum_whitelist_bytes_for_user(records: list[dict], user_id: int, since_ts: in
     return sum(r["bytes"] for r in records if r["username"] == uname and r["ts"] >= since_ts)
 
 async def activate_subscription(user_id: int, days: int, hwid: int = 1,
-                                 squad_uuid: str | None = None,
+                                 squad_uuid: str | list[str] | None = None,
                                  whitelist_gb: int = 0) -> dict | None:
     """
     squad_uuid=None — не менять текущий сквад (для admin-действий без явного тарифа).
+    squad_uuid может быть одной строкой или списком (vpn_bypass/trial нужны сразу
+    и Basic, и White List сквады одновременно, а не замена одного на другой).
     whitelist_gb>0 — заводим/обновляем отслеживание лимита белых списков.
     """
     user = await remna_get_user(user_id)
@@ -741,13 +664,13 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1,
                     "ON CONFLICT (user_id) DO UPDATE SET gb_limit=$2, period_start=$3, cut_off=FALSE",
                     user_id, whitelist_gb, int(time.time()),
                 )
-            elif squad_uuid is not None and squad_uuid != SQUAD_UUID_WHITELIST:
+            elif squad_uuid is not None and SQUAD_UUID_WHITELIST not in _normalize_squads(squad_uuid):
                 await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
     return result
 
 # ─────────────────────────────────────────────
 #  ОБЩИЕ ХЕЛПЕРЫ
-# ─────────────────────────   ───────────────────
+# ─────────────────────────────────────────────
 def parse_dt(value) -> int:
     if not value:
         return 0
@@ -806,7 +729,7 @@ async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str |
                            item_name: str, price: float):
     """
     Начисление рефереру REFERRAL_PERCENT% от суммы оплаты приглашённого друга.
-    ДОПУЩЕНИЕ (не был   явно уточнено в ТЗ): начисление идёт с КАЖДОЙ оплаты
+    ДОПУЩЕНИЕ (не было явно уточнено в ТЗ): начисление идёт с КАЖДОЙ оплаты
     приглашённого, а не только с первой. Если нужно только с первой покупки —
     легко поменять на условие has_paid==0, скажи и поправлю.
     """
@@ -908,80 +831,6 @@ async def check_sub_cb(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-_CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
-
-async def get_cabinet_url(user_id: int) -> str | None:
-    """Ссылка на личный кабинет пользователя на сайте.
-    Генерирует (или берёт существующий) 16-символьный код в cabinet_tokens.
-    Если SITE_URL не задан — возвращает None (кнопка не показывается)."""
-    if not SITE_URL:
-        return None
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
-            if row and row["code"]:
-                return f"{SITE_URL}/cab/{row['code']}"
-            for _ in range(6):
-                code = "".join(secrets.choice(_CAB_ALPHABET) for _ in range(16))
-                await conn.execute(
-                    "INSERT INTO cabinet_tokens (user_id, code, created_at) VALUES ($1,$2,$3) "
-                    "ON CONFLICT (user_id) DO NOTHING",
-                    user_id, code, int(time.time()),
-                )
-                row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
-                if row and row["code"]:
-                    return f"{SITE_URL}/cab/{row['code']}"
-    except Exception as e:
-        logging.error("get_cabinet_url: %s", e)
-    return None
-
-# Алфавит для кода входа (без похожих символов I, O, 0, 1).
-_LOGIN_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
-_LOGIN_DIGITS  = "23456789"
-
-def _gen_login_code() -> str:
-    """Код вида XXXX-YYYY: в каждой половине ровно 2 буквы и 2 цифры."""
-    rng = secrets.SystemRandom()
-    def half() -> str:
-        chars = [secrets.choice(_LOGIN_LETTERS) for _ in range(2)] + \
-                [secrets.choice(_LOGIN_DIGITS) for _ in range(2)]
-        rng.shuffle(chars)
-        return "".join(chars)
-    return f"{half()}-{half()}"
-
-@router.callback_query(F.data == "cabinet_login")
-async def cabinet_login_cb(cb: CallbackQuery):
-    await cb.answer()
-    user_id = cb.from_user.id
-    cab_url = await get_cabinet_url(user_id)
-    if not cab_url:
-        await cb.answer("Личный кабинет временно недоступен.", show_alert=True)
-        return
-    code = _gen_login_code()
-    expires = int(time.time()) + LOGIN_CODE_TTL_MIN * 60
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO cabinet_login_codes (user_id, code, expires_at, attempts) VALUES ($1,$2,$3,0) "
-                "ON CONFLICT (user_id) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at, attempts=0",
-                user_id, code, expires,
-            )
-    except Exception as e:
-        logging.error("cabinet_login_cb: %s", e)
-        await cb.answer("Ошибка, попробуйте позже.", show_alert=True)
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Открыть личный кабинет", emoji_id="5841530748082851696", url=cab_url)]
-    ])
-    await cb.message.answer(
-        "🔐 <b>Вход в личный кабинет</b>\n\n"
-        f"Ваш код для входа: <code>{code}</code>\n\n"
-        "1) Нажмите кнопку ниже, чтобы открыть сайт.\n"
-        "2) Введите этот код на сайте.\n\n"
-        f"⏱ Код действует {LOGIN_CODE_TTL_MIN} мин. После входа сессия активна 1 час.",
-        parse_mode="HTML", reply_markup=kb,
-    )
-
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """
     Профиль = единственный домашний экран. Показывает вариант подписки,
@@ -1076,7 +925,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                          callback_data="buy_open")])
     else:
-        rows.append([btn("Д  бавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
+        rows.append([btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
                          callback_data="dev_add")])
         if plan == "vpn":
             rows.append([btn("Улучшить тариф", emoji_id=BTN_ICON_UPGRADE,
@@ -1084,9 +933,6 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         elif plan == "vpn_bypass":
             rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
-
-    # Кнопка кабинета показывается всегда; сам вход выдаётся по коду в cabinet_login_cb.
-    rows.append([btn("Личный кабинет", emoji_id="5841530748082851696", callback_data="cabinet_login")])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
@@ -1130,7 +976,7 @@ async def profile_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
-                                squad: str | None = None, whitelist_gb: int = 0,
+                                squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
                                 qty: int = 0):
     """
@@ -1150,7 +996,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                 "kind":         kind,
                 "days":         str(days),
                 "hwid":         str(hwid) if hwid is not None else "",
-                "squad":        squad or "",
+                "squad":        ",".join(squad) if isinstance(squad, list) else (squad or ""),
                 "whitelist_gb": str(whitelist_gb),
                 "plan_key":     plan_key or "",
                 "price":        str(price),
@@ -1172,7 +1018,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
 
 async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
-                                squad: str | None = None, whitelist_gb: int = 0,
+                                squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
                                 qty: int = 0, display_prefix: str = "", extra_desc: str = ""):
     """display_prefix — необязательный HTML-префикс (например premium-эмодзи)
@@ -1195,7 +1041,7 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
 
 async def _create_payment_page_from_message(message: types.Message, *, kind: str, item_name: str,
                                              price: int, days: int = 0, hwid: int | None = None,
-                                             squad: str | None = None, whitelist_gb: int = 0,
+                                             squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                              plan_key: str | None = None, is_trial: bool = False,
                                              qty: int = 0, display_prefix: str = ""):
     """То же самое, что _create_payment_page, но когда вызов идёт из ответа на
@@ -1233,7 +1079,8 @@ async def check_payment_cb(cb: CallbackQuery):
     days        = int(md.get("days", 0) or 0)
     hwid_str    = md.get("hwid", "")
     hwid        = int(hwid_str) if hwid_str.isdigit() else None
-    squad       = md.get("squad") or None
+    squad_raw   = md.get("squad") or None
+    squad       = squad_raw.split(",") if squad_raw and "," in squad_raw else squad_raw
     whitelist_gb= int(md.get("whitelist_gb", 0) or 0)
     plan_key    = md.get("plan_key") or None
     price       = float(md.get("price", 0))
@@ -1303,7 +1150,7 @@ async def check_payment_cb(cb: CallbackQuery):
             if not remna:
                 await cb.answer("Пользователь не найден в панели.", show_alert=True)
                 return
-            result_user = await remna_update_user(remna["uuid"], {"activeInternalSquads": _expand_squads(SQUAD_UUID_WHITELIST)})
+            result_user = await remna_update_user(remna["uuid"], {"activeInternalSquads": [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]})
             if not result_user:
                 await cb.answer("Ошибка обновления тарифа.", show_alert=True)
                 return
@@ -1412,7 +1259,7 @@ async def buyplan_cb(cb: CallbackQuery):
     await cb.message.edit_text(
         f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n\n"
         f"Дополнительные устройства и трафик для обхода белых списков "
-        f"докупаются в главном меню п  сл   покупки.\n\n"
+        f"докупаются в главном меню после покупки.\n\n"
         f"{EMOJI_CHOOSE_TERM} Выберите срок:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
@@ -1532,7 +1379,7 @@ async def wl_topup_cancel(message: types.Message, state: FSMContext):
 @router.message(WhitelistTopupState.waiting_gb)
 async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().isdigit():
-        await message.answer("Введите целое положите  ьное число.")
+        await message.answer("Введите целое положительное число.")
         return
     gb = int(message.text.strip())
     if gb <= 0:
@@ -1630,11 +1477,6 @@ async def handle_promo(message: types.Message, state: FSMContext):
         async with pool.acquire() as conn:
             await conn.execute("UPDATE users SET plan=$1, extra_devices=0 WHERE user_id=$2",
                                tariff_key, message.from_user.id)
-            await conn.execute(
-                "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, note, created_at) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-                message.from_user.id, 0, tariff_key, days, False, "promo", code, int(time.time()),
-            )
             if uses <= 1:
                 await conn.execute("DELETE FROM promos WHERE code=$1", code)
             else:
@@ -1653,11 +1495,6 @@ async def handle_promo(message: types.Message, state: FSMContext):
 
     user = await activate_subscription(message.from_user.id, days)
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, note, created_at) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-            message.from_user.id, 0, "extend", days, False, "promo", code, int(time.time()),
-        )
         if uses <= 1:
             await conn.execute("DELETE FROM promos WHERE code=$1", code)
         else:
@@ -1670,18 +1507,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
 @router.callback_query(F.data.startswith("pfree_"))
 async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    # ВАЖНО: ключи тарифов сами содержат «_» (напр. vpn_bypass), поэтому
-    # простой split("_", 2) разбивал vpn_bypass на vpn + bypass_<код> и выдавал
-    # обычный VPN вместо «VPN + белые списки». Определяем ключ по
-    # известным тарифам (сначала самый длинный), остаток — код промо.
-    rest = cb.data.removeprefix("pfree_")
-    plan_key = None
-    promo_code = ""
-    for _pk in sorted(PLANS, key=len, reverse=True):
-        if rest == _pk or rest.startswith(_pk + "_"):
-            plan_key   = _pk
-            promo_code = rest[len(_pk):].lstrip("_")
-            break
+    _, plan_key, promo_code = cb.data.split("_", 2)
     data = await state.get_data()
     days = data.get("promo_days", 30); uses = data.get("promo_uses", 1)
     await state.clear()
@@ -1694,11 +1520,6 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     async with pool.acquire() as conn:
         await conn.execute("UPDATE users SET plan=$1, extra_devices=0 WHERE user_id=$2",
                            plan_key, cb.from_user.id)
-        await conn.execute(
-            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, note, created_at) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-            cb.from_user.id, 0, plan_key, days, False, "promo", promo_code, int(time.time()),
-        )
         if uses <= 1:
             await conn.execute("DELETE FROM promos WHERE code=$1", promo_code)
         else:
@@ -1709,7 +1530,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
 
 # ─────────────────────────────────────────────
 #  О СЕРВИСЕ
-# ───────────────────────────────────────  ─────
+# ─────────────────────────────────────────────
 @router.callback_query(F.data == "info_tab")
 async def info_tab(cb: CallbackQuery):
     await cb.answer()
@@ -1841,7 +1662,6 @@ async def admin_add_username_handler(message: types.Message, state: FSMContext):
         )
     EXTRA_ADMIN_IDS.add(target_id)
     await message.answer(f"@{username} добавлен в админы.")
-    await log_admin(message.from_user.id, message.from_user.username, "Админы", f"Добавил админа @{username}", target_id)
     try:
         await bot.send_message(target_id, "Вы назначены администратором бота. Кнопка «Панель» появится в профиле.")
     except Exception:
@@ -1859,7 +1679,6 @@ async def admin_del_cb(cb: CallbackQuery):
         await conn.execute("DELETE FROM extra_admins WHERE user_id=$1", target_id)
     EXTRA_ADMIN_IDS.discard(target_id)
     await cb.answer("Админ удалён.", show_alert=True)
-    await log_admin(cb.from_user.id, cb.from_user.username, "Админы", "Удалил админа", target_id)
     try:
         await bot.send_message(target_id, "С вас сняты права администратора бота.")
     except Exception:
@@ -1867,8 +1686,8 @@ async def admin_del_cb(cb: CallbackQuery):
     await _render_admins_list(cb)
 
 # ─────────────────────────────────────────────
-#  ПОДПИСЧИ  И — кнопки с пагинацией (только   ктивные)
-# ───────────────   ────   ────────────────────────
+#  ПОДПИСЧИКИ — кнопки с пагинацией (только активные)
+# ─────────────────────────────────────────────
 SUBS_PAGE_SIZE = 8
 
 async def _get_sorted_subs() -> list:
@@ -1984,7 +1803,7 @@ def _check_kb(user_id: int, hwid: int, has_whitelist: bool = False) -> InlineKey
     if preset_row:
         rows.append(preset_row)
 
-    whitelist_btn_text = "Забрать белые списки" if has_whitelist else "Дать б  лые списки"
+    whitelist_btn_text = "Забрать белые списки" if has_whitelist else "Дать белые списки"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="+ Дни", callback_data=f"ca_adddays_{user_id}"),
          InlineKeyboardButton(text="- Дни", callback_data=f"ca_subdays_{user_id}"),
@@ -2293,7 +2112,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
 @router.message(Command("cancel"), CheckActionState.waiting_whitelist_gb)
 async def ca_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Отмен  но.")
+    await message.answer("Отменено.")
 
 # ─────────────────────────────────────────────
 #  СПИСОК УСТРОЙСТВ (HWID inspector)
@@ -2306,7 +2125,7 @@ async def ca_devices_show(cb: CallbackQuery):
     user_id = int(cb.data.removeprefix("ca_devices_"))
     remna = await remna_get_user(user_id)
     if not remna:
-        await cb.message.answer("Пользователь не найден    Remnawave.")
+        await cb.message.answer("Пользователь не найден в Remnawave.")
         return
     devices = await remna_get_user_hwid(remna["uuid"])
     if not devices:
@@ -2350,7 +2169,6 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
         await cb.message.answer(f"ID:{user_id} — доступ к белым спискам отозван.")
-        await log_admin(cb.from_user.id, cb.from_user.username, "Белые списки", f"Отозвал доступ к белым спискам", user_id)
         await _render_check(cb, user_id)
     else:
         await cb.message.answer(
@@ -2399,7 +2217,6 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
 
     limit_label = f"{gb_limit} GB" if gb_limit > 0 else "без лимита"
     await message.answer(f"ID:{user_id} — доступ к белым спискам выдан. Лимит: {limit_label}")
-    await log_admin(message.from_user.id, message.from_user.username, "Белые списки", f"Выдал доступ к белым спискам (лимит {limit_label})", user_id)
     await _render_check(message, user_id)
 
 # ─────────────────────────────────────────────
@@ -2423,7 +2240,6 @@ async def quick_take(cb: CallbackQuery):
         )
         await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
     await cb.message.answer(f"Подписка ID:{user_id} отозвана.")
-    await log_admin(cb.from_user.id, cb.from_user.username, "Подписка", "Отозвал подписку", user_id)
     try:
         await bot.send_message(user_id, "Ваша подписка отозвана администратором.")
     except Exception:
@@ -2432,19 +2248,6 @@ async def quick_take(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 #  ПРОМОКОДЫ (админ)
 # ─────────────────────────────────────────────
-async def log_admin(admin_id, admin_name, action, details, target_id=None):
-    """Журнал действий админа (виден в веб-разделе «Логи»)."""
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO admin_logs (admin_id, admin_name, action, target_id, details, created_at) "
-                "VALUES ($1,$2,$3,$4,$5,$6)",
-                admin_id, admin_name, action, target_id, details, int(time.time()),
-            )
-    except Exception as e:
-        log.warning("log_admin failed: %s", e)
-
-
 async def _save_promo(message: types.Message, parts: list):
     code = parts[0].upper(); days = int(parts[1])
     uses = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
@@ -2473,7 +2276,6 @@ async def _save_promo(message: types.Message, parts: list):
             code, days, uses, promo_type, tariff_key, discount_percent,
         )
     await message.answer(f"Промокод {code} создан. Тип: {promo_type}. Дней: {days}. Исп.: {uses}")
-    await log_admin(message.from_user.id, message.from_user.username, "Промокод", f"Создал промокод {code} (тип {promo_type}, дней {days}, исп. {uses})")
 
 @router.message(Command("add_promo"))
 async def add_promo(message: types.Message, command: CommandObject):
@@ -2500,7 +2302,7 @@ async def admin_genpromo(message: types.Message, state: FSMContext):
         "КОД ДНИ [исп.] — добавляет дни\n"
         "КОД ДНИ [исп.] free:vpn|vpn_bypass|choice — бесплатный тариф\n"
         "КОД 0 [исп.] discount:ПРОЦЕНТ — скидка %\n\n"
-        "Чи  ло вмес  о кода → авто генерация",
+        "Число вместо кода → авто генерация",
         reply_markup=cancel_kb(),
     )
 
@@ -2687,7 +2489,7 @@ async def promogen_uses_custom_handler(message: types.Message, state: FSMContext
     await state.update_data(uses=uses)
     await state.set_state(PromoGenState.waiting_code)
     await message.answer(
-        "Введите код про  окода (латиница/цифры), либо отправьте 0 для автогенерации:",
+        "Введите код промокода (латиница/цифры), либо отправьте 0 для автогенерации:",
         reply_markup=cancel_kb(),
     )
 
@@ -2701,7 +2503,6 @@ async def promogen_code_handler(message: types.Message, state: FSMContext):
         code=code, days=data["days"], uses=data["uses"],
         promo_type=data["promo_type"], tariff_key=data.get("tariff_key"),
     )
-    await log_admin(message.from_user.id, message.from_user.username, "Промокод", f"Создал про  окод {code} (тип {data['promo_type']}, дней {data['days']}, исп. {data['uses']})")
     type_label = {
         "days": "дни к подписке",
         "free_tariff": PLANS.get(data.get("tariff_key"), {}).get("name", "бесплатный тариф"),
@@ -2770,7 +2571,6 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
             fail += 1
         await asyncio.sleep(0.05)
     await cb.message.edit_text(f"Готово.\nОтправлено: {ok} · Ошибок: {fail}")
-    await log_admin(cb.from_user.id, cb.from_user.username, "Рассылка", f"Рассылка ({'подписчикам' if subs_only else 'всем'}): доставлено {ok}, ошибок {fail}")
 
 @router.callback_query(F.data == "bc_confirm")
 async def broadcast_confirm(cb: CallbackQuery, state: FSMContext):
@@ -2809,7 +2609,7 @@ async def admin_referrals_cb(cb: CallbackQuery):
             ") ORDER BY u.referral_balance DESC"
         )
     if not rows:
-        await cb.message.edit_text("Рефералов пок   нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        await cb.message.edit_text("Рефералов пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
         ]))
         return
@@ -2857,14 +2657,13 @@ async def admin_payout(message: types.Message, command: CommandObject):
             row["user_id"], balance, int(time.time()),
         )
     await message.answer(f"Выплата {balance:.2f} руб. пользователю {target} зафиксирована, баланс обнулён.")
-    await log_admin(message.from_user.id, message.from_user.username, "Выплата", f"Выплатил реферальный баланс {balance:.2f} ₽", row["user_id"])
     try:
         await bot.send_message(row["user_id"], f"Ваш реферальный баланс {balance:.2f} руб. выплачен.")
     except Exception:
         pass
 
 # ─────────────────────────────────────────────
-#  ОТЧЁТ (  нопка панели — отправить сразу)
+#  ОТЧЁТ (кнопка панели — отправить сразу)
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_report")
 async def admin_report_cb(cb: CallbackQuery):
@@ -2967,11 +2766,11 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         squad_uuid = SQUAD_UUID_BASIC
         new_plan   = "vpn"
     elif choice == "vpn_bypass":
-        squad_uuid   = SQUAD_UUID_WHITELIST
+        squad_uuid   = [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]
         whitelist_gb = PLANS["vpn_bypass"]["whitelist_gb"]
         new_plan     = "vpn_bypass"
     elif choice == "trial":
-        squad_uuid   = SQUAD_UUID_WHITELIST
+        squad_uuid   = [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]
         whitelist_gb = TRIAL["whitelist_gb"]
         new_plan     = "trial"
     # choice == "none": оставляем squad_uuid=None, new_plan=None (ничего не трогаем)
@@ -2990,19 +2789,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
                 "UPDATE users SET plan=$1, extra_devices=$2 WHERE user_id=$3",
                 new_plan, extra_devices, target_id,
             )
-        # Подписка ВЫДАНА админом: в «Операции» остаётся сам тариф, а факт
-        # выдачи отражается в «Сумме» (source='gift', сумма 0 — в доход не идёт).
-        op_key = {"none": "extend", "vpn": "vpn", "vpn_bypass": "vpn_bypass", "trial": "trial"}[choice]
-        await conn.execute(
-            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, created_at) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            target_id, 0, op_key, days, False, "gift", int(time.time()),
-        )
 
-    await log_admin(
-        cb.from_user.id, cb.from_user.username,
-        "Выдача", f"Выдал подписку ({op_key}) на {days} дн.", target_id,
-    )
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN с обходом", "trial": "пробный доступ"}[choice]
@@ -3122,7 +2909,6 @@ async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
             await conn.execute("UPDATE admin_settings SET sale_notify=$1 WHERE admin_id=$2", new_val, admin_id)
         else:
             await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
-    await log_admin(cb.from_user.id, cb.from_user.username, "Настройки", f"Уведомления о покупках: {'вкл' if new_val else 'выкл'}")
     text = f"Настройки\n\nУведомления о покупках: {'вкл' if new_val else 'выкл'}"
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -3308,7 +3094,6 @@ async def toggle_sale_notify(message: types.Message):
         else:
             await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
     await message.answer("Уведомления о покупках включены." if new_val else "Уведомления о покупках выключены.")
-    await log_admin(message.from_user.id, message.from_user.username, "Настройки", f"Уведомления о покупках: {'вкл' if new_val else 'выкл'}")
 
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
@@ -3330,17 +3115,6 @@ async def admin_give(message: types.Message, command: CommandObject):
     if not user:
         await message.answer("Ошибка активации.")
         return
-    # Выдача админом: в «Операции» — продление, факт выдачи — в «Сумме».
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, created_at) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            row["user_id"], 0, "extend", days, False, "gift", int(time.time()),
-        )
-    await log_admin(
-        message.from_user.id, message.from_user.username,
-        "Выдача", f"Выдал (командой) {days} дн.", row["user_id"],
-    )
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     await message.answer(f"@{target} выдано {days} дн. До: {date_str}")
@@ -3479,7 +3253,7 @@ async def send_daily_report():
             f"Отчёт за {date} (МСК)\n\n"
             f"Новых пользователей: {new_users}\n"
             f"Новых триалов: {new_trials}\n"
-            f"Нов  х оплат: {new_paid}\n"
+            f"Новых оплат: {new_paid}\n"
             f"Поступления за день: {revenue:.2f} руб.\n\n"
             f"Активных подписок: {active}\n"
             f"Платили хоть раз: {total_paid}"
