@@ -105,7 +105,7 @@ def msk_now() -> datetime:
 # ─────────────────────────────────────────────
 #  PREMIUM-ЭМОДЗИ
 #
-#  Работают только в тексте сообщений (parse_mode="HTML"), НЕ в кнопках —
+#  Работают только в тексте с  общений (parse_mode="HTML"), НЕ в кнопках —
 #  кнопки Telegram принимают только простой текст без форматирования.
 #  Для непремиум-пользователей и старых клиентов показывается fallback-символ
 #  вместо кастомного эмодзи. Расставлены по одному разу на смысловой момент,
@@ -806,7 +806,7 @@ async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str |
                            item_name: str, price: float):
     """
     Начисление рефереру REFERRAL_PERCENT% от суммы оплаты приглашённого друга.
-    ДОПУЩЕНИЕ (не было явно уточнено в ТЗ): начисление идёт с КАЖДОЙ оплаты
+    ДОПУЩЕНИЕ (не был   явно уточнено в ТЗ): начисление идёт с КАЖДОЙ оплаты
     приглашённого, а не только с первой. Если нужно только с первой покупки —
     легко поменять на условие has_paid==0, скажи и поправлю.
     """
@@ -1085,9 +1085,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
 
-    cab_url = await get_cabinet_url(user_id)
-    if cab_url:
-        rows.append([btn("Личный кабинет", emoji_id="5841530748082851696", callback_data="cabinet_login")])
+    # Кнопка кабинета показывается всегда; сам вход выдаётся по коду в cabinet_login_cb.
+    rows.append([btn("Личный кабинет", emoji_id="5841530748082851696", callback_data="cabinet_login")])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
@@ -1868,7 +1867,7 @@ async def admin_del_cb(cb: CallbackQuery):
     await _render_admins_list(cb)
 
 # ─────────────────────────────────────────────
-#  ПОДПИСЧИ  И — кнопки с пагинацией (только активные)
+#  ПОДПИСЧИ  И — кнопки с пагинацией (только   ктивные)
 # ───────────────   ────   ────────────────────────
 SUBS_PAGE_SIZE = 8
 
