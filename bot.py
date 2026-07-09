@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo
 
 from yookassa import Configuration, Payment
 
@@ -1043,7 +1043,7 @@ async def cabinet_login_cb(cb: CallbackQuery):
         await cb.answer("Ошибка, попробуйте позже.", show_alert=True)
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Открыть личный кабинет", emoji_id="5282843764451195532", url=cab_url)]
+        [btn("Открыть личный кабинет", emoji_id="5282843764451195532", web_app=WebAppInfo(url=cab_url))]
     ])
     await cb.message.answer(
         f"{premium_emoji('5282843764451195532', '🖥')} Вход в личный кабинет\n\n"
