@@ -1,5 +1,7 @@
 import os
 import uuid
+import secrets
+import string
 import logging
 import time
 import asyncio
@@ -72,6 +74,10 @@ CHANNEL_ID   = os.environ.get("CHANNEL_ID", "@Truba_VPN")
 # Юзернейм поддержки — кнопка "Тех.Поддержка" ведёт в личку с этим аккаунтом
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
 SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
+
+# Публичный адрес пользовательского сайта (личный кабинет).
+# Например: http://89.34.219.134:5001  —  если пусто, кнопка кабинета не показывается.
+SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
@@ -309,6 +315,14 @@ async def init_db():
                 extra_devices    INTEGER DEFAULT 0,
                 trial_used       BOOLEAN DEFAULT FALSE,
                 referral_balance NUMERIC DEFAULT 0
+            )
+        """)
+        # Токены личного кабинета на сайте (общие с веб-панелью).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cabinet_tokens (
+                user_id    BIGINT PRIMARY KEY,
+                code       TEXT UNIQUE NOT NULL,
+                created_at BIGINT DEFAULT 0
             )
         """)
         await conn.execute("""
@@ -873,6 +887,33 @@ async def check_sub_cb(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
+_CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
+
+async def get_cabinet_url(user_id: int) -> str | None:
+    """Ссылка на личный кабинет пользователя на сайте.
+    Генерирует (или берёт существующий) 16-символьный код в cabinet_tokens.
+    Если SITE_URL не задан — возвращает None (кнопка не показывается)."""
+    if not SITE_URL:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
+            if row and row["code"]:
+                return f"{SITE_URL}/cab/{row['code']}"
+            for _ in range(6):
+                code = "".join(secrets.choice(_CAB_ALPHABET) for _ in range(16))
+                await conn.execute(
+                    "INSERT INTO cabinet_tokens (user_id, code, created_at) VALUES ($1,$2,$3) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    user_id, code, int(time.time()),
+                )
+                row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
+                if row and row["code"]:
+                    return f"{SITE_URL}/cab/{row['code']}"
+    except Exception as e:
+        logging.error("get_cabinet_url: %s", e)
+    return None
+
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """
     Профиль = единственный домашний экран. Показывает вариант подписки,
@@ -967,7 +1008,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                          callback_data="buy_open")])
     else:
-        rows.append([btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
+        rows.append([btn("Д  бавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
                          callback_data="dev_add")])
         if plan == "vpn":
             rows.append([btn("Улучшить тариф", emoji_id=BTN_ICON_UPGRADE,
@@ -975,6 +1016,10 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         elif plan == "vpn_bypass":
             rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
+
+    cab_url = await get_cabinet_url(user_id)
+    if cab_url:
+        rows.append([btn("Личный кабинет", emoji_id="5841530748082851696", url=cab_url)])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
@@ -1300,7 +1345,7 @@ async def buyplan_cb(cb: CallbackQuery):
     await cb.message.edit_text(
         f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n\n"
         f"Дополнительные устройства и трафик для обхода белых списков "
-        f"докупаются в главном меню посл   покупки.\n\n"
+        f"докупаются в главном меню п  сл   покупки.\n\n"
         f"{EMOJI_CHOOSE_TERM} Выберите срок:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
@@ -1597,7 +1642,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
 
 # ─────────────────────────────────────────────
 #  О СЕРВИСЕ
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────  ─────
 @router.callback_query(F.data == "info_tab")
 async def info_tab(cb: CallbackQuery):
     await cb.answer()
@@ -1756,7 +1801,7 @@ async def admin_del_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  ПОДПИСЧИ  И — кнопки с пагинацией (только активные)
-# ───────────────   ─────────────────────────────
+# ───────────────   ────   ────────────────────────
 SUBS_PAGE_SIZE = 8
 
 async def _get_sorted_subs() -> list:
@@ -2181,7 +2226,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
 @router.message(Command("cancel"), CheckActionState.waiting_whitelist_gb)
 async def ca_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Отменено.")
+    await message.answer("Отмен  но.")
 
 # ─────────────────────────────────────────────
 #  СПИСОК УСТРОЙСТВ (HWID inspector)
@@ -2194,7 +2239,7 @@ async def ca_devices_show(cb: CallbackQuery):
     user_id = int(cb.data.removeprefix("ca_devices_"))
     remna = await remna_get_user(user_id)
     if not remna:
-        await cb.message.answer("Пользователь не найден в Remnawave.")
+        await cb.message.answer("Пользователь не найден    Remnawave.")
         return
     devices = await remna_get_user_hwid(remna["uuid"])
     if not devices:
@@ -2388,7 +2433,7 @@ async def admin_genpromo(message: types.Message, state: FSMContext):
         "КОД ДНИ [исп.] — добавляет дни\n"
         "КОД ДНИ [исп.] free:vpn|vpn_bypass|choice — бесплатный тариф\n"
         "КОД 0 [исп.] discount:ПРОЦЕНТ — скидка %\n\n"
-        "Чи  ло вместо кода → авто генерация",
+        "Чи  ло вмес  о кода → авто генерация",
         reply_markup=cancel_kb(),
     )
 
@@ -2575,7 +2620,7 @@ async def promogen_uses_custom_handler(message: types.Message, state: FSMContext
     await state.update_data(uses=uses)
     await state.set_state(PromoGenState.waiting_code)
     await message.answer(
-        "Введите код промокода (латиница/цифры), либо отправьте 0 для автогенерации:",
+        "Введите код про  окода (латиница/цифры), либо отправьте 0 для автогенерации:",
         reply_markup=cancel_kb(),
     )
 
@@ -2589,7 +2634,7 @@ async def promogen_code_handler(message: types.Message, state: FSMContext):
         code=code, days=data["days"], uses=data["uses"],
         promo_type=data["promo_type"], tariff_key=data.get("tariff_key"),
     )
-    await log_admin(message.from_user.id, message.from_user.username, "Промокод", f"Создал промокод {code} (тип {data['promo_type']}, дней {data['days']}, исп. {data['uses']})")
+    await log_admin(message.from_user.id, message.from_user.username, "Промокод", f"Создал про  окод {code} (тип {data['promo_type']}, дней {data['days']}, исп. {data['uses']})")
     type_label = {
         "days": "дни к подписке",
         "free_tariff": PLANS.get(data.get("tariff_key"), {}).get("name", "бесплатный тариф"),
@@ -2697,7 +2742,7 @@ async def admin_referrals_cb(cb: CallbackQuery):
             ") ORDER BY u.referral_balance DESC"
         )
     if not rows:
-        await cb.message.edit_text("Рефералов пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        await cb.message.edit_text("Рефералов пок   нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
         ]))
         return
