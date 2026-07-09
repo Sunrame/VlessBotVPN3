@@ -373,6 +373,17 @@ async def init_db():
                 processed_at BIGINT DEFAULT 0
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id         SERIAL PRIMARY KEY,
+                admin_id   BIGINT,
+                admin_name TEXT,
+                action     TEXT,
+                target_id  BIGINT,
+                details    TEXT,
+                created_at BIGINT DEFAULT 0
+            )
+        """)
         # Миграции на случай старой БД
         for col in [
             "remna_uuid TEXT", "created_at BIGINT DEFAULT 0",
@@ -1459,7 +1470,7 @@ async def earn_open_cb(cb: CallbackQuery):
 def _free_plan_kb(code: str):
     rows = []
     for key, plan in PLANS.items():
-        rows.append([InlineKeyboardButton(text=plan["name"], callback_data=f"pfree_{key}")])
+        rows.append([InlineKeyboardButton(text=plan["name"], callback_data=f"pfree_{key}_{code}")])
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1561,8 +1572,6 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
             break
     data = await state.get_data()
     days = data.get("promo_days", 30); uses = data.get("promo_uses", 1)
-    # Код промо берём из FSM-состояния (callback теперь только ключ тарифа).
-    promo_code = promo_code or data.get("promo_code", "")
     await state.clear()
     if plan_key not in PLANS:
         await cb.answer("Тариф не найден.", show_alert=True)
@@ -1720,6 +1729,7 @@ async def admin_add_username_handler(message: types.Message, state: FSMContext):
         )
     EXTRA_ADMIN_IDS.add(target_id)
     await message.answer(f"@{username} добавлен в админы.")
+    await log_admin(message.from_user.id, message.from_user.username, "Админы", f"Добавил админа @{username}", target_id)
     try:
         await bot.send_message(target_id, "Вы назначены администратором бота. Кнопка «Панель» появится в профиле.")
     except Exception:
@@ -1737,6 +1747,7 @@ async def admin_del_cb(cb: CallbackQuery):
         await conn.execute("DELETE FROM extra_admins WHERE user_id=$1", target_id)
     EXTRA_ADMIN_IDS.discard(target_id)
     await cb.answer("Админ удалён.", show_alert=True)
+    await log_admin(cb.from_user.id, cb.from_user.username, "Админы", "Удалил админа", target_id)
     try:
         await bot.send_message(target_id, "С вас сняты права администратора бота.")
     except Exception:
@@ -1745,7 +1756,7 @@ async def admin_del_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  ПОДПИСЧИ  И — кнопки с пагинацией (только активные)
-# ─────────────────────────────────────────────
+# ───────────────   ─────────────────────────────
 SUBS_PAGE_SIZE = 8
 
 async def _get_sorted_subs() -> list:
@@ -1861,7 +1872,7 @@ def _check_kb(user_id: int, hwid: int, has_whitelist: bool = False) -> InlineKey
     if preset_row:
         rows.append(preset_row)
 
-    whitelist_btn_text = "Забрать белые списки" if has_whitelist else "Дать белые списки"
+    whitelist_btn_text = "Забрать белые списки" if has_whitelist else "Дать б  лые списки"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="+ Дни", callback_data=f"ca_adddays_{user_id}"),
          InlineKeyboardButton(text="- Дни", callback_data=f"ca_subdays_{user_id}"),
@@ -2227,6 +2238,7 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
         await cb.message.answer(f"ID:{user_id} — доступ к белым спискам отозван.")
+        await log_admin(cb.from_user.id, cb.from_user.username, "Белые списки", f"Отозвал доступ к белым спискам", user_id)
         await _render_check(cb, user_id)
     else:
         await cb.message.answer(
@@ -2275,6 +2287,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
 
     limit_label = f"{gb_limit} GB" if gb_limit > 0 else "без лимита"
     await message.answer(f"ID:{user_id} — доступ к белым спискам выдан. Лимит: {limit_label}")
+    await log_admin(message.from_user.id, message.from_user.username, "Белые списки", f"Выдал доступ к белым спискам (лимит {limit_label})", user_id)
     await _render_check(message, user_id)
 
 # ─────────────────────────────────────────────
@@ -2298,6 +2311,7 @@ async def quick_take(cb: CallbackQuery):
         )
         await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
     await cb.message.answer(f"Подписка ID:{user_id} отозвана.")
+    await log_admin(cb.from_user.id, cb.from_user.username, "Подписка", "Отозвал подписку", user_id)
     try:
         await bot.send_message(user_id, "Ваша подписка отозвана администратором.")
     except Exception:
@@ -2306,6 +2320,19 @@ async def quick_take(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 #  ПРОМОКОДЫ (админ)
 # ─────────────────────────────────────────────
+async def log_admin(admin_id, admin_name, action, details, target_id=None):
+    """Журнал действий админа (виден в веб-разделе «Логи»)."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO admin_logs (admin_id, admin_name, action, target_id, details, created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                admin_id, admin_name, action, target_id, details, int(time.time()),
+            )
+    except Exception as e:
+        log.warning("log_admin failed: %s", e)
+
+
 async def _save_promo(message: types.Message, parts: list):
     code = parts[0].upper(); days = int(parts[1])
     uses = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
@@ -2334,6 +2361,7 @@ async def _save_promo(message: types.Message, parts: list):
             code, days, uses, promo_type, tariff_key, discount_percent,
         )
     await message.answer(f"Промокод {code} создан. Тип: {promo_type}. Дней: {days}. Исп.: {uses}")
+    await log_admin(message.from_user.id, message.from_user.username, "Промокод", f"Создал промокод {code} (тип {promo_type}, дней {days}, исп. {uses})")
 
 @router.message(Command("add_promo"))
 async def add_promo(message: types.Message, command: CommandObject):
@@ -2360,7 +2388,7 @@ async def admin_genpromo(message: types.Message, state: FSMContext):
         "КОД ДНИ [исп.] — добавляет дни\n"
         "КОД ДНИ [исп.] free:vpn|vpn_bypass|choice — бесплатный тариф\n"
         "КОД 0 [исп.] discount:ПРОЦЕНТ — скидка %\n\n"
-        "Число вместо кода → авто генерация",
+        "Чи  ло вместо кода → авто генерация",
         reply_markup=cancel_kb(),
     )
 
@@ -2561,6 +2589,7 @@ async def promogen_code_handler(message: types.Message, state: FSMContext):
         code=code, days=data["days"], uses=data["uses"],
         promo_type=data["promo_type"], tariff_key=data.get("tariff_key"),
     )
+    await log_admin(message.from_user.id, message.from_user.username, "Промокод", f"Создал промокод {code} (тип {data['promo_type']}, дней {data['days']}, исп. {data['uses']})")
     type_label = {
         "days": "дни к подписке",
         "free_tariff": PLANS.get(data.get("tariff_key"), {}).get("name", "бесплатный тариф"),
@@ -2629,6 +2658,7 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
             fail += 1
         await asyncio.sleep(0.05)
     await cb.message.edit_text(f"Готово.\nОтправлено: {ok} · Ошибок: {fail}")
+    await log_admin(cb.from_user.id, cb.from_user.username, "Рассылка", f"Рассылка ({'подписчикам' if subs_only else 'всем'}): доставлено {ok}, ошибок {fail}")
 
 @router.callback_query(F.data == "bc_confirm")
 async def broadcast_confirm(cb: CallbackQuery, state: FSMContext):
@@ -2715,6 +2745,7 @@ async def admin_payout(message: types.Message, command: CommandObject):
             row["user_id"], balance, int(time.time()),
         )
     await message.answer(f"Выплата {balance:.2f} руб. пользователю {target} зафиксирована, баланс обнулён.")
+    await log_admin(message.from_user.id, message.from_user.username, "Выплата", f"Выплатил реферальный баланс {balance:.2f} ₽", row["user_id"])
     try:
         await bot.send_message(row["user_id"], f"Ваш реферальный баланс {balance:.2f} руб. выплачен.")
     except Exception:
@@ -2856,6 +2887,10 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
             target_id, 0, op_key, days, False, "gift", int(time.time()),
         )
 
+    await log_admin(
+        cb.from_user.id, cb.from_user.username,
+        "Выдача", f"Выдал подписку ({op_key}) на {days} дн.", target_id,
+    )
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN с обходом", "trial": "пробный доступ"}[choice]
@@ -2975,6 +3010,7 @@ async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
             await conn.execute("UPDATE admin_settings SET sale_notify=$1 WHERE admin_id=$2", new_val, admin_id)
         else:
             await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
+    await log_admin(cb.from_user.id, cb.from_user.username, "Настройки", f"Уведомления о покупках: {'вкл' if new_val else 'выкл'}")
     text = f"Настройки\n\nУведомления о покупках: {'вкл' if new_val else 'выкл'}"
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -3160,6 +3196,7 @@ async def toggle_sale_notify(message: types.Message):
         else:
             await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
     await message.answer("Уведомления о покупках включены." if new_val else "Уведомления о покупках выключены.")
+    await log_admin(message.from_user.id, message.from_user.username, "Настройки", f"Уведомления о покупках: {'вкл' if new_val else 'выкл'}")
 
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
@@ -3188,6 +3225,10 @@ async def admin_give(message: types.Message, command: CommandObject):
             "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             row["user_id"], 0, "extend", days, False, "gift", int(time.time()),
         )
+    await log_admin(
+        message.from_user.id, message.from_user.username,
+        "Выдача", f"Выдал (командой) {days} дн.", row["user_id"],
+    )
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     await message.answer(f"@{target} выдано {days} дн. До: {date_str}")
@@ -3326,7 +3367,7 @@ async def send_daily_report():
             f"Отчёт за {date} (МСК)\n\n"
             f"Новых пользователей: {new_users}\n"
             f"Новых триалов: {new_trials}\n"
-            f"Новых оплат: {new_paid}\n"
+            f"Нов  х оплат: {new_paid}\n"
             f"Поступления за день: {revenue:.2f} руб.\n\n"
             f"Активных подписок: {active}\n"
             f"Платили хоть раз: {total_paid}"
