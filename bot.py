@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, MenuButtonWebApp, MenuButtonDefault
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo
 
 from yookassa import Configuration, Payment
 
@@ -66,8 +66,6 @@ SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 # Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
 SITE_URL           = os.environ.get("SITE_URL", "").rstrip("/")
-# Ссылка на Telegram Mini App (личный кабинет внутри Telegram). Требует HTTPS.
-WEBAPP_URL         = f"{SITE_URL}/tgapp" if SITE_URL else ""
 LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
@@ -968,13 +966,9 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
 
-    # Личный кабинет: если задан WEBAPP_URL — Mini App прямо в Telegram (авто-вход по подписи).
-    if WEBAPP_URL:
-        rows.append([btn("Личный кабинет", emoji_id="5282843764451195532", web_app=WebAppInfo(url=WEBAPP_URL))])
-    else:
-        rows.append([btn("Личный кабинет", emoji_id="5282843764451195532", callback_data="cabinet_login")])
+    rows.append([btn("Личный кабинет", emoji_id="5282843764451195532", callback_data="cabinet_login")])
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
-    rows.append([btn("Промок    д", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
+    rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
     rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
     if is_admin(user_id):
         rows.append([btn("Панель", emoji_id=BTN_ICON_ADMIN, callback_data="admin_panel")])
@@ -988,12 +982,30 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 _CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
 
 async def get_cabinet_url(user_id: int) -> str | None:
-    """Ссылка на страницу входа в личный кабинет на сайте.
-    Вход только по 9-значному коду (без UID). Если SITE_URL не задан —
-    возвращает None (кнопка покажет 'временно недоступен')."""
+    """Ссылка на личный кабинет пользователя на сайте.
+    Генерирует (или берёт существующий) 16-символьный код в cabinet_tokens.
+    Если SITE_URL не задан — возвращает None (при нажатии кнопки покажет
+    'временно недоступен', сама кнопка при этом всё равно показывается)."""
     if not SITE_URL:
         return None
-    return f"{SITE_URL}/cab"
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
+            if row and row["code"]:
+                return f"{SITE_URL}/cab/{row['code']}"
+            for _ in range(6):
+                code = "".join(secrets.choice(_CAB_ALPHABET) for _ in range(16))
+                await conn.execute(
+                    "INSERT INTO cabinet_tokens (user_id, code, created_at) VALUES ($1,$2,$3) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    user_id, code, int(time.time()),
+                )
+                row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
+                if row and row["code"]:
+                    return f"{SITE_URL}/cab/{row['code']}"
+    except Exception as e:
+        log.error("get_cabinet_url: %s", e)
+    return None
 
 # Алфавит для кода входа (без похожих символов I, O, 0, 1).
 _LOGIN_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -1031,7 +1043,7 @@ async def cabinet_login_cb(cb: CallbackQuery):
         await cb.answer("Ошибка, попробуйте позже.", show_alert=True)
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Открыть личный кабинет", emoji_id="5282843764451195532", url=cab_url)]
+        [btn("Открыть личный кабинет", emoji_id="5282843764451195532", web_app=WebAppInfo(url=cab_url))]
     ])
     await cb.message.answer(
         f"{premium_emoji('5282843764451195532', '🖥')} Вход в личный кабинет\n\n"
@@ -1071,7 +1083,7 @@ async def profile_cb(cb: CallbackQuery):
     await _show_home(cb)
 
 # ─────────────────────────────────────────────
-#  ОБЩ  Я СТРАНИЦА ОПЛАТЫ (YooKassa)
+#  ОБЩАЯ СТРАНИЦА ОПЛАТЫ (YooKassa)
 # ─────────────────────────────────────────────
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
@@ -1304,7 +1316,7 @@ async def check_payment_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  ПРОБНАЯ ПОДПИСКА
-# ───────────  ─────────────────────────────────
+# ─────────────────────────────────────────────
 @router.callback_query(F.data == "trial_buy")
 async def trial_buy_cb(cb: CallbackQuery):
     await cb.answer()
@@ -2318,7 +2330,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
     await message.answer(f"ID:{user_id} — доступ к белым спискам выдан. Лимит: {limit_label}")
     await _render_check(message, user_id)
 
-# ──────────────────────────────────────────  ──
+# ─────────────────────────────────────────────
 #  ЗАБРАТЬ ПОДПИСКУ
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("quicktake_"))
@@ -2748,7 +2760,7 @@ async def admin_payout(message: types.Message, command: CommandObject):
             return
         balance = float(row["referral_balance"] or 0)
         if balance <= 0:
-            await message.answer("Баланс уже   улевой.")
+            await message.answer("Баланс уже нулевой.")
             return
         await conn.execute("UPDATE users SET referral_balance=0 WHERE user_id=$1", row["user_id"])
         await conn.execute(
@@ -3390,16 +3402,6 @@ async def main():
     dp.include_router(router)
     asyncio.create_task(daily_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
-    # Кнопка-меню (слева от поля ввода): открывает личный кабинет как Mini App.
-    try:
-        if WEBAPP_URL:
-            await bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(text="Кабинет", web_app=WebAppInfo(url=WEBAPP_URL))
-            )
-        else:
-            await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
-    except Exception as e:
-        log.error("set_chat_menu_button: %s", e)
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
@@ -3408,4 +3410,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Bot stopped.")
- 
