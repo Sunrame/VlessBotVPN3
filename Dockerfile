@@ -1,9 +1,13 @@
-FROM python:3.13-slim
+FROM python:3.12-slim
 
-# libpq5        — рантайм-библиотека (libpq.so.5, ошибка №1).
-# libpq-dev     — заголовки + pg_config для сборки psycopg2 (ошибка №2).
-# build-essential — полный набор для сборки Си (gcc, make и, что важно,
-#                   libc6-dev — без него не находится даже assert.h, ошибка №3).
+# Под Python 3.12 у psycopg2-binary есть готовый wheel — сборка из
+# исходников вообще не должна запускаться. Но на случай если pip всё же
+# решит собирать (другая архитектура/будущее обновление пакета) — оставляем
+# полный набор инструментов сборки как страховку, чтобы это не всплыло
+# четвёртым кругом:
+# libpq5         — рантайм-библиотека (libpq.so.5).
+# libpq-dev      — заголовки + pg_config для сборки psycopg2.
+# build-essential — gcc, make, libc6-dev (assert.h и другие Си-заголовки).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libpq5 libpq-dev build-essential \
     && rm -rf /var/lib/apt/lists/*
