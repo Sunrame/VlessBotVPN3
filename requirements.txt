@@ -4,3 +4,5 @@ psycopg2-binary==2.9.9
 requests==2.32.3
 python-dotenv==1.0.1
 yookassa==3.5.0
+aiogram>=3.13
+request
