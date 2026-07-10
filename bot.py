@@ -654,7 +654,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
         return []
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юзер        в на ноде белых списков."""
+    """Сырые дневные записи трафика для ВСЕХ юзер          в на ноде белых списков."""
     if not WHITELIST_NODE_UUID:
         return []
     end_dt   = datetime.now(timezone.utc)
@@ -839,22 +839,74 @@ def back_kb():
 # и закрывается. Здесь мы разбираем <section> и сразу открываем
 # соответствующий раздел/кнопку оплаты уже в боте.
 #
-# Поддерживаемые разделы: buy (купить VPN), trial (пробная),
-# dev (добавить устройства), upgrade (улучшить тариф),
-# wl (докупить трафик на белых списках).
+# Поддерживаемые разделы (с необязательным количеством в хвосте):
+#   trial                     — пробная подписка
+#   buy_<план>_<месяцев>      — купить тариф (напр. buy_vpn_3, buy_vpn_bypass_6)
+#   extend_<месяцев>          — продлить текущий тариф (напр. extend_3)
+#   dev_<кол-во>              — докупить устройства (напр. dev_5) → сразу оплата
+#   wl_<ГБ>                   — докупить трафик (напр. wl_10) → сразу оплата
+#   upgrade                   — улучшить тариф до VPN с обходом
+# Если количество не передано, бот открывает соответствующий экран/ввод.
 async def _open_paysection_from_message(message: types.Message, state: FSMContext,
                                         section: str) -> bool:
     """Открывает раздел оплаты по ключу из диплинка. Возвращает True, если
     раздел распознан и обработан, иначе False."""
     u_id    = message.from_user.id
-    section = (section or "").lower()
+    section = (section or "").lower().strip()
+    parts   = section.split("_")
+    head    = parts[0] if parts else ""
 
-    if section in ("buy", "buy_open", "vpn"):
+    def _tail_int() -> int | None:
+        """Число в хвосте диплинка (например 5 из dev_5) либо None."""
+        if len(parts) >= 2 and parts[-1].isdigit():
+            return int(parts[-1])
+        return None
+
+    if head == "buy" or section == "vpn":
+        # buy_<план>_<месяцев>: сразу открываем оплату выбранного тарифа.
+        plan_key = None
+        months   = None
+        if len(parts) >= 3 and parts[-1].isdigit():
+            plan_key = "_".join(parts[1:-1])
+            months   = int(parts[-1])
+        elif len(parts) >= 2 and not parts[-1].isdigit():
+            plan_key = "_".join(parts[1:])
+        if plan_key in PLANS and months and months > 0:
+            plan  = PLANS[plan_key]
+            price = calc_plan_price(plan_key, months)
+            await _create_payment_page_from_message(
+                message, kind="plan", item_name=f"{plan['name']} · {months} мес.",
+                price=price, days=months * 30, hwid=1, squad=plan["squad"],
+                whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
+            )
+            return True
+        # Без конкретного тарифа/срока — показываем экран выбора тарифа.
         text, kb = _buy_open_content()
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
         return True
 
-    if section in ("trial", "trial_buy"):
+    if head == "extend":
+        # extend_<месяцев>: продлеваем текущий тариф пользователя.
+        months = _tail_int()
+        async with pool.acquire() as conn:
+            plan_key = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", u_id)
+        if plan_key not in PLANS:
+            await message.answer("Сначала оформите подписку.")
+            return True
+        if not months or months <= 0:
+            text, kb = _buy_open_content()
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+            return True
+        plan  = PLANS[plan_key]
+        price = calc_plan_price(plan_key, months)
+        await _create_payment_page_from_message(
+            message, kind="plan", item_name=f"Продление {plan['name']} · {months} мес.",
+            price=price, days=months * 30, hwid=1, squad=plan["squad"],
+            whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
+        )
+        return True
+
+    if head == "trial":
         async with pool.acquire() as conn:
             used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", u_id)
         if used:
@@ -867,13 +919,25 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         )
         return True
 
-    if section in ("dev", "dev_add", "devices"):
+    if head in ("dev", "devices"):
+        # dev_<кол-во>: если количество передано — сразу создаём оплату,
+        # иначе спрашиваем количество (старый сценарий).
+        qty = _tail_int()
         async with pool.acquire() as conn:
             plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", u_id)
         if plan not in PLANS:
             await message.answer("Сначала оформите подписку.")
             return True
         device_price = PLANS[plan]["device_price"]
+        if qty and qty > 0:
+            price = device_price * qty
+            word = "устройство" if qty == 1 else (
+                "устройства" if 2 <= qty % 10 <= 4 and not (11 <= qty % 100 <= 14) else "устройств")
+            await _create_payment_page_from_message(
+                message, kind="device", item_name=f"+{qty} {word} ({PLANS[plan]['name']})",
+                price=price, days=0, qty=qty,
+            )
+            return True
         await state.set_state(DeviceTopupState.waiting_count)
         await state.update_data(plan=plan)
         await message.answer(
@@ -884,7 +948,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         )
         return True
 
-    if section in ("upgrade", "plan_upgrade"):
+    if head == "upgrade" or section == "plan_upgrade":
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT plan, extra_devices FROM users WHERE user_id=$1", u_id)
         if not row or row["plan"] != "vpn":
@@ -902,11 +966,20 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         )
         return True
 
-    if section in ("wl", "wl_topup", "whitelist"):
+    if head in ("wl", "whitelist"):
+        # wl_<ГБ>: если объём передан — сразу оплата, иначе спрашиваем ГБ.
+        gb = _tail_int()
         async with pool.acquire() as conn:
             plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", u_id)
         if plan != "vpn_bypass":
             await message.answer("Докупка доступна только на тарифе VPN с обходом.")
+            return True
+        if gb and gb > 0:
+            price = gb * WHITELIST_PRICE_PER_GB
+            await _create_payment_page_from_message(
+                message, kind="wl_topup", item_name=f"+{gb} ГБ на белых списках",
+                price=price, days=0, whitelist_gb=gb,
+            )
             return True
         await state.set_state(WhitelistTopupState.waiting_gb)
         await message.answer(
@@ -1578,7 +1651,7 @@ async def plan_upgrade_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  ДОКУПИТЬ ТРАФИК НА БЕЛЫХ СПИСКАХ
-# ─────────────────────────────────────────────
+# ─────────────────────────────   ───────────────
 @router.callback_query(F.data == "wl_topup")
 async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3364,7 +3437,7 @@ async def admin_help(message: types.Message):
         "Кнопка «Панель» в профиле открывает то же самое через интерфейс."
     )
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────   ─────
 #  ЛИМИТ ТРАФИКА НА СЕРВЕРЕ БЕЛЫХ СПИСКОВ
 # ─────────────────────────────────────────────
 async def check_whitelist_limits():
