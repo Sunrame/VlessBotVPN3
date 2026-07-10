@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo
 
 from yookassa import Configuration, Payment
 
@@ -67,6 +67,13 @@ SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
 SITE_URL           = os.environ.get("SITE_URL", "").rstrip("/")
 LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
+
+# URL мини-приложения «Личный кабинет» (Telegram Mini App). Кнопка "Личный
+# кабинет" открывает его прямо в Telegram как WebApp; вход в аккаунт
+# автоматический — по подписанным Telegram initData (без кодов). Если явно не
+# задан, берётся SITE_URL + "/cab". Если ничего не задано — кнопка покажет
+# "временно недоступен".
+MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") or (f"{SITE_URL}/cab" if SITE_URL else "")
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
@@ -647,7 +654,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
         return []
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юзеров на ноде белых списков."""
+    """Сырые дневные записи трафика для ВСЕХ юзер��������в на ноде белых списков."""
     if not WHITELIST_NODE_UUID:
         return []
     end_dt   = datetime.now(timezone.utc)
@@ -793,7 +800,7 @@ def calc_upgrade_price(extra_devices: int) -> int:
     """
     Доплата за апгрейд VPN -> VPN с обходом белых списков.
 
-    Дни подписки при апгрейде не пересчитываются и не трогаются — остаются
+    Дн�� подписки при ��пгрейде не пересчитываются и не трогаются — остаются
     ровно те же, что были. Поэтому доплата — просто фиксированная разница
     между тарифами:
       1) Разница цены тарифов за месяц: price_month_bypass - price_month_vpn
@@ -823,14 +830,111 @@ def back_kb():
 # ─────────────────────────────────────────────
 #  СТАРТ / ПРОФИЛЬ (единственный домашний экран)
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  ДИПЛИНК-РОУТИНГ ИЗ ЛИЧНОГО КАБИНЕТА
+# ─────────────────────────────────────────────
+# Когда пользователь хочет что-то оплатить в мини-приложении (личном
+# кабинете), мини-приложение открывает бота по ссылке
+# t.me/<bot>?start=cab_<section> (например Telegram.WebApp.openTelegramLink)
+# и закрывается. Здесь мы разбираем <section> и сразу открываем
+# соответствующий раздел/кнопку оплаты уже в боте.
+#
+# Поддерживаемые разделы: buy (купить VPN), trial (пробная),
+# dev (добавить устройства), upgrade (улучшить тариф),
+# wl (докупить трафик на белых списках).
+async def _open_paysection_from_message(message: types.Message, state: FSMContext,
+                                        section: str) -> bool:
+    """Открывает раздел оплаты по ключу из диплинка. Возвращает True, если
+    раздел распознан и обработан, иначе False."""
+    u_id    = message.from_user.id
+    section = (section or "").lower()
+
+    if section in ("buy", "buy_open", "vpn"):
+        text, kb = _buy_open_content()
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return True
+
+    if section in ("trial", "trial_buy"):
+        async with pool.acquire() as conn:
+            used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", u_id)
+        if used:
+            await message.answer("Пробная подписка уже использована.")
+            return True
+        await _create_payment_page_from_message(
+            message, kind="trial", item_name=TRIAL["name"], price=TRIAL["price"],
+            days=TRIAL["days"], hwid=TRIAL["hwid"], squad=TRIAL["squad"],
+            whitelist_gb=TRIAL["whitelist_gb"], is_trial=True,
+        )
+        return True
+
+    if section in ("dev", "dev_add", "devices"):
+        async with pool.acquire() as conn:
+            plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", u_id)
+        if plan not in PLANS:
+            await message.answer("Сначала оформите подписку.")
+            return True
+        device_price = PLANS[plan]["device_price"]
+        await state.set_state(DeviceTopupState.waiting_count)
+        await state.update_data(plan=plan)
+        await message.answer(
+            f"{EMOJI_DEV_TOPUP} Добавить устройства\n\n"
+            f"Цена одного устройства на вашем тарифе: {device_price} руб.\n\n"
+            f"Введите, сколько устройств хотите докупить:",
+            parse_mode="HTML", reply_markup=cancel_kb(),
+        )
+        return True
+
+    if section in ("upgrade", "plan_upgrade"):
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT plan, extra_devices FROM users WHERE user_id=$1", u_id)
+        if not row or row["plan"] != "vpn":
+            await message.answer("Апгрейд доступен только с тарифа VPN.")
+            return True
+        remna = await remna_get_user(u_id)
+        if not remna:
+            await message.answer("Подписка не найдена.")
+            return True
+        price = calc_upgrade_price(row["extra_devices"] or 0)
+        await _create_payment_page_from_message(
+            message, kind="upgrade",
+            item_name="Улучшение тарифа до VPN с обходом белых списков",
+            price=price, days=0, display_prefix=EMOJI_UPGRADE,
+        )
+        return True
+
+    if section in ("wl", "wl_topup", "whitelist"):
+        async with pool.acquire() as conn:
+            plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", u_id)
+        if plan != "vpn_bypass":
+            await message.answer("Докупка доступна только на тарифе VPN с обходом.")
+            return True
+        await state.set_state(WhitelistTopupState.waiting_gb)
+        await message.answer(
+            f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
+            f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
+            f"Введите, сколько ГБ хотите докупить:",
+            parse_mode="HTML", reply_markup=cancel_kb(),
+        )
+        return True
+
+    return False
+
 @router.message(CommandStart())
-async def cmd_start(message: types.Message, command: CommandObject):
+async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     u_id = message.from_user.id
     r_id = None
-    if command.args and command.args.isdigit():
-        candidate = int(command.args)
-        if candidate != u_id:
-            r_id = candidate
+    section = None
+    if command.args:
+        arg = command.args.strip()
+        if arg.isdigit():
+            candidate = int(arg)
+            if candidate != u_id:
+                r_id = candidate
+        else:
+            # Нечисловой start-параметр — диплинк из мини-приложения
+            # (личного кабинета) для переброса в раздел оплаты.
+            # Поддерживаем как "cab_buy", так и просто "buy".
+            section = arg[4:] if arg.startswith("cab_") else arg
 
     now = int(time.time())
     async with pool.acquire() as conn:
@@ -851,6 +955,12 @@ async def cmd_start(message: types.Message, command: CommandObject):
         )
         return
 
+    # Переброс из личного кабинета в конкретный раздел оплаты.
+    if section:
+        await state.clear()
+        if await _open_paysection_from_message(message, state, section):
+            return
+
     text, kb = await _build_profile_view(u_id)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -862,6 +972,23 @@ async def check_sub_cb(cb: CallbackQuery):
         return
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+def get_cabinet_webapp_url() -> str | None:
+    """URL мини-приложения личного кабинета для кнопки-WebApp.
+    Вход в аккаунт — автоматический по Telegram initData, без кодов."""
+    return MINIAPP_URL or None
+
+def _cabinet_button_row() -> list[InlineKeyboardButton]:
+    """Строка клавиатуры с кнопкой «Личный кабинет».
+    Если URL мини-приложения задан — кнопка открывает его как Telegram Mini App
+    (WebApp) с автоматическим входом (без кодов). Иначе — заглушка о том, что
+    кабинет временно недоступен."""
+    url = get_cabinet_webapp_url()
+    if url:
+        return [btn("Личный кабинет", emoji_id="5282843764451195532",
+                    web_app=WebAppInfo(url=url))]
+    return [btn("Личный кабинет", emoji_id="5282843764451195532",
+                callback_data="cabinet_unavailable")]
 
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """
@@ -913,7 +1040,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         plan = live_plan
 
         # Остаток трафика на белых списках — только если реально отслеживается
-        # (есть строка в whitelist_limits с лимитом > 0). Своя отдельная строка,
+        # (есть строка в whitelist_limits с лимит��м > 0). Своя отдельная строка,
         # не смешивается с тарифом/устройствами.
         gb_line = ""
         if has_whitelist:
@@ -944,6 +1071,18 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     text = "\n".join(lines)
 
     rows = []
+    cabinet_row    = _cabinet_button_row()
+    cabinet_placed = False
+
+    # Расположение кнопки «Личный кабинет»:
+    #  �� пробная подписка УЖЕ использована (trial_used) → ЛК стоит выше всех
+    #    остальных кнопок;
+    #  • пробная подписка ещё НЕ использована → ЛК стоит сразу под кнопкой
+    #    «Пробная подписка».
+    if trial_used:
+        rows.append(cabinet_row)
+        cabinet_placed = True
+
     # Кнопки "Купить VPN"/"Пробная" показываются, пока не куплен РЕАЛЬНЫЙ тариф
     # (vpn / vpn_bypass) И подписка при этом реально активна. Проверка именно
     # subscription_active (а не только plan) защищает от случая, когда старое
@@ -954,6 +1093,9 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if not trial_used:
             rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
                              callback_data="trial_buy")])
+            # ЛК стоит сразу под кнопкой пробной подписки
+            rows.append(cabinet_row)
+            cabinet_placed = True
         rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                          callback_data="buy_open")])
     else:
@@ -966,7 +1108,12 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
 
-    rows.append([btn("Личный кабинет", emoji_id="5282843764451195532", callback_data="cabinet_login")])
+    # Страховка: если ЛК ещё не размещён (например, тариф активен, но пробная
+    # подписка ни разу не использовалась и кнопки «Пробная подписка» нет) —
+    # добавляем кнопку здесь, чтобы личный кабинет был доступен всегда.
+    if not cabinet_placed:
+        rows.append(cabinet_row)
+
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промок  д", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
     rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
@@ -984,7 +1131,7 @@ _CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
 async def get_cabinet_url(user_id: int) -> str | None:
     """Ссылка на страницу входа в личный кабинет на сайте.
     Вход только по 9-значному коду (без UID). Если SITE_URL не задан —
-    возвращает None (кнопка покажет 'временно недоступен')."""
+    возвращает None (кнопка покажет 'времен��о недоступен')."""
     if not SITE_URL:
         return None
     return f"{SITE_URL}/cab"
@@ -1003,38 +1150,15 @@ def _gen_login_code() -> str:
         return "".join(chars)
     return f"{half()}-{half()}"
 
-@router.callback_query(F.data == "cabinet_login")
-async def cabinet_login_cb(cb: CallbackQuery):
-    await cb.answer()
-    user_id = cb.from_user.id
-    cab_url = await get_cabinet_url(user_id)
-    if not cab_url:
-        await cb.answer("Личный кабинет временно недоступен.", show_alert=True)
-        return
-    code = _gen_login_code()
-    expires = int(time.time()) + LOGIN_CODE_TTL_MIN * 60
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO cabinet_login_codes (user_id, code, expires_at, attempts) VALUES ($1,$2,$3,0) "
-                "ON CONFLICT (user_id) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at, attempts=0",
-                user_id, code, expires,
-            )
-    except Exception as e:
-        log.error("cabinet_login_cb: %s", e)
-        await cb.answer("Ошибка, попробуйте позже.", show_alert=True)
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Открыть личный кабинет", emoji_id="5282843764451195532", url=cab_url)]
-    ])
-    await cb.message.answer(
-        f"{premium_emoji('5282843764451195532', '🖥')} Вход в личный кабинет\n\n"
-        f"Ваш код для входа: {hcode(code)}\n\n"
-        "1) Нажмите кнопку ниже, чтобы открыть сайт.\n"
-        "2) Введите этот код на сайте.\n\n"
-        f"Код действует {LOGIN_CODE_TTL_MIN} мин. После входа сессия активна 1 час.",
-        parse_mode="HTML", reply_markup=kb,
-    )
+# Кнопка «Личный кабинет» теперь — это WebApp-кнопка (Telegram Mini App),
+# которая открывает мини-приложение прямо в Telegram. Вход в аккаунт
+# происходит автоматически — мини-приложение получает подписанные
+# Telegram initData с данными пользователя, поэтому никакие коды входа не
+# требуются. Отдельный callback-хендлер на открытие больше не нужен;
+# остаётся только заглушка на случай, когда URL мини-приложения не задан.
+@router.callback_query(F.data == "cabinet_unavailable")
+async def cabinet_unavailable_cb(cb: CallbackQuery):
+    await cb.answer("Личный кабинет временно недоступен.", show_alert=True)
 
 async def _show_home(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
@@ -1064,7 +1188,7 @@ async def profile_cb(cb: CallbackQuery):
     await cb.answer()
     await _show_home(cb)
 
-# ─────────────────────────────────────────────
+# ─────────���───────────────────────────────────
 #  ОБЩАЯ СТРАНИЦА ОПЛАТЫ (YooKassa)
 # ─────────────────────────────────────────────
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
@@ -1144,7 +1268,7 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
     )
     if not payment:
-        await message.answer("Ошибка создания платежа.")
+        await message.answer("Ошибка создания плат��жа.")
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     await message.answer(
@@ -1192,7 +1316,7 @@ async def check_payment_cb(cb: CallbackQuery):
 
     # Идемпотентность: если "Проверить оплату" нажали повторно уже ПОСЛЕ
     # успешной обработки этого же платежа, всё что ниже (активация,
-    # начисление устройств/ГБ, уведомление админам, реферальный процент)
+    # начисление устройств/ГБ, уведомление админам, ��еферальный процент)
     # не должно повториться второй раз. Атомарный INSERT с ON CONFLICT
     # решает и гонку при почти одновременном двойном тапе.
     async with pool.acquire() as conn:
@@ -1209,7 +1333,7 @@ async def check_payment_cb(cb: CallbackQuery):
         if kind in ("trial", "plan"):
             result_user = await activate_subscription(u_id, days, hwid or 1, squad_uuid=squad, whitelist_gb=whitelist_gb)
             if not result_user:
-                await cb.answer("Ошибка активации. Обратитесь в поддержку.", show_alert=True)
+                await cb.answer("Ошибка активации. Обратитесь в по��держку.", show_alert=True)
                 return
             async with pool.acquire() as conn:
                 if kind == "trial":
@@ -1316,9 +1440,10 @@ async def trial_buy_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 #  КУПИТЬ VPN — выбор тарифа, затем срока
 # ─────────────────────────────────────────────
-@router.callback_query(F.data == "buy_open")
-async def buy_open_cb(cb: CallbackQuery):
-    await cb.answer()
+def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесено
+    отдельно, чтобы использовать как из нажатия кнопки, так и при перебросе
+    из личного кабинета (диплинк)."""
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
     text = (
@@ -1332,6 +1457,12 @@ async def buy_open_cb(cb: CallbackQuery):
         [btn(bypass["name"], emoji_id=BTN_ICON_PLAN_BYPASS, callback_data="buyplan_vpn_bypass")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
+    return text, kb
+
+@router.callback_query(F.data == "buy_open")
+async def buy_open_cb(cb: CallbackQuery):
+    await cb.answer()
+    text, kb = _buy_open_content()
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("buyplan_"))
@@ -2189,7 +2320,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
     await state.clear()
     remna = await remna_get_user(user_id)
     if not remna:
-        await message.answer("Пользователь не найден в Remnawave.")
+        await message.answer("Пользователь н�� найден в Remnawave.")
         return
     result = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": hwid})
     if not result:
@@ -2757,7 +2888,7 @@ async def admin_payout(message: types.Message, command: CommandObject):
 
 # ─────────────────────────────────────────────
 #  ОТЧЁТ (кнопка панели — отправить сразу)
-# ─────────────────────────────────────────────
+# ────────────────────────��────────────────────
 @router.callback_query(F.data == "admin_report")
 async def admin_report_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3377,7 +3508,7 @@ async def admin_report_cmd(message: types.Message):
 
 # ─────────────────────────────────────────────
 #  MAIN
-# ─────────────────────────────────────────────
+# ─────────────���───────────────────────────────
 async def main():
     await init_db()
     await load_extra_admins()
