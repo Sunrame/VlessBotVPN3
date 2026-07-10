@@ -968,7 +968,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     rows.append([btn("Личный кабинет", emoji_id="5282843764451195532", callback_data="cabinet_login")])
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
-    rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
+    rows.append([btn("Промок  д", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
     rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
     if is_admin(user_id):
         rows.append([btn("Панель", emoji_id=BTN_ICON_ADMIN, callback_data="admin_panel")])
@@ -982,30 +982,12 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 _CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
 
 async def get_cabinet_url(user_id: int) -> str | None:
-    """Ссылка на личный кабинет пользователя на сайте.
-    Генерирует (или берёт существующий) 16-символьный код в cabinet_tokens.
-    Если SITE_URL не задан — возвращает None (при нажатии кнопки покажет
-    'временно недоступен', сама кнопка при этом всё равно показывается)."""
+    """Ссылка на страницу входа в личный кабинет на сайте.
+    Вход только по 9-значному коду (без UID). Если SITE_URL не задан —
+    возвращает None (кнопка покажет 'временно недоступен')."""
     if not SITE_URL:
         return None
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
-            if row and row["code"]:
-                return f"{SITE_URL}/cab/{row['code']}"
-            for _ in range(6):
-                code = "".join(secrets.choice(_CAB_ALPHABET) for _ in range(16))
-                await conn.execute(
-                    "INSERT INTO cabinet_tokens (user_id, code, created_at) VALUES ($1,$2,$3) "
-                    "ON CONFLICT (user_id) DO NOTHING",
-                    user_id, code, int(time.time()),
-                )
-                row = await conn.fetchrow("SELECT code FROM cabinet_tokens WHERE user_id=$1", user_id)
-                if row and row["code"]:
-                    return f"{SITE_URL}/cab/{row['code']}"
-    except Exception as e:
-        log.error("get_cabinet_url: %s", e)
-    return None
+    return f"{SITE_URL}/cab"
 
 # Алфавит для кода входа (без похожих символов I, O, 0, 1).
 _LOGIN_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
