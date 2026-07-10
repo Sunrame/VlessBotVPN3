@@ -27,7 +27,6 @@ import db
 import remnawave as rw
 import telegram
 import payments as pay
-import webapp_auth
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
@@ -1373,33 +1372,6 @@ def cabinet_login():
         _set_cab_session(user_id)
         return redirect(url_for("cabinet"))
     return render_template("cab_login.html", support_url=config.SUPPORT_URL)
-
-
-# ──────────────────────── TELEGRAM MINI APP ────────────────────
-@app.route("/tgapp")
-def tgapp():
-    """Точка входа Mini App. Отдаёт страницу, которая читает initData
-    (window.Telegram.WebApp.initData) и отправляет её на /cabinet/tg-auth
-    для проверки подписи и авто-входа в личный кабинет."""
-    return render_template("tgapp.html")
-
-
-@app.route("/cabinet/tg-auth", methods=["POST"])
-def cabinet_tg_auth():
-    """Проверяет подпись Telegram Mini App и открывает сессию кабинета.
-    Не требует ввода кода: Telegram ID берётся из подписанного initData."""
-    init_data = (request.form.get("initData") or "").strip()
-    if not init_data and request.is_json:
-        init_data = ((request.get_json(silent=True) or {}).get("initData") or "").strip()
-    user_id = webapp_auth.extract_user_id(init_data)
-    if not user_id:
-        return jsonify({"ok": False, "error": "bad_signature"}), 403
-    # Пользователь должен существовать в базе (хотя бы раз запускал бота).
-    row = db.query("SELECT user_id FROM users WHERE user_id=%s", (user_id,), one=True)
-    if not row:
-        return jsonify({"ok": False, "error": "not_registered"}), 404
-    _set_cab_session(user_id)
-    return jsonify({"ok": True, "redirect": url_for("cabinet")})
 
 
 @app.route("/cab/as/<int:user_id>")
