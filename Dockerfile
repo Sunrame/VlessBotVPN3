@@ -1,10 +1,11 @@
 FROM python:3.13-slim
 
-# libpq5 — системная библиотека PostgreSQL-клиента (та самая libpq.so.5,
-# которой не хватало в рантайме). Ставим её явно, не полагаясь на то, как
-# конкретно Railway-билдер (Railpack/Nixpacks) соберёт рантайм-слой.
+# libpq5   — рантайм-библиотека (та самая libpq.so.5 из первой ошибки).
+# libpq-dev — заголовки + pg_config, нужны ТОЛЬКО для сборки psycopg2 из
+#             исходников (если под Python 3.13 ещё нет готового wheel).
+# gcc      — компилятор, тоже нужен только для этой сборки.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libpq5 \
+    && apt-get install -y --no-install-recommends libpq5 libpq-dev gcc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
