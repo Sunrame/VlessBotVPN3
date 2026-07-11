@@ -71,9 +71,9 @@ LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
 # URL мини-приложения «Личный кабинет» (Telegram Mini App). Кнопка "Личный
 # кабинет" открывает его прямо в Telegram как WebApp; вход в аккаунт
 # автоматический — по подписанным Telegram initData (без кодов). Если явно не
-# задан, берётся SITE_URL + "/cab". Если ничего не задано — кнопка покажет
+# задан, берётся SITE_URL + "/tgapp". Если ничего не задано — кнопка покажет
 # "временно недоступен".
-MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") or (f"{SITE_URL}/cab" if SITE_URL else "")
+MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") or (f"{SITE_URL}/tgapp" if SITE_URL else "")
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
@@ -383,6 +383,16 @@ async def init_db():
                 created_at BIGINT DEFAULT 0
             )
         """)
+        # Выбранный в мини-приложении раздел оплаты. Мини-апп кладёт сюда раздел
+        # и открывает бота: даже если Telegram не передаст start-параметр (чат
+        # с ботом уже открыт), /start подхватит раздел отсюда.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cabinet_paysection (
+                user_id    BIGINT PRIMARY KEY,
+                section    TEXT,
+                created_at BIGINT DEFAULT 0
+            )
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS cabinet_login_codes (
                 user_id    BIGINT PRIMARY KEY,
@@ -654,7 +664,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
         return []
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юзер            в на ноде белых списков."""
+    """Сырые дневные записи трафика для ВСЕХ юз                  в на ноде белых списков."""
     if not WHITELIST_NODE_UUID:
         return []
     end_dt   = datetime.now(timezone.utc)
@@ -900,7 +910,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         plan  = PLANS[plan_key]
         price = calc_plan_price(plan_key, months)
         await _create_payment_page_from_message(
-            message, kind="plan", item_name=f"Продление {plan['name']} · {months} мес.",
+            message, kind="plan", item_name=f"Продле  ие {plan['name']} · {months} мес.",
             price=price, days=months * 30, hwid=1, squad=plan["squad"],
             whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
         )
@@ -1027,6 +1037,21 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             reply_markup=sub_required_kb(), parse_mode="HTML",
         )
         return
+
+    # Fallback: мини-приложение могло сохранить раздел оплаты в БД, потому что
+    # Telegram не передаёт start-параметр, когда чат с ботом уже открыт. Берём
+    # его, если он свежий (не старше 3 минут), и удаляем запись.
+    if not section:
+        try:
+            async with pool.acquire() as conn:
+                prow = await conn.fetchrow(
+                    "SELECT section, created_at FROM cabinet_paysection WHERE user_id=$1", u_id)
+                if prow:
+                    await conn.execute("DELETE FROM cabinet_paysection WHERE user_id=$1", u_id)
+            if prow and (int(time.time()) - int(prow["created_at"] or 0)) <= 180:
+                section = prow["section"]
+        except Exception:
+            pass
 
     # Переброс из личного кабинета в конкретный раздел оплаты.
     if section:
@@ -1190,7 +1215,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([btn("Улучшить тариф", emoji_id=BTN_ICON_UPGRADE,
                              callback_data="plan_upgrade")])
         elif plan == "vpn_bypass":
-            rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
+            rows.append([btn("Доку  ить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
@@ -1233,7 +1258,7 @@ def _gen_login_code() -> str:
 # которая открывает мини-приложение прямо в Telegram. Вход в аккаунт
 # происходит автоматически — мини-приложение получает подписанные
 # Telegram initData с данными пользователя, поэтому никакие коды входа не
-# требуются. Отдельный callback-хендлер на открытие больше не нужен;
+# требуютс  . Отдельный callback-хендлер на открытие больше не нужен;
 # остаётся только заглушка на случай, когда URL мини-приложения не задан.
 @router.callback_query(F.data == "cabinet_unavailable")
 async def cabinet_unavailable_cb(cb: CallbackQuery):
@@ -1518,7 +1543,7 @@ async def trial_buy_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  КУПИТЬ VPN — выбор тарифа, затем срока
-# ─────────────────────────────────────────────
+# ─────────   ───────────────────────────────────
 def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
     """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесено
     отдельно, чтобы использовать как из нажатия кнопки, так и при перебросе
@@ -1955,7 +1980,7 @@ async def admin_admins_cb(cb: CallbackQuery):
 async def admin_add_start_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     if not is_main_admin(cb.from_user.id):
-        await cb.answer("Доступно только главным админам.", show_alert=True)
+        await cb.answer("Дост  пно только главным админам.", show_alert=True)
         return
     await state.set_state(AdminManageState.waiting_username)
     await cb.message.answer(
@@ -2272,7 +2297,7 @@ async def set_hwid_limit(cb: CallbackQuery):
         pass
 
 # ─────────────────────────────────────────────
-#  ДНИ: добавить / убрать / установить дату
+#  ДНИ: добавить / убрать / ус  ановить дату
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_adddays_"))
 async def ca_adddays_start(cb: CallbackQuery, state: FSMContext):
@@ -2550,7 +2575,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
 
 # ─────────────────────────────────────────────
 #  ЗАБРАТЬ ПОДПИСКУ
-# ─────────────────────────────────────────────
+# ──────────────   ───   ──────────────────────────
 @router.callback_query(F.data.startswith("quicktake_"))
 async def quick_take(cb: CallbackQuery):
     await cb.answer()
@@ -3060,7 +3085,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
     ])
     await message.answer(
         "Какой тариф/доступ выставить?\n\n"
-        "«Не менять» — только продлить дни, сквад и вариант подписки останутся как есть.\n"
+        "«Не менять» — только продлить дни, сквад и вариант подписки остан  тся как есть.\n"
         "«VPN» / «VPN с обходом» — выставит соответствующий тариф и профиль пользователя "
         "переключится в купленное состояние (появятся кнопки «Добавить устройства» и т.д.).\n"
         "«Пробный доступ» — доступ к белым спискам с лимитом 3 ГБ, но БЕЗ пометки как "
@@ -3362,7 +3387,7 @@ async def admin_survey_results_cb(cb: CallbackQuery):
             "WHERE comment IS NOT NULL ORDER BY created_at DESC LIMIT 10"
         )
     avg_r = round(float(avg), 2)
-    lines = [f"Результаты опроса", "", f"Всего ответов: {total}", f"Средняя оценка: {avg_r}/10", "", "Распределение:"]
+    lines = [f"Результаты опроса", "", f"Всего ответов: {total}", f"Ср  дняя оценка: {avg_r}/10", "", "Распределение:"]
     for r in dist:
         bar = "#" * min(r["cnt"], 20)
         lines.append(f"  {r['rating']:2d}/10 · {r['cnt']:3d} чел.  {bar}")
