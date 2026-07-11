@@ -100,7 +100,7 @@ def msk_now() -> datetime:
 #
 #  Работают только в тексте сообщений (parse_mode="HTML"), НЕ в кнопках —
 #  кнопки Telegram принимают только простой текст без форматирования.
-#  Для непремиум-пользователей и старых клиентов показывается fallback-символ
+#    ля непремиум-пользователей и старых клиентов показывается fallback-символ
 #  вместо кастомного эмодзи. Расставлены по одному разу на смысловой момент,
 #  без перегруза одного и того же места несколькими штуками.
 # ─────────────────────────────────────────────
@@ -373,6 +373,16 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS processed_payments (
                 payment_id   TEXT PRIMARY KEY,
                 processed_at BIGINT DEFAULT 0
+            )
+        """)
+        # Отправленные напоминания об окончании подписки (по срокам 3д/1д/1ч).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS expiry_reminders (
+                user_id   BIGINT,
+                kind      TEXT,
+                expire_ts BIGINT,
+                sent_at   BIGINT DEFAULT 0,
+                PRIMARY KEY (user_id, kind, expire_ts)
             )
         """)
         # Токены личного кабинета на сайте (общий с веб-панелью механизм входа).
@@ -654,7 +664,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
         return []
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юз                  в на ноде белых списков."""
+    """Сырые дневные записи трафика для ВСЕХ юз                    в на ноде белых списков."""
     if not WHITELIST_NODE_UUID:
         return []
     end_dt   = datetime.now(timezone.utc)
@@ -942,7 +952,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         await state.update_data(plan=plan)
         await message.answer(
             f"{EMOJI_DEV_TOPUP} Добавить устройства\n\n"
-            f"Цена одного устройства на вашем тарифе: {device_price} руб.\n\n"
+            f"Цена одного устройства на   ашем тарифе: {device_price} руб.\n\n"
             f"Введите, сколько устройств хотите докупить:",
             parse_mode="HTML", reply_markup=cancel_kb(),
         )
@@ -983,7 +993,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             return True
         await state.set_state(WhitelistTopupState.waiting_gb)
         await message.answer(
-            f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
+            f"Докупить трафик (белые списки)\n\n"
             f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
             f"Введите, сколько ГБ хотите докупить:",
             parse_mode="HTML", reply_markup=cancel_kb(),
@@ -1233,7 +1243,7 @@ def _gen_login_code() -> str:
 
 # Кнопка «Личный кабинет» теперь — это WebApp-кнопка (Telegram Mini App),
 # которая открывает мини-приложение прямо в Telegram. Вход в аккаунт
-# происходит автоматически — мини-приложение получает подписанные
+# происходит автоматическ   — мини-приложение получает подписанные
 # Telegram initData с данными пользователя, поэтому никакие коды входа не
 # требуются. От  ельный callback-хендлер на открытие больше не нужен;
 # остаётся только заглушка на случай, когда URL мини-приложения не задан.
@@ -1281,7 +1291,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
     kind: "trial" | "plan" | "device" | "upgrade" | "wl_topup"
     qty — для kind="device": сколько устройств докупается; для kind="wl_topup"
     смотри whitelist_gb (сколько ГБ докупается) — там оно и так уже есть.
-    Возвращает (payment, kb) либо (None, None) при ошибке создания платежа.
+    Возвращает (payment, kb) либо (None, None) при ошибке создани   платежа.
     """
     try:
         payment = Payment.create({
@@ -1522,7 +1532,7 @@ async def trial_buy_cb(cb: CallbackQuery):
 #  КУПИТЬ VPN — выбор тарифа, затем срока
 # ─────────────────────────────────────────────
 def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
-    """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесено
+    """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесен  
     отдельно, чтобы использовать как из нажатия кнопки, так и при перебросе
     из личного кабинета (диплинк)."""
     vpn    = PLANS["vpn"]
@@ -1670,7 +1680,7 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(WhitelistTopupState.waiting_gb)
     await cb.message.edit_text(
-        f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
+        f"Докупить трафик (белые списки)\n\n"
         f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
         f"Введите, сколько ГБ хотите докупить:",
         parse_mode="HTML", reply_markup=cancel_kb(),
@@ -1717,7 +1727,7 @@ async def earn_open_cb(cb: CallbackQuery):
         f"Ваша ссылка:\n{hcode(link)}\n\n"
         f"Приглашено: {ref_count}\n"
         f"Баланс: {balance:.2f} руб.\n"
-        f"Вывод доступен от {REFERRAL_MIN_WITHDRAW} руб."
+        f"Вывод   оступен от {REFERRAL_MIN_WITHDRAW} руб."
     )
     rows = []
     if balance >= REFERRAL_MIN_WITHDRAW:
@@ -3616,12 +3626,142 @@ async def admin_report_cmd(message: types.Message):
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────   ───────────────────────────────
+# ─────────────────────────────────────────────
+#  НАПОМИНАНИЯ ОБ ОКОНЧАНИИ ПОДПИСКИ
+# ─────────────────────────────────────────────
+_EXPIRY_WINDOWS = [("3d", 3 * 86400), ("1d", 86400), ("1h", 3600)]
+_EXPIRY_LABELS  = {"3d": "около 3 дней", "1d": "около 1 дня", "1h": "около 1 часа"}
+
+
+def _renew_kb(plan_key: str) -> InlineKeyboardMarkup:
+    """Клавиатура продления для напоминания. Тап по кнопке уже создаёт саму
+    ссылку на оплату (экран «Оплатить» / «Проверить оплату»)."""
+    rows = []
+    for m in MONTH_CHOICES:
+        price = calc_plan_price(plan_key, m)
+        rows.append([InlineKeyboardButton(
+            text=f"Продлить · {m} мес — {price} ₽",
+            callback_data=f"rnw_{plan_key}_{m}",
+        )])
+    if plan_key == "vpn":
+        # Обычный VPN: дополнительно предлагаем докупить обход белых списков.
+        rows.append([InlineKeyboardButton(
+            text="Добавить обход белых списков",
+            callback_data="plan_upgrade",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("rnw_"))
+async def renew_cb(cb: CallbackQuery):
+    await cb.answer()
+    plan_key, _, months_s = cb.data.removeprefix("rnw_").rpartition("_")
+    if not plan_key or not months_s.isdigit():
+        await cb.answer("Не удалось определить тариф.", show_alert=True)
+        return
+    months = int(months_s)
+    if plan_key not in PLANS or months <= 0:
+        await cb.answer("Тариф недоступен.", show_alert=True)
+        return
+    plan  = PLANS[plan_key]
+    price = calc_plan_price(plan_key, months)
+    await _create_payment_page(
+        cb, kind="plan",
+        item_name=f"Продление {plan['name']} · {months} мес.",
+        price=price, days=months * 30, hwid=1, squad=plan["squad"],
+        whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
+    )
+
+
+async def _send_expiry_reminder(user_id: int, plan_key: str, expire_ts: int, kind: str):
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+    date_str = fmt_dt(expire_ts, "%d.%m.%Y %H:%M")
+    text = (
+        f"⏳ {hbold('Подписка скоро закончится')}\n\n"
+        f"Тариф: {plan['name']}\n"
+        f"Осталось: {_EXPIRY_LABELS.get(kind, '')}\n"
+        f"Действует до: {date_str}\n\n"
+        f"Продлите подписку, чтобы не потерять доступ:"
+    )
+    await bot.send_message(user_id, text, parse_mode="HTML",
+                           reply_markup=_renew_kb(plan_key))
+
+
+async def _run_expiry_reminders():
+    users = await remna_get_all_users()
+    now   = int(time.time())
+    candidates = []
+    for ru in users:
+        if (ru.get("status") or "").upper() == "DISABLED":
+            continue
+        tg_id = ru.get("telegramId")
+        if not tg_id:
+            continue
+        expire_ts = parse_dt(ru.get("expireAt"))
+        if not expire_ts:
+            continue
+        seconds_left = int(expire_ts) - now
+        if seconds_left <= 0 or seconds_left > _EXPIRY_WINDOWS[0][1]:
+            continue
+        candidates.append((int(tg_id), int(expire_ts), seconds_left))
+    if not candidates:
+        return
+    ids = [c[0] for c in candidates]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, plan FROM users WHERE user_id = ANY($1::bigint[])", ids
+        )
+    plan_by_id = {r["user_id"]: r["plan"] for r in rows}
+    windows_asc = sorted(_EXPIRY_WINDOWS, key=lambda x: x[1])
+    for tg_id, expire_ts, seconds_left in candidates:
+        plan_key = plan_by_id.get(tg_id)
+        if plan_key not in ("vpn", "vpn_bypass"):
+            continue
+        reached = [k for k, t in windows_asc if seconds_left <= t]
+        if not reached:
+            continue
+        target = reached[0]  # самое срочное достигнутое окно
+        async with pool.acquire() as conn:
+            sent = await conn.fetch(
+                "SELECT kind FROM expiry_reminders WHERE user_id=$1 AND expire_ts=$2",
+                tg_id, expire_ts,
+            )
+        sent_kinds = {r["kind"] for r in sent}
+        if target not in sent_kinds:
+            try:
+                await _send_expiry_reminder(tg_id, plan_key, expire_ts, target)
+            except Exception as e:
+                log.error("expiry reminder send %s: %s", tg_id, e)
+        # Фиксируем target и подавляем менее срочные (более длинные) окна.
+        async with pool.acquire() as conn:
+            for k in reached:
+                await conn.execute(
+                    "INSERT INTO expiry_reminders (user_id, kind, expire_ts, sent_at) "
+                    "VALUES ($1,$2,$3,$4) ON CONFLICT (user_id, kind, expire_ts) DO NOTHING",
+                    tg_id, k, expire_ts, now,
+                )
+        await asyncio.sleep(0.05)
+
+
+async def expiry_reminder_scheduler():
+    """Раз в 15 минут напоминает об окончании подписки за 3 дня, 1 день и 1 час."""
+    while True:
+        try:
+            await _run_expiry_reminders()
+        except Exception as e:
+            log.error("expiry_reminder_scheduler: %s", e)
+        await asyncio.sleep(15 * 60)
+
+
 async def main():
     await init_db()
     await load_extra_admins()
     dp.include_router(router)
     asyncio.create_task(daily_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
+    asyncio.create_task(expiry_reminder_scheduler())
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
