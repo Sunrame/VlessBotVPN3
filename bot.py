@@ -654,7 +654,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
         return []
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юзер          в на ноде белых списков."""
+    """Сырые дневные записи трафика для ВСЕХ юзер            в на ноде белых списков."""
     if not WHITELIST_NODE_UUID:
         return []
     end_dt   = datetime.now(timezone.utc)
@@ -1145,16 +1145,29 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     rows = []
     cabinet_row    = _cabinet_button_row()
-    cabinet_placed = False
+    user_is_admin  = is_admin(user_id)
+    admin_site_url = "https://accept-finances-cyber-itself.trycloudflare.com/"
+
+    def _place_cabinet():
+        # Кнопка «Личный кабинет», а для админов — сразу под ней ссылка на
+        # админ-сайт.
+        rows.append(cabinet_row)
+        if user_is_admin:
+            rows.append([btn("Админ-сайт", emoji_id=BTN_ICON_ADMIN, url=admin_site_url)])
+
+    # Кнопка «Пробная подписка» показывается только если подписка не активна
+    # и пробный период ещё не использован.
+    show_trial = (not subscription_active or plan not in PLANS) and not trial_used
 
     # Расположение кнопки «Личный кабинет»:
     #     пробная подписка УЖЕ использована (trial_used) → ЛК стоит выше всех
     #    остальных кнопок;
     #  • пробная подписка ещё НЕ использована → ЛК стоит сразу под кнопкой
     #    «Пробная подписка».
-    if trial_used:
-        rows.append(cabinet_row)
-        cabinet_placed = True
+    # «Личный кабинет» стоит выше всех кнопок, КРОМЕ случая, когда показывается
+    # кнопка «Пробная подписка» — тогда ЛК ставится сразу под ней (ниже).
+    if not show_trial:
+        _place_cabinet()
 
     # Кнопки "Купить VPN"/"Пробная" показываются, пока не куплен РЕАЛЬНЫЙ тариф
     # (vpn / vpn_bypass) И подписка при этом реально активна. Проверка именно
@@ -1166,9 +1179,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if not trial_used:
             rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
                              callback_data="trial_buy")])
-            # ЛК стоит сразу под кнопкой пробной подписки
-            rows.append(cabinet_row)
-            cabinet_placed = True
+            # ЛК (и ссылка на админ-сайт для админов) — сразу под пробной подпиской
+            _place_cabinet()
         rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                          callback_data="buy_open")])
     else:
@@ -1181,14 +1193,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
                              callback_data="wl_topup")])
 
-    # Страховка: если ЛК ещё не размещён (например, тариф активен, но пробная
-    # подписка ни разу не использовалась и кнопки «Пробная подписка» нет) —
-    # добавляем кнопку здесь, чтобы личный кабинет был доступен всегда.
-    if not cabinet_placed:
-        rows.append(cabinet_row)
-
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
-    rows.append([btn("Промок  д", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
+    rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
     rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
     if is_admin(user_id):
         rows.append([btn("Панель", emoji_id=BTN_ICON_ADMIN, callback_data="admin_panel")])
@@ -1749,7 +1755,15 @@ async def promo_cancel(cb: CallbackQuery, state: FSMContext):
 
 @router.message(PromoState.waiting_code)
 async def handle_promo(message: types.Message, state: FSMContext):
-    code = message.text.upper().strip()
+    code = (message.text or "").upper().strip()
+    if not code:
+        await message.answer(
+            "Отправьте промокод текстом:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")],
+            ]),
+        )
+        return
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT days, uses, promo_type, tariff_key FROM promos WHERE code=$1", code
@@ -1765,6 +1779,18 @@ async def handle_promo(message: types.Message, state: FSMContext):
     promo_type = row["promo_type"] or "days"
     tariff_key = row["tariff_key"]
     days = row["days"]; uses = row["uses"]
+
+    # Скидочный промокод применяется на шаге оплаты, а не здесь. Иначе он
+    # ошибочно «активировал» бы подписку на 0 дней и сгорал впустую.
+    if promo_type == "discount":
+        await state.clear()
+        await message.answer(
+            "Это промокод на скидку. Введите его на шаге оплаты при покупке "
+            "тарифа — здесь он не активируется."
+        )
+        text, kb = await _build_profile_view(message.from_user.id)
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return
 
     if promo_type == "free_tariff" and tariff_key and tariff_key in PLANS:
         await state.clear()
@@ -1804,7 +1830,13 @@ async def handle_promo(message: types.Message, state: FSMContext):
 @router.callback_query(F.data.startswith("pfree_"))
 async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    _, plan_key, promo_code = cb.data.split("_", 2)
+    # plan_key может содержать «_» (например vpn_bypass), поэтому разбираем по
+    # известным ключам тарифов, а не простым split (иначе выбор тарифа
+    # «VPN с обходом» через промокод ломался).
+    raw = cb.data[len("pfree_"):]
+    plan_key = next((k for k in sorted(PLANS, key=len, reverse=True)
+                     if raw == k or raw.startswith(k + "_")), None)
+    promo_code = raw[len(plan_key) + 1:] if plan_key else ""
     data = await state.get_data()
     days = data.get("promo_days", 30); uses = data.get("promo_uses", 1)
     await state.clear()
@@ -3070,7 +3102,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         squad_uuid   = [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]
         whitelist_gb = TRIAL["whitelist_gb"]
         new_plan     = "trial"
-    # choice == "none": оставляем squad_uuid=None, new_plan=None (ничего не трогаем)
+    # choice == "none":   ставляем squad_uuid=None, new_plan=None (ничего не трогаем)
 
     user = await activate_subscription(
         target_id, days, hwid or 1, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
@@ -3427,7 +3459,7 @@ async def admin_help(message: types.Message):
     await message.answer(
         "Команды администратора:\n\n"
         "/give username дни [уст.] — быстро выдать дни (тариф/сквад не меняет; "
-        "для выбора тарифа используйте кнопку «Выдать» в панели)\n"
+        "для выбора тарифа использу  те кнопку «Выдать» в панели)\n"
         "/check username|id — карточка подписчика\n"
         "/add_promo, /genpromo, /list_promos — промокоды\n"
         "/broadcast — рассылка\n"
