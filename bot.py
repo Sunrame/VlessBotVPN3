@@ -1202,8 +1202,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         elif plan == "vpn_bypass":
             # Без custom-emoji иконки: на части клиентов этот premium-эмодзи
             # рендерился поверх текста и ломал надпись кнопки («Доку  ить»).
-            rows.append([btn("Докупить трафик (белые списки)",
-                             callback_data="wl_topup")])
+            rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
+                 callback_data="wl_topup")])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
