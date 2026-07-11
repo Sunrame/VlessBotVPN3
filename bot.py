@@ -993,7 +993,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             return True
         await state.set_state(WhitelistTopupState.waiting_gb)
         await message.answer(
-            f"Докупить трафик (белые списки)\n\n"
+            f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
             f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
             f"Введите, сколько ГБ хотите докупить:",
             parse_mode="HTML", reply_markup=cancel_kb(),
