@@ -383,16 +383,6 @@ async def init_db():
                 created_at BIGINT DEFAULT 0
             )
         """)
-        # Выбранный в мини-приложении раздел оплаты. Мини-апп кладёт сюда раздел
-        # и открывает бота: даже если Telegram не передаст start-параметр (чат
-        # с ботом уже открыт), /start подхватит раздел отсюда.
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS cabinet_paysection (
-                user_id    BIGINT PRIMARY KEY,
-                section    TEXT,
-                created_at BIGINT DEFAULT 0
-            )
-        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS cabinet_login_codes (
                 user_id    BIGINT PRIMARY KEY,
@@ -910,7 +900,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         plan  = PLANS[plan_key]
         price = calc_plan_price(plan_key, months)
         await _create_payment_page_from_message(
-            message, kind="plan", item_name=f"Продле  ие {plan['name']} · {months} мес.",
+            message, kind="plan", item_name=f"Продление {plan['name']} · {months} мес.",
             price=price, days=months * 30, hwid=1, squad=plan["squad"],
             whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
         )
@@ -1037,21 +1027,6 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             reply_markup=sub_required_kb(), parse_mode="HTML",
         )
         return
-
-    # Fallback: мини-приложение могло сохранить раздел оплаты в БД, потому что
-    # Telegram не передаёт start-параметр, когда чат с ботом уже открыт. Берём
-    # его, если он свежий (не старше 3 минут), и удаляем запись.
-    if not section:
-        try:
-            async with pool.acquire() as conn:
-                prow = await conn.fetchrow(
-                    "SELECT section, created_at FROM cabinet_paysection WHERE user_id=$1", u_id)
-                if prow:
-                    await conn.execute("DELETE FROM cabinet_paysection WHERE user_id=$1", u_id)
-            if prow and (int(time.time()) - int(prow["created_at"] or 0)) <= 180:
-                section = prow["section"]
-        except Exception:
-            pass
 
     # Переброс из личного кабинета в конкретный раздел оплаты.
     if section:
@@ -1215,7 +1190,9 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([btn("Улучшить тариф", emoji_id=BTN_ICON_UPGRADE,
                              callback_data="plan_upgrade")])
         elif plan == "vpn_bypass":
-            rows.append([btn("Доку  ить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
+            # Без custom-emoji иконки: на части клиентов этот premium-эмодзи
+            # рендерился поверх текста и ломал надпись кнопки («Доку  ить»).
+            rows.append([btn("Докупить трафик (белые списки)",
                              callback_data="wl_topup")])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
@@ -1258,7 +1235,7 @@ def _gen_login_code() -> str:
 # которая открывает мини-приложение прямо в Telegram. Вход в аккаунт
 # происходит автоматически — мини-приложение получает подписанные
 # Telegram initData с данными пользователя, поэтому никакие коды входа не
-# требуютс  . Отдельный callback-хендлер на открытие больше не нужен;
+# требуются. От  ельный callback-хендлер на открытие больше не нужен;
 # остаётся только заглушка на случай, когда URL мини-приложения не задан.
 @router.callback_query(F.data == "cabinet_unavailable")
 async def cabinet_unavailable_cb(cb: CallbackQuery):
@@ -1543,7 +1520,7 @@ async def trial_buy_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  КУПИТЬ VPN — выбор тарифа, затем срока
-# ─────────   ───────────────────────────────────
+# ─────────────────────────────────────────────
 def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
     """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесено
     отдельно, чтобы использовать как из нажатия кнопки, так и при перебросе
@@ -1745,7 +1722,7 @@ async def earn_open_cb(cb: CallbackQuery):
     rows = []
     if balance >= REFERRAL_MIN_WITHDRAW:
         text += f"\n\nПорог вывода достигнут!"
-        withdraw_text = f"Хочу вывести реферальный баланс ({balance:.2f} руб.)"
+        withdraw_text = f"Хочу вывес  и реферальный баланс ({balance:.2f} руб.)"
         withdraw_url  = f"{SUPPORT_URL}?text={withdraw_text.replace(' ', '%20')}"
         rows.append([InlineKeyboardButton(text="Написать для вывода", url=withdraw_url)])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
@@ -1892,7 +1869,7 @@ async def info_tab(cb: CallbackQuery):
         f"{EMOJI_INFO} О сервисе",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [btn("Канал с инструкциями", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
+            [btn("Канал с инструкция  и", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
             [btn("Пользовательское соглашение", emoji_id=BTN_ICON_TOS,
                 url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
             [btn("Политика конфиденциальности", emoji_id=BTN_ICON_PRIVACY,
@@ -2726,7 +2703,7 @@ async def admin_promos_cb(cb: CallbackQuery):
 #  своё число) → код (текстом, либо 0 для автогенерации) → готово.
 #  Тип "скидка" не предлагается — в текущей версии бота скидочные промокоды
 #  нигде не обрабатываются при активации, создавать их значит создавать
-#  нерабочую функциональность.
+#  не  абочую функциональность.
 # ─────────────────────────────────────────────
 async def _create_promo(code: str, days: int, uses: int, promo_type: str, tariff_key: str | None = None):
     async with pool.acquire() as conn:
@@ -2878,7 +2855,7 @@ async def broadcast_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.set_state(BroadcastState.waiting_text)
-    await message.answer("Рассылка\n\nВведите текст.", reply_markup=cancel_kb())
+    await message.answer("Рассылка\n\nВв  дите текст.", reply_markup=cancel_kb())
 
 @router.message(Command("cancel"), BroadcastState.waiting_text)
 async def broadcast_cancel(message: types.Message, state: FSMContext):
