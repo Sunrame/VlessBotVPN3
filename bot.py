@@ -77,12 +77,12 @@ MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") or (f"{SITE_URL}/tga
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
-# Основной сквад (все сервера, кроме белых списков)
+# Основной сквад (все сервера, кроме глушилок)
 SQUAD_UUID = os.environ.get("SQUAD_UUID_BASIC", "")
 SQUAD_UUID_BASIC = SQUAD_UUID
-# Сквад с доступом к серверу белых списков
+# Сквад с доступом к серверу глушилок
 SQUAD_UUID_WHITELIST = os.environ.get("SQUAD_UUID_WHITELIST", SQUAD_UUID)
-# UUID самой ноды "белые списки" — нужен для проверки индивидуального расхода трафика
+# UUID самой ноды "глушилки" — нужен для проверки индивидуального расхода трафика
 WHITELIST_NODE_UUID = os.environ.get("WHITELIST_NODE_UUID", "")
 
 MSK = timezone(timedelta(hours=3))
@@ -130,7 +130,7 @@ BTN_ICON_BUY_VPN         = "5312361253610475399"  # Купить VPN
 BTN_ICON_PROMO           = "5465169893580086142"  # Промокод
 BTN_ICON_INFO            = "5334544901428229844"  # О сервисе
 BTN_ICON_EARN            = "5287231198098117669"  # Заработать
-BTN_ICON_PLAN_BYPASS     = "5447410659077661506"  # VPN с обходом белых списков
+BTN_ICON_PLAN_BYPASS     = "5447410659077661506"  # VPN с обходом глушилок
 BTN_ICON_PLAN_VPN        = "5427168083074628963"  # VPN
 BTN_ICON_ADMIN           = "5231200819986047254"  # Панель (админ)
 BTN_ICON_DEV_TOPUP       = "5407025283456835913"  # Добавить устройства
@@ -141,7 +141,7 @@ EMOJI_TRUBAVPN      = premium_emoji("5224450179368767019", "\U0001f310")  # "Tru
 EMOJI_INFO          = premium_emoji("5334544901428229844", "\u2728")   # заголовок "О сервисе"
 EMOJI_EARN          = premium_emoji("5287231198098117669", "\U0001f4b0")  # заголовок "Заработать"
 EMOJI_PROFILE       = premium_emoji("5341715473882955310", "\u2b50")   # заголовок "Профиль"
-EMOJI_PLAN_BYPASS   = premium_emoji("5447410659077661506", "\U0001f7e3")  # заголовок "VPN с обходом белых списков"
+EMOJI_PLAN_BYPASS   = premium_emoji("5447410659077661506", "\U0001f7e3")  # заголовок "VPN с обходом глушилок"
 EMOJI_PLAN_VPN      = premium_emoji("5427168083074628963", "\U0001f535")  # заголовок "VPN"
 EMOJI_CHOOSE_TERM   = premium_emoji("5382194935057372936", "\U0001f4c5")  # "Выберите срок"
 EMOJI_SUB_LINK      = premium_emoji("5271604874419647061", "\U0001f517")  # "Ссылка на подписку:"
@@ -188,7 +188,7 @@ TRIAL = {
     "whitelist_gb": 3,
     "desc": (
         "24 часа доступа ко всем серверам. Трафик VPN не ограничен, трафик "
-        "на обход белых списков ограничен 3 ГБ. Лимит устройств — 1."
+        "на обход глушилок ограничен 3 ГБ. Лимит устройств — 1."
     ),
 }
 
@@ -205,17 +205,17 @@ PLANS = {
     },
     "vpn_bypass": {
         "key":          "vpn_bypass",
-        "name":         "VPN с обходом белых списков",
+        "name":         "VPN с обходом глушилок",
         "price_month":  149,
         "device_price": 70,
         "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
         "whitelist_gb": 20,
         "desc": (
             "Более трёх локаций, 1 устройство, трафик не ограничен.\n"
-            "Трафик на обход белых списков ограничен 20 ГБ."
+            "Трафик на обход глушилок ограничен 20 ГБ."
         ),
         "extra": (
-            "Дополнительные устройства и трафик для обхода белых списков "
+            "Дополнительные устройства и трафик для обхода глушилок "
             "докупаются в главном меню или личном кабинете после покупки тарифа."
         ),
     },
@@ -223,7 +223,7 @@ PLANS = {
 
 MONTH_CHOICES = [1, 3, 6, 12]
 
-# Докупка трафика на белых списках: цена за 1 ГБ. Пользователь сам вводит
+# Докупка трафика на глушилках: цена за 1 ГБ. Пользователь сам вводит
 # сколько ГБ хочет купить, итоговая цена = кол-во * цена за ГБ.
 WHITELIST_PRICE_PER_GB = int(os.environ.get("WHITELIST_PRICE_PER_GB", "3"))
 
@@ -669,7 +669,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
         return []
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юз                    в на ноде белых списков."""
+    """Сырые дневные записи трафика для ВСЕХ юз                    в на ноде глушилок."""
     if not WHITELIST_NODE_UUID:
         return []
     end_dt   = datetime.now(timezone.utc)
@@ -697,7 +697,7 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1,
     squad_uuid=None — не менять текущий сквад (для admin-действий без явного тарифа).
     squad_uuid может быть одной строкой или списком (vpn_bypass/trial нужны сразу
     и Basic, и White List сквады одновременно, а не замена одного на другой).
-    whitelist_gb>0 — заводим/обновляем отслеживание лимита белых списков.
+    whitelist_gb>0 — заводим/обновляем отслеживание лимита глушилок.
     """
     user = await remna_get_user(user_id)
     if user:
@@ -813,7 +813,7 @@ def calc_plan_price(plan_key: str, months: int) -> int:
 
 def calc_upgrade_price(extra_devices: int) -> int:
     """
-    Доплата за апгрейд VPN -> VPN с обходом белых списков.
+    Доплата за апгрейд VPN -> VPN с обходом глушилок.
 
     Дн   подписки при   пгрейде не пересчитываются и не трогаются — остаются
     ровно те же, что были. Поэтому доплата — просто фиксированная разница
@@ -976,7 +976,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         price = calc_upgrade_price(row["extra_devices"] or 0)
         await _create_payment_page_from_message(
             message, kind="upgrade",
-            item_name="Улучшение тарифа до VPN с обходом белых списков",
+            item_name="Улучшение тарифа до VPN с обходом глушилок",
             price=price, days=0, display_prefix=EMOJI_UPGRADE,
         )
         return True
@@ -992,13 +992,13 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         if gb and gb > 0:
             price = gb * WHITELIST_PRICE_PER_GB
             await _create_payment_page_from_message(
-                message, kind="wl_topup", item_name=f"+{gb} ГБ на белых списках",
+                message, kind="wl_topup", item_name=f"+{gb} ГБ на глушилках",
                 price=price, days=0, whitelist_gb=gb,
             )
             return True
         await state.set_state(WhitelistTopupState.waiting_gb)
         await message.answer(
-            f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
+            f"{EMOJI_GB_TOPUP} Докупить трафик (глушилки)\n\n"
             f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
             f"Введите, сколько ГБ хотите докупить:",
             parse_mode="HTML", reply_markup=cancel_kb(),
@@ -1109,7 +1109,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         # Тариф определ  ется ЖИВОЙ проверкой сквадов на каждый показ профиля
         # (не по значению в БД) — так текст и кнопки всегда соответствуют
         # реальному состоянию в Remnawave, даже если plan в БД устарел/не
-        # задан. Триал — единственное исключение (тот же сквад белых списков,
+        # задан. Триал — единственное исключение (тот же сквад глушилок,
         # что и у vpn_bypass, поэтому его нельзя отличить по скваду и он
         # хранится отдельным явным флагом).
         if plan == "trial":
@@ -1127,7 +1127,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 )
         plan = live_plan
 
-        # Остаток трафика на белых списках — только если реально отслеживается
+        # Остаток трафика на глушилках — только если реально отслеживается
         # (есть строка в whitelist_limits с лимит  м > 0). Своя отдельная строка,
         # не смешивается с тарифом/устройствами.
         gb_line = ""
@@ -1140,7 +1140,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 records   = await fetch_whitelist_daily_records(days_back=40)
                 used_gb   = sum_whitelist_bytes_for_user(records, user_id, wl_row["period_start"]) / 1024 ** 3
                 remaining = max(0.0, wl_row["gb_limit"] - used_gb)
-                gb_line = f"Осталось трафика на белых списках: {remaining:.1f}/{wl_row['gb_limit']} ГБ"
+                gb_line = f"Осталось трафика на глушилках: {remaining:.1f}/{wl_row['gb_limit']} ГБ"
 
         lines += [
             f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}",
@@ -1207,7 +1207,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         elif plan == "vpn_bypass":
             # Без custom-emoji иконки: на части клиентов этот premium-эмодзи
             # рендерился поверх текста и ломал надпись кнопки («Доку  ить»).
-            rows.append([btn("Докупить трафик (белые списки)", emoji_id=BTN_ICON_GB_TOPUP,
+            rows.append([btn("Докупить трафик (глушилки)", emoji_id=BTN_ICON_GB_TOPUP,
                  callback_data="wl_topup")])
 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
@@ -1286,7 +1286,7 @@ async def profile_cb(cb: CallbackQuery):
 
 # ─────────   ───────────────────────────────────
 #  ОБЩАЯ СТРАНИЦА ОПЛАТЫ (YooKassa)
-# ─────────────────────────────────────────────
+# ───────  ─────────────────────────────────────
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | list[str] | None = None, whitelist_gb: int = 0,
@@ -1647,7 +1647,7 @@ async def dev_add_count_handler(message: types.Message, state: FSMContext):
     )
 
 # ─────────────────────────────────────────────
-#  УЛУЧШИТЬ ТАРИФ (VPN -> VPN с обходом белых списков)
+#  УЛУЧШИТЬ ТАРИФ (VPN -> VPN с обходом глушилок)
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "plan_upgrade")
 async def plan_upgrade_cb(cb: CallbackQuery):
@@ -1664,7 +1664,7 @@ async def plan_upgrade_cb(cb: CallbackQuery):
         return
     price = calc_upgrade_price(row["extra_devices"] or 0)
     await _create_payment_page(
-        cb, kind="upgrade", item_name="Улучшение тарифа до VPN с обходом белых списков",
+        cb, kind="upgrade", item_name="Улучшение тарифа до VPN с обходом глушилок",
         price=price, days=0, display_prefix=EMOJI_UPGRADE,
     )
 
@@ -1681,7 +1681,7 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(WhitelistTopupState.waiting_gb)
     await cb.message.edit_text(
-        f"Докупить трафик (белые списки)\n\n"
+        f"Докупить трафик (глушилки)\n\n"
         f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
         f"Введите, сколько ГБ хотите докупить:",
         parse_mode="HTML", reply_markup=cancel_kb(),
@@ -1704,7 +1704,7 @@ async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
     await state.clear()
     price = gb * WHITELIST_PRICE_PER_GB
     await _create_payment_page_from_message(
-        message, kind="wl_topup", item_name=f"+{gb} ГБ на белых списках",
+        message, kind="wl_topup", item_name=f"+{gb} ГБ на глушилках",
         price=price, days=0, whitelist_gb=gb,
     )
 
@@ -1994,7 +1994,7 @@ async def admin_add_username_handler(message: types.Message, state: FSMContext):
     target_id = row["user_id"]
     await state.clear()
     if is_admin(target_id):
-        await message.answer(f"@{username} уже является админом.")
+        await message.answer(f"@{username} уже является   дмином.")
         return
     async with pool.acquire() as conn:
         await conn.execute(
@@ -2014,7 +2014,7 @@ async def admin_add_username_handler(message: types.Message, state: FSMContext):
 async def admin_del_cb(cb: CallbackQuery):
     await cb.answer()
     if not is_main_admin(cb.from_user.id):
-        await cb.answer("Доступно только главным админам.", show_alert=True)
+        await cb.answer("Доступно только главным адм  нам.", show_alert=True)
         return
     target_id = int(cb.data.removeprefix("admin_del_"))
     async with pool.acquire() as conn:
@@ -2133,7 +2133,7 @@ async def sub_view_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  КАРТОЧКА ПОДПИСЧИКА (/check)
-# ─────────────────────────────────────────────
+# ──────────────────  ──────────────────────────
 def _check_kb(user_id: int, hwid: int, has_whitelist: bool = False) -> InlineKeyboardMarkup:
     preset_row = []
     rows = []
@@ -2145,7 +2145,7 @@ def _check_kb(user_id: int, hwid: int, has_whitelist: bool = False) -> InlineKey
     if preset_row:
         rows.append(preset_row)
 
-    whitelist_btn_text = "Забрать белые списки" if has_whitelist else "Дать белые списки"
+    whitelist_btn_text = "Забрать глушилки" if has_whitelist else "Дать глушилки"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="+ Дни", callback_data=f"ca_adddays_{user_id}"),
          InlineKeyboardButton(text="- Дни", callback_data=f"ca_subdays_{user_id}"),
@@ -2207,14 +2207,14 @@ async def _render_check(target_send, user_id: int):
             f"До: {date_str} ({days_left} дн.)",
             f"Трафик: {used_gb} GB",
             f"Устройств: {hwid}",
-            f"Белые списки: {'да' if has_whitelist_squad else 'нет'}",
+            f"Глушилки: {'да' if has_whitelist_squad else 'нет'}",
         ]
         if wl_row:
             since_ts = wl_row["period_start"]
             records  = await fetch_whitelist_daily_records(days_back=40)
             used_wl_gb = sum_whitelist_bytes_for_user(records, user_id, since_ts) / 1024 ** 3
             lines.append(
-                f"  Лимит белых списков: {used_wl_gb:.1f}/{wl_row['gb_limit']} GB"
+                f"  Лимит глушилок: {used_wl_gb:.1f}/{wl_row['gb_limit']} GB"
                 f"{' (отключён)' if wl_row['cut_off'] else ''}"
             )
     else:
@@ -2456,7 +2456,7 @@ async def ca_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
 
-# ─────────────────────────────────────────────
+# ───────────  ─────────────────────────────────
 #  СПИСО   УСТРОЙСТВ (HWID inspector)
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_devices_"))
@@ -2510,11 +2510,11 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
             return
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
-        await cb.message.answer(f"ID:{user_id} — доступ к белым спискам отозван.")
+        await cb.message.answer(f"ID:{user_id} — доступ к глушилкам отозван.")
         await _render_check(cb, user_id)
     else:
         await cb.message.answer(
-            f"Выдать доступ к белым спискам для ID:{user_id}\n\n"
+            f"Выдать доступ к глушилкам для ID:{user_id}\n\n"
             f"Введите лимит в ГБ (0 = без лимита, без отслеживания):",
             reply_markup=cancel_kb(),
         )
@@ -2558,7 +2558,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
 
     limit_label = f"{gb_limit} GB" if gb_limit > 0 else "без лимита"
-    await message.answer(f"ID:{user_id} — доступ к белым спискам выдан. Лимит: {limit_label}")
+    await message.answer(f"ID:{user_id} — доступ к глушилкам выдан. Лимит: {limit_label}")
     await _render_check(message, user_id)
 
 # ─────────────────────────────────────────────
@@ -3068,15 +3068,15 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
         [InlineKeyboardButton(text="VPN", callback_data="giveplan_vpn")],
-        [InlineKeyboardButton(text="VPN с обходом белых списков", callback_data="giveplan_vpn_bypass")],
-        [InlineKeyboardButton(text="Пробный доступ (белые списки, 3 ГБ)", callback_data="giveplan_trial")],
+        [InlineKeyboardButton(text="VPN с обходом глушилок", callback_data="giveplan_vpn_bypass")],
+        [InlineKeyboardButton(text="Пробный доступ (глушилки, 3 ГБ)", callback_data="giveplan_trial")],
     ])
     await message.answer(
         "Какой тариф/доступ выставить?\n\n"
         "«Не менять» — только продлить дни, сквад и вариант подписки остан  тся как есть.\n"
         "«VPN» / «VPN с обходом» — выставит соответствующий тариф и профиль пользователя "
         "переключится в купленное состояние (появятся кнопки «Добавить устройства» и т.д.).\n"
-        "«Пробный доступ» — доступ к белым спискам с лимитом 3 ГБ, но БЕЗ пометки как "
+        "«Пробный доступ» — доступ к глушилкам с лимитом 3 ГБ, но БЕЗ пометки как "
         "купленный тариф (кнопки покупки в профиле останутся).",
         reply_markup=kb,
     )
@@ -3478,7 +3478,7 @@ async def admin_help(message: types.Message):
         "/broadcast — рассылка\n"
         "/payout username — выплатить реф. баланс\n"
         "/sale_notify — вкл/выкл уведомления о покупках\n"
-        "/whitelist_check, /whitelist_status — лимиты белых списков\n\n"
+        "/whitelist_check, /whitelist_status — лимиты глушилок\n\n"
         "Кнопка «Панель» в профиле открывает то же самое через интерфейс."
     )
 
@@ -3515,7 +3515,7 @@ async def check_whitelist_limits():
                     try:
                         await bot.send_message(
                             user_id,
-                            f"Вы исчерпали лимит трафика на белых списках "
+                            f"Вы исчерпали лимит трафика на глушилках "
                             f"({used_gb:.1f}/{gb_limit} GB за текущий период). "
                             f"Доступ к остальным серверам сохранён.",
                             parse_mode="HTML",
@@ -3537,7 +3537,7 @@ async def admin_whitelist_check_now(message: types.Message):
     if not WHITELIST_NODE_UUID:
         await message.answer("WHITELIST_NODE_UUID не задан.")
         return
-    await message.answer("Проверяю лимиты белых списков...")
+    await message.answer("Проверяю лимиты глушилок...")
     await check_whitelist_limits()
     await message.answer("Готово. Смотри /whitelist_status для деталей.")
 
@@ -3555,11 +3555,11 @@ async def admin_whitelist_status(message: types.Message):
             "ORDER BY wl.period_start DESC"
         )
     if not tracked:
-        await message.answer("Пока никто не отслеживается по лимиту белых списков.")
+        await message.answer("Пока никто не отслеживается по лимиту глушилок.")
         return
     await message.answer("Считаю расход...")
     records = await fetch_whitelist_daily_records(days_back=40)
-    lines = ["Лимиты белых списков", ""]
+    lines = ["Лимиты глушилок", ""]
     for row in tracked:
         used = sum_whitelist_bytes_for_user(records, row["user_id"], row["period_start"])
         used_gb  = used / 1024 ** 3
@@ -3645,9 +3645,9 @@ def _renew_kb(plan_key: str) -> InlineKeyboardMarkup:
             callback_data=f"rnw_{plan_key}_{m}",
         )])
     if plan_key == "vpn":
-        # Обычный VPN: дополнительно предлагаем докупить обход белых списков.
+        # Обычный VPN: дополнительно предлагаем докупить обход глушилок.
         rows.append([InlineKeyboardButton(
-            text="Добавить обход белых списков",
+            text="Добавить обход глушилок",
             callback_data="plan_upgrade",
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
