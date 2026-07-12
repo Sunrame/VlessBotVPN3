@@ -1073,7 +1073,7 @@ def _cabinet_button_row() -> list[InlineKeyboardButton]:
     кабинет временно недоступен."""
     url = get_cabinet_webapp_url()
     if url:
-        return [btn("Личный кабинет", emoji_id="5282843764451195532",
+        return [btn("Управление подпиской", emoji_id="5282843764451195532",
                     web_app=WebAppInfo(url=url))]
     return [btn("Личный кабинет", emoji_id="5282843764451195532",
                 callback_data="cabinet_unavailable")]
