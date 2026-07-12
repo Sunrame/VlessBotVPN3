@@ -1869,7 +1869,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(f"Промокод {promo_code} активирован — {plan['name']}, {days} дн.\n\n{text}",
                                parse_mode="HTML", reply_markup=kb)
 
-# ─────────────────────────────────────────────
+#   ────────────────────────────────────────────
 #  О СЕРВИСЕ
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "info_tab")
@@ -2456,7 +2456,7 @@ async def ca_cancel(message: types.Message, state: FSMContext):
     await message.answer("Отменено.")
 
 # ─────────────────────────────────────────────
-#  СПИСОК УСТРОЙСТВ (HWID inspector)
+#  СПИСО   УСТРОЙСТВ (HWID inspector)
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_devices_"))
 async def ca_devices_show(cb: CallbackQuery):
@@ -2470,7 +2470,7 @@ async def ca_devices_show(cb: CallbackQuery):
         return
     devices = await remna_get_user_hwid(remna["uuid"])
     if not devices:
-        await cb.message.answer(f"Устройства ID:{user_id}\n\nНет зарегистрированных устройств.")
+        await cb.message.answer(f"Устройства ID:{user_id}\n\nНет заре  истрированных устройств.")
         return
     lines = [f"Устройства ID:{user_id} ({len(devices)} шт.)"]
     for i, d in enumerate(devices, 1):
@@ -3746,13 +3746,14 @@ async def _run_expiry_reminders():
 
 
 async def expiry_reminder_scheduler():
-    """Раз в 15 минут напоминает об окончании подписки за 3 дня, 1 день и 1 час."""
+    """Каждые 5 минут напоминает об окончании подписки за 3 дня, 1 день и 1 час.
+    Первый прогон — сразу при старте бота, поэтому уведомление приходит быстро."""
     while True:
         try:
             await _run_expiry_reminders()
         except Exception as e:
             log.error("expiry_reminder_scheduler: %s", e)
-        await asyncio.sleep(15 * 60)
+        await asyncio.sleep(5 * 60)
 
 
 async def main():
