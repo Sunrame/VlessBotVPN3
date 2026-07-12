@@ -201,6 +201,7 @@ PLANS = {
         "squad":        [SQUAD_UUID_BASIC],
         "whitelist_gb": 0,
         "desc": "Более трёх локаций, 1 устройство, трафик не ограничен.",
+        "extra": "Дополнительные устройства докупаются в главном меню или личном кабинете после покупки тарифа.",
     },
     "vpn_bypass": {
         "key":          "vpn_bypass",
@@ -210,8 +211,12 @@ PLANS = {
         "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
         "whitelist_gb": 20,
         "desc": (
-            "Более трёх локаций, 1 устройство, трафик не ограничен. "
+            "Более трёх локаций, 1 устройство, трафик не ограничен.\n"
             "Трафик на обход белых списков ограничен 20 ГБ."
+        ),
+        "extra": (
+            "Дополнительные устройства и трафик для обхода белых списков "
+            "докупаются в главном меню или личном кабинете после покупки тарифа."
         ),
     },
 }
@@ -1101,7 +1106,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         current_squads = _squad_uuids(remna.get("activeInternalSquads"))
         has_whitelist  = SQUAD_UUID_WHITELIST in current_squads
 
-        # Тариф определяется ЖИВОЙ проверкой сквадов на каждый показ профиля
+        # Тариф определ  ется ЖИВОЙ проверкой сквадов на каждый показ профиля
         # (не по значению в БД) — так текст и кнопки всегда соответствуют
         # реальному состоянию в Remnawave, даже если plan в БД устарел/не
         # задан. Триал — единственное исключение (тот же сквад белых списков,
@@ -1538,10 +1543,8 @@ def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
     text = (
-        f"{EMOJI_PLAN_VPN} {hbold(vpn['name'])}\n{vpn['desc']}\n{vpn['price_month']} руб./мес.\n\n"
-        f"{EMOJI_PLAN_BYPASS} {hbold(bypass['name'])}\n{bypass['desc']}\n{bypass['price_month']} руб./мес.\n\n"
-        f"Дополнительные устройства и трафик для обхода белых списков "
-        f"докупаются в главном меню после покупки тарифа."
+        f"{EMOJI_PLAN_VPN} {hbold(vpn['name'])}\n{vpn['desc']}\n{vpn['extra']}\n{vpn['price_month']} руб./мес.\n\n"
+        f"{EMOJI_PLAN_BYPASS} {hbold(bypass['name'])}\n{bypass['desc']}\n{bypass['extra']}\n{bypass['price_month']} руб./мес."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn(vpn["name"], emoji_id=BTN_ICON_PLAN_VPN, callback_data="buyplan_vpn")],
@@ -1572,9 +1575,7 @@ async def buyplan_cb(cb: CallbackQuery):
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buymonths_{plan_key}_{months}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="buy_open")])
     await cb.message.edit_text(
-        f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n\n"
-        f"Дополнительные устройства и трафик для обхода белых списков "
-        f"докупаются в главном меню после покупки.\n\n"
+        f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n{plan['extra']}\n\n"
         f"{EMOJI_CHOOSE_TERM} Выберите срок:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
