@@ -1075,7 +1075,7 @@ def _cabinet_button_row() -> list[InlineKeyboardButton]:
     if url:
         return [btn("Управление подпиской", emoji_id="5282843764451195532",
                     web_app=WebAppInfo(url=url))]
-    return [btn("Личный кабинет", emoji_id="5282843764451195532",
+    return [btn("Управление подпиской", emoji_id="5282843764451195532",
                 callback_data="cabinet_unavailable")]
 
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
