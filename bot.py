@@ -1508,7 +1508,9 @@ async def check_payment_cb(cb: CallbackQuery):
  
         await notify_admins_sale(u_id, uname, item_name, days, price, is_trial)
  
-        if referrer_id and not is_trial:
+        # Пробная подписка тоже является оплаченной покупкой (10 руб.),
+        # поэтому реферальное вознаграждение начисляется и с неё.
+        if referrer_id:
             await credit_referral(referrer_id, u_id, uname, item_name, price)
  
     text, kb = await _build_profile_view(u_id)
