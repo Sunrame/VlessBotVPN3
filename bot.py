@@ -4,13 +4,11 @@ import string
 import secrets
 import logging
 import time
-import json
-import base64
 import asyncio
 import asyncpg
 import httpx
 from datetime import datetime, timedelta, timezone
-
+ 
 from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -18,9 +16,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo
-
+ 
 from yookassa import Configuration, Payment
-
+ 
 # ─────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────
@@ -28,68 +26,57 @@ API_TOKEN    = os.environ["BOT_TOKEN"]
 SHOP_ID      = os.environ["SHOP_ID"]
 YOOKASSA_KEY = os.environ["YOOKASSA_KEY"]
 DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
-
+ 
 REMNAWAVE_URL    = os.environ["REMNAWAVE_URL"].rstrip("/")
 REMNAWAVE_TOKEN  = os.environ["REMNAWAVE_TOKEN"]
 REMNAWAVE_COOKIE = os.environ["REMNAWAVE_COOKIE"]
 SUB_BASE_URL     = os.environ["SUB_BASE_URL"].rstrip("/")
-
+ 
 ADMIN_IDS: list[int] = []
 for _key in ("ADMIN_ID_1", "ADMIN_ID_2"):
     _val = os.environ.get(_key, "")
     if _val.isdigit():
         ADMIN_IDS.append(int(_val))
-
+ 
 # Динамически добавленные админы (через панель) — хранятся в БД, кэшируются
 # в память при старте и при каждом добавлении/удалении, чтобы не дёргать БД
 # на каждую проверку прав. ADMIN_IDS (из переменных окружения) — "главные"
 # админы, только они могут добавлять/убирать остальных.
 EXTRA_ADMIN_IDS: set[int] = set()
-
+ 
 def is_admin(user_id: int) -> bool:
     """Любой админ — главный (из env) или добавленный через панель."""
     return user_id in ADMIN_IDS or user_id in EXTRA_ADMIN_IDS
-
+ 
 def is_main_admin(user_id: int) -> bool:
     """Только главный админ (ADMIN_ID_1/ADMIN_ID_2) — может управлять списком админов."""
     return user_id in ADMIN_IDS
-
+ 
 def all_admin_ids() -> list[int]:
     """Главные + динамически добавленные админы — для массовых рассылок уведомлений."""
     return ADMIN_IDS + list(EXTRA_ADMIN_IDS)
-
+ 
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 CHANNEL_ID   = os.environ.get("CHANNEL_ID", "@Truba_VPN")
-
+ 
 # Юзернейм поддержки — кнопка "Тех.Поддержка" ведёт в личку с этим аккаунтом
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
 SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
-
+ 
 # Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
 SITE_URL           = os.environ.get("SITE_URL", "").rstrip("/")
 LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
-
+ 
 # URL мини-приложения «Личный кабинет» (Telegram Mini App). Кнопка "Личный
 # кабинет" открывает его прямо в Telegram как WebApp; вход в аккаунт
 # автоматический — по подписанным Telegram initData (без кодов). Если явно не
 # задан, берётся SITE_URL + "/tgapp". Если ничего не задано — кнопка покажет
 # "временно недоступен".
 MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") or (f"{SITE_URL}/tgapp" if SITE_URL else "")
-
+ 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
-
-# ─────────────────────────────────────────────
-#  «МОЙ НАЛОГ» (самозанятость) — КОНФИГУРАЦИЯ
-# ─────────────────────────────────────────────
-# Включение авточеков. NALOG_ENABLED=0 — полностью отключить.
-NALOG_ENABLED = os.environ.get("NALOG_ENABLED", "1") == "1"
-# Телефон самозанятого (только цифры, напр. 79001234567) — для входа по SMS.
-NALOG_PHONE = "".join(ch for ch in os.environ.get("NALOG_PHONE", "") if ch.isdigit())
-# Фиксированное название услуги в чеке. Если пусто — берётся название товара.
-NALOG_SERVICE_NAME = os.environ.get("NALOG_SERVICE_NAME", "").strip()
-NALOG_API = "https://lknpd.nalog.ru"  # базовый хост; версия API указывается в пути
-
+ 
 # Основной сквад (все сервера, кроме глушилок)
 SQUAD_UUID = os.environ.get("SQUAD_UUID_BASIC", "")
 SQUAD_UUID_BASIC = SQUAD_UUID
@@ -97,17 +84,17 @@ SQUAD_UUID_BASIC = SQUAD_UUID
 SQUAD_UUID_WHITELIST = os.environ.get("SQUAD_UUID_WHITELIST", SQUAD_UUID)
 # UUID самой ноды "глушилки" — нужен для проверки индивидуального расхода трафика
 WHITELIST_NODE_UUID = os.environ.get("WHITELIST_NODE_UUID", "")
-
+ 
 MSK = timezone(timedelta(hours=3))
-
+ 
 def fmt_dt(ts: int, fmt: str = "%d.%m.%Y %H:%M") -> str:
     if not ts:
         return "нет данных"
     return datetime.fromtimestamp(ts, tz=MSK).strftime(fmt) + " МСК"
-
+ 
 def msk_now() -> datetime:
     return datetime.now(MSK)
-
+ 
 # ─────────────────────────────────────────────
 #  PREMIUM-ЭМОДЗИ
 #
@@ -119,7 +106,7 @@ def msk_now() -> datetime:
 # ─────────────────────────────────────────────
 def premium_emoji(emoji_id: str, fallback: str) -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
-
+ 
 def btn(text: str, *, emoji_id: str | None = None, style: str | None = None, **kwargs) -> InlineKeyboardButton:
     """
     Обёртка над InlineKeyboardButton с premium-иконкой (icon_custom_emoji_id) и/или
@@ -128,7 +115,7 @@ def btn(text: str, *, emoji_id: str | None = None, style: str | None = None, **k
     либо куплен доп. юзернейм на Fragment.
     """
     return InlineKeyboardButton(text=text, icon_custom_emoji_id=emoji_id, style=style, **kwargs)
-
+ 
 # ─────────────────────────────────────────────
 #  ID КАСТОМНЫХ EMOJI ДЛЯ КНОПОК (icon_custom_emoji_id)
 # ─────────────────────────────────────────────
@@ -149,7 +136,7 @@ BTN_ICON_ADMIN           = "5231200819986047254"  # Панель (админ)
 BTN_ICON_DEV_TOPUP       = "5407025283456835913"  # Добавить устройства
 BTN_ICON_GB_TOPUP        = "5283080528818360566"  # Докупить трафик
 BTN_ICON_UPGRADE         = "5449683594425410231"  # Улучшить тариф
-
+ 
 EMOJI_TRUBAVPN      = premium_emoji("5224450179368767019", "\U0001f310")  # "TrubaVPN" в приветствии
 EMOJI_INFO          = premium_emoji("5334544901428229844", "\u2728")   # заголовок "О сервисе"
 EMOJI_EARN          = premium_emoji("5287231198098117669", "\U0001f4b0")  # заголовок "Заработать"
@@ -165,7 +152,7 @@ EMOJI_DEV_TOPUP     = premium_emoji("5407025283456835913", "\U0001f4f1")  # за
 EMOJI_GB_TOPUP      = premium_emoji("5283080528818360566", "\U0001f4ca")  # заголовок "Докупить трафик"
 EMOJI_UPGRADE       = premium_emoji("5449683594425410231", "\u2b06\ufe0f")  # "Улучшение тарифа" (оплата)
 EMOJI_INVITE        = premium_emoji("5264713049637409446", "\U0001f465")  # "Приглашайте друзей.."
-
+ 
 # ─────────────────────────────────────────────
 #  Технически невозможно вставить (кнопки Telegram не поддерживают формати-
 #  рование/кастомные эмодзи, только plain text) — оставлено для справки,
@@ -180,8 +167,8 @@ EMOJI_INVITE        = premium_emoji("5264713049637409446", "\U0001f465")  # "П�
 #    5312361253610475399 — "Купить VPN" (кнопка)
 #    5465169893580086142 — "Промокод" (кнопка)
 # ─────────────────────────────────────────────
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 #  ТАРИФЫ
 #
@@ -204,7 +191,7 @@ TRIAL = {
         "на обход глушилок ограничен 3 ГБ. Лимит устройств — 1."
     ),
 }
-
+ 
 PLANS = {
     "vpn": {
         "key":          "vpn",
@@ -233,458 +220,83 @@ PLANS = {
         ),
     },
 }
-
+ 
 MONTH_CHOICES = [1, 3, 6, 12]
-
+ 
 # Докупка трафика на глушилках: цена за 1 ГБ. Пользователь сам вводит
 # сколько ГБ хочет купить, итоговая цена = кол-во * цена за ГБ.
 WHITELIST_PRICE_PER_GB = int(os.environ.get("WHITELIST_PRICE_PER_GB", "3"))
-
+ 
 # Реферальная система: процент с оплаты друга и порог вывода
 REFERRAL_PERCENT      = 50
 REFERRAL_MIN_WITHDRAW = 1000
-
+ 
 HWID_LABELS = {i: f"{i} устр." for i in range(1, 21)}
 HWID_LABELS[0] = "без лимита"
-
+ 
 # ─────────────────────────────────────────────
 #  FSM STATES
 # ─────────────────────────────────────────────
 class PromoState(StatesGroup):
     waiting_code    = State()
     choosing_tariff = State()
-
+ 
 class BroadcastState(StatesGroup):
     waiting_text = State()
     confirming   = State()
-
+ 
 class AdminPromoState(StatesGroup):
     waiting_input = State()
-
+ 
 class PromoGenState(StatesGroup):
     waiting_days       = State()
     waiting_uses_custom = State()
     waiting_code       = State()
-
+ 
 class OrderPromoState(StatesGroup):
     waiting_code = State()
-
+ 
 class CheckActionState(StatesGroup):
     waiting_days_add     = State()
     waiting_days_sub      = State()
     waiting_days_set      = State()
     waiting_hwid_set      = State()
     waiting_whitelist_gb  = State()
-
+ 
 class BuyDevicesState(StatesGroup):
     waiting_confirm = State()
-
+ 
 class WithdrawState(StatesGroup):
     waiting_confirm = State()
-
+ 
 class AdminGiveState(StatesGroup):
     waiting_username = State()
     waiting_days     = State()
     waiting_devices  = State()
-
+ 
 class AdminFindState(StatesGroup):
     waiting_query = State()
-
+ 
 class SurveyState(StatesGroup):
     waiting_comment = State()
-
+ 
 class DeviceTopupState(StatesGroup):
     waiting_count = State()
-
+ 
 class WhitelistTopupState(StatesGroup):
     waiting_gb = State()
-
+ 
 # ─────────────────────────────────────────────
 #  INIT
 # ─────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("trubavpn")
-
+ 
 bot    = Bot(token=API_TOKEN)
 dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
 pool: asyncpg.Pool = None
-
-
-# ─────────────────────────────────────────────
-#  «МОЙ НАЛОГ» (lknpd.nalog.ru) — КЛИЕНТ АВТОЧЕКОВ
-#
-#  После успешной оплаты YooKassa автоматически пробивается чек в сервисе
-#  ФНС «Мой налог». Авторизация — по телефону + SMS-коду (при первом
-#  запуске), далее access-токен обновляется сам по refresh-токену,
-#  который вместе с ИНН хранится в БД (таблица nalog_auth). Повторно SMS
-#  не запрашивается, пока refresh-токен жив.
-# ─────────────────────────────────────────────
-class NalogClient:
-    """Тонкий асинхронный клиент API «Мой налог» (ФНС)."""
-
-    def __init__(self):
-        self.phone: str | None = None
-        self.inn: str | None = None
-        self.token: str | None = None            # access-токен (короткоживущий)
-        self.token_expire: datetime | None = None
-        self.refresh_token: str | None = None
-        self.device_id: str = "".join(
-            secrets.choice(string.ascii_lowercase + string.digits) for _ in range(21)
-        )
-        self._challenge_token: str | None = None
-        self._challenge_phone: str | None = None
-        self._lock = asyncio.Lock()
-
-    # ── служебное ────────────────────────────
-    def _device_info(self) -> dict:
-        return {
-            "appVersion": "1.0.0",
-            "sourceDeviceId": self.device_id,
-            "sourceType": "WEB",
-            "metaDetails": {
-                "userAgent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            },
-        }
-
-    @property
-    def ready(self) -> bool:
-        return bool(self.refresh_token and self.inn)
-
-    @staticmethod
-    def _now_iso_utc() -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    @staticmethod
-    def _now_iso_msk() -> str:
-        return datetime.now(MSK).strftime("%Y-%m-%dT%H:%M:%S+03:00")
-
-    @staticmethod
-    def _parse_dt(value: str) -> datetime:
-        try:
-            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except Exception:
-            return datetime.now(timezone.utc) + timedelta(minutes=10)
-
-    @staticmethod
-    def _inn_from_token(token: str | None):
-        """ИЗвлекает ИНН из payload JWT access-токена (если не пришёл в profile)."""
-        if not token:
-            return None
-        try:
-            payload = token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            data = json.loads(base64.urlsafe_b64decode(payload))
-            for k in ("inn", "sub"):
-                if data.get(k):
-                    return str(data[k])
-        except Exception:
-            pass
-        return None
-
-    async def _request(self, method: str, path: str, *, json_body=None, auth=False) -> dict:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://lknpd.nalog.ru/",
-            "Referrer": "https://lknpd.nalog.ru/",
-            "Referrer-Policy": "strict-origin-when-cross-origin",
-        }
-        if auth:
-            await self._ensure_token()
-            headers["Authorization"] = f"Bearer {self.token}"
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            r = await client.request(method, f"{NALOG_API}{path}", json=json_body, headers=headers)
-        if r.status_code >= 400:
-            raise RuntimeError(f"nalog {path} -> {r.status_code}: {r.text[:300]}")
-        return r.json() if r.text else {}
-
-    def _apply_token_response(self, data: dict) -> None:
-        if data.get("token"):
-            self.token = data["token"]
-        if data.get("refreshToken"):
-            self.refresh_token = data["refreshToken"]
-        profile = data.get("profile") or {}
-        if profile.get("inn"):
-            self.inn = profile["inn"]
-        exp = data.get("tokenExpireIn")
-        self.token_expire = self._parse_dt(exp) if exp else (
-            datetime.now(timezone.utc) + timedelta(minutes=10)
-        )
-        if not self.inn and self.token:
-            self.inn = self._inn_from_token(self.token)
-
-    # ── авторизация по SMS ───────────────────
-    async def request_sms(self, phone: str) -> None:
-        phone = "".join(ch for ch in str(phone) if ch.isdigit())
-        if not phone:
-            raise RuntimeError("Не указан номер телефона.")
-        # Актуальный endpoint запроса SMS — v2 /auth/challenge/sms/start.
-        data = await self._request(
-            "POST", "/api/v2/auth/challenge/sms/start",
-            json_body={"phone": phone, "requireTpToBeActive": True},
-        )
-        self._challenge_token = data.get("challengeToken")
-        self._challenge_phone = phone
-        if not self._challenge_token:
-            raise RuntimeError(f"Не получен challengeToken: {data}")
-
-    async def verify_sms(self, code: str) -> None:
-        if not self._challenge_token or not self._challenge_phone:
-            raise RuntimeError("Сначала запросите SMS-код (/nalog_login).")
-        # Актуальный endpoint подтверждения — v1 /auth/challenge/sms/verify.
-        data = await self._request(
-            "POST", "/api/v1/auth/challenge/sms/verify",
-            json_body={
-                "phone": self._challenge_phone,
-                "code": str(code).strip(),
-                "challengeToken": self._challenge_token,
-                "deviceInfo": self._device_info(),
-            },
-        )
-        self._apply_token_response(data)
-        self.phone = self._challenge_phone
-        self._challenge_token = None
-        if not self.refresh_token:
-            raise RuntimeError(f"Вход не завершён (нет refreshToken): {data}")
-        # Получаем access-токен и ИНН (verify может вернуть только refreshToken).
-        await self._refresh()
-        if not self.ready:
-            raise RuntimeError(f"Вход не завершён (не получен ИНН): {data}")
-        await self._save()
-
-    async def _refresh(self) -> None:
-        if not self.refresh_token:
-            raise RuntimeError("Нет refresh-токена. Требуется вход по SMS.")
-        data = await self._request(
-            "POST", "/api/v1/auth/token",
-            json_body={"deviceInfo": self._device_info(), "refreshToken": self.refresh_token},
-        )
-        self._apply_token_response(data)
-        await self._save()
-
-    async def _ensure_token(self) -> None:
-        if (self.token and self.token_expire
-                and self.token_expire - timedelta(seconds=60) > datetime.now(timezone.utc)):
-            return
-        await self._refresh()
-
-    # ── пробитие чека ────────────────────────
-    def receipt_url(self, receipt_uuid: str) -> str:
-        return f"{NALOG_API}/api/v1/receipt/{self.inn}/{receipt_uuid}/print"
-
-    async def add_income(self, amount: float, name: str, when: datetime | None = None) -> dict:
-        if not self.ready:
-            raise RuntimeError("«Мой налог» не авторизован (нужен вход по SMS).")
-        amount = round(float(amount), 2)
-        op_time = (when or datetime.now(MSK)).astimezone(MSK)
-        body = {
-            "operationTime": op_time.strftime("%Y-%m-%dT%H:%M:%S+03:00"),
-            "requestTime": self._now_iso_msk(),
-            "services": [{
-                "name": name or "Оказание услуг",
-                "amount": amount,
-                "quantity": 1,
-            }],
-            "totalAmount": str(amount),
-            "client": {
-                "contactPhone": None,
-                "displayName": None,
-                "incomeType": "FROM_INDIVIDUAL",
-                "inn": None,
-            },
-            "paymentType": "CASH",
-            "ignoreMaxTotalIncomeRestriction": False,
-        }
-        async with self._lock:
-            data = await self._request("POST", "/api/v1/income", json_body=body, auth=True)
-        receipt_uuid = data.get("approvedReceiptUuid")
-        return {
-            "uuid": receipt_uuid,
-            "url": self.receipt_url(receipt_uuid) if receipt_uuid else None,
-        }
-
-    # ── хранение авторизации в БД ─────────────
-    async def _save(self) -> None:
-        if pool is None:
-            return
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO nalog_auth (id, phone, inn, refresh_token, device_id, updated_at) "
-                    "VALUES (1,$1,$2,$3,$4,$5) "
-                    "ON CONFLICT (id) DO UPDATE SET phone=$1, inn=$2, refresh_token=$3, "
-                    "device_id=$4, updated_at=$5",
-                    self.phone, self.inn, self.refresh_token, self.device_id, int(time.time()),
-                )
-        except Exception as e:
-            log.error("nalog _save: %s", e)
-
-    async def load(self) -> None:
-        if pool is None:
-            return
-        try:
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT phone, inn, refresh_token, device_id FROM nalog_auth WHERE id=1"
-                )
-        except Exception as e:
-            log.error("nalog load: %s", e)
-            return
-        if row:
-            self.phone = row["phone"]
-            self.inn = row["inn"]
-            self.refresh_token = row["refresh_token"]
-            if row["device_id"]:
-                self.device_id = row["device_id"]
-
-
-nalog = NalogClient()
-
-
-def _parse_payment_dt(raw):
-    """Дата платежа YooKassa (ISO-строка или datetime) → datetime | None."""
-    if isinstance(raw, datetime):
-        return raw
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-async def nalog_issue_receipt(payment, price: float, item_name: str, is_trial: bool):
-    """Пробивает чек в «Мой налог» после успешной оплаты. Любая ошибка тут
-    НЕ должна ломать выдачу подписки — только логируется. Возвращает
-    {\"uuid\", \"url\"} или None."""
-    if not NALOG_ENABLED or is_trial:
-        return None
-    try:
-        amount = float(getattr(getattr(payment, "amount", None), "value", None) or price or 0)
-    except Exception:
-        amount = float(price or 0)
-    if amount <= 0:
-        return None
-    if not nalog.ready:
-        log.warning("«Мой налог»: чек не пробит — нет авторизации (payment %s).",
-                    getattr(payment, "id", "?"))
-        return None
-    when = None
-    for attr in ("captured_at", "created_at"):
-        parsed = _parse_payment_dt(getattr(payment, attr, None))
-        if parsed:
-            when = parsed
-            break
-    try:
-        res = await nalog.add_income(
-            amount=amount, name=(NALOG_SERVICE_NAME or item_name), when=when,
-        )
-        log.info("«Мой налог»: чек пробит на %.2f ₽ (uuid %s).", amount, res.get("uuid"))
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO nalog_receipts (payment_id, receipt_uuid, url, amount, created_at) "
-                    "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (payment_id) DO NOTHING",
-                    getattr(payment, "id", None), res.get("uuid"), res.get("url"),
-                    amount, int(time.time()),
-                )
-        except Exception as e:
-            log.error("«Мой налог»: не сохранил чек в БД: %s", e)
-        return res
-    except Exception as e:
-        log.exception("«Мой налог»: ошибка пробития чека: %s", e)
-        return None
-
-
-async def nalog_init():
-    """Инициализация «Мой налог» при старте бота. Если авторизация уже
-    сохранена — просто проверяем токен. Если нет и задан NALOG_PHONE —
-    запрашиваем SMS-код и просим админа ввести его через /nalog_code."""
-    if not NALOG_ENABLED:
-        log.info("«Мой налог»: отключён (NALOG_ENABLED=0).")
-        return
-    await nalog.load()
-    if nalog.ready:
-        try:
-            await nalog._ensure_token()
-            log.info("«Мой налог»: авторизация активна (ИНН %s).", nalog.inn)
-        except Exception as e:
-            log.error("«Мой налог»: refresh не удался (%s). Нужен вход /nalog_login.", e)
-        return
-    if NALOG_PHONE:
-        try:
-            await nalog.request_sms(NALOG_PHONE)
-            msg = (
-                "🧾 «Мой налог»: нужен вход для авточеков.\n"
-                f"На номер +{NALOG_PHONE} отправлен SMS-код.\n"
-                "Введите его командой: /nalog_code КОД"
-            )
-            for admin_id in all_admin_ids():
-                try:
-                    await bot.send_message(admin_id, msg)
-                except Exception:
-                    pass
-            log.info("«Мой налог»: запрошен SMS-код на %s. Ждём /nalog_code.", NALOG_PHONE)
-        except Exception as e:
-            log.error("«Мой налог»: не удалось запросить SMS (%s).", e)
-    else:
-        log.warning("«Мой налог»: NALOG_PHONE не задан — авточеки выключены до /nalog_login.")
-
-
-@router.message(Command("nalog_login"))
-async def nalog_login_cmd(message: types.Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        return
-    phone = "".join(ch for ch in (command.args or "").strip() if ch.isdigit()) or NALOG_PHONE
-    if not phone:
-        await message.answer("Укажите номер: /nalog_login 79001234567")
-        return
-    try:
-        await nalog.request_sms(phone)
-    except Exception as e:
-        await message.answer(f"Не удалось запросить SMS: {e}")
-        return
-    await message.answer(f"SMS-код отправлен на +{phone}.\nВведите: /nalog_code КОД")
-
-
-@router.message(Command("nalog_code"))
-async def nalog_code_cmd(message: types.Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        return
-    code = "".join(ch for ch in (command.args or "").strip() if ch.isdigit())
-    if not code:
-        await message.answer("Укажите код: /nalog_code 1234")
-        return
-    try:
-        await nalog.verify_sms(code)
-    except Exception as e:
-        await message.answer(f"Не удалось подтвердить код: {e}")
-        return
-    await message.answer(
-        f"✅ «Мой налог» подключён. ИНН: {nalog.inn}\n"
-        "Теперь чеки пробиваются автоматически после каждой оплаты."
-    )
-
-
-@router.message(Command("nalog_status"))
-async def nalog_status_cmd(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    if not NALOG_ENABLED:
-        await message.answer("«Мой налог»: отключён (NALOG_ENABLED=0).")
-        return
-    if nalog.ready:
-        await message.answer(
-            f"«Мой налог»: подключён ✅\nИНН: {nalog.inn}\nТелефон: +{nalog.phone or '—'}"
-        )
-    else:
-        await message.answer("«Мой налог»: не авторизован. Войдите: /nalog_login")
-
+ 
 # ─────────────────────────────────────────────
 #  DATABASE
 # ─────────────────────────────────────────────
@@ -803,27 +415,6 @@ async def init_db():
                 created_at BIGINT DEFAULT 0
             )
         """)
-        # «Мой налог»: сохранённая авторизация (один самозанятый на бота).
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS nalog_auth (
-                id            INTEGER PRIMARY KEY DEFAULT 1,
-                phone         TEXT,
-                inn           TEXT,
-                refresh_token TEXT,
-                device_id     TEXT,
-                updated_at    BIGINT DEFAULT 0
-            )
-        """)
-        # «Мой налог»: связь платёж → пробитый чек (история/идемпотентность).
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS nalog_receipts (
-                payment_id   TEXT PRIMARY KEY,
-                receipt_uuid TEXT,
-                url          TEXT,
-                amount       NUMERIC,
-                created_at   BIGINT DEFAULT 0
-            )
-        """)
         # Миграции на случай старой БД
         for col in [
             "remna_uuid TEXT", "created_at BIGINT DEFAULT 0",
@@ -843,7 +434,7 @@ async def init_db():
         except Exception:
             pass
     log.info("PostgreSQL ready.")
-
+ 
 async def load_extra_admins():
     """Подгружает динамически добавленных админов из БД в память (при старте
     и после каждого добавления/удаления)."""
@@ -852,8 +443,8 @@ async def load_extra_admins():
         rows = await conn.fetch("SELECT user_id FROM extra_admins")
     EXTRA_ADMIN_IDS = {r["user_id"] for r in rows}
     log.info("Loaded %d extra admin(s) from DB.", len(EXTRA_ADMIN_IDS))
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 #  REMNAWAVE API
 # ─────────────────────────────────────────────
@@ -863,10 +454,10 @@ def _remna_headers() -> dict:
         "Content-Type":  "application/json",
         "Cookie":        REMNAWAVE_COOKIE,
     }
-
+ 
 def remna_username(user_id: int) -> str:
     return f"truba_{user_id}"
-
+ 
 def _squad_uuids(raw_squads) -> list[str]:
     """
     Remnawave в GET-ответе возвращает activeInternalSquads как список объектов
@@ -884,11 +475,11 @@ def _squad_uuids(raw_squads) -> list[str]:
         elif isinstance(s, str):
             out.append(s)
     return out
-
+ 
 def _expire_at(days: int) -> str:
     dt = datetime.now(timezone.utc) + timedelta(days=days)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
+ 
 async def remna_get_user(user_id: int) -> dict | None:
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -903,7 +494,7 @@ async def remna_get_user(user_id: int) -> dict | None:
     except Exception as e:
         log.error("[Remna] get_user: %s", e)
         return None
-
+ 
 def _normalize_squads(squad_uuid) -> list[str]:
     """squad_uuid может быть одной строкой (старый формат) или списком строк
     (нужно для vpn_bypass/trial — им нужен доступ сразу к 2 скваdам). Всегда
@@ -911,7 +502,7 @@ def _normalize_squads(squad_uuid) -> list[str]:
     if isinstance(squad_uuid, list):
         return squad_uuid
     return [squad_uuid]
-
+ 
 async def remna_create_user(user_id: int, days: int, hwid: int = 1,
                              squad_uuid: str | list[str] = SQUAD_UUID_BASIC) -> dict | None:
     payload = {
@@ -936,24 +527,24 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1,
     except Exception as e:
         log.error("[Remna] create_user: %s", e)
         return None
-
+ 
 async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
                              squad_uuid: str | list[str] | None = None) -> dict | None:
     user = await remna_get_user(user_id)
     if not user:
         return await remna_create_user(user_id, days, hwid or 1, squad_uuid or SQUAD_UUID_BASIC)
-
+ 
     now        = datetime.now(timezone.utc)
     current    = datetime.fromisoformat(user["expireAt"].replace("Z", "+00:00"))
     base       = max(current, now)
     new_expire = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
+ 
     payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "status": "ACTIVE"}
     if squad_uuid is not None:
         payload["activeInternalSquads"] = _normalize_squads(squad_uuid)
     if hwid is not None:
         payload["hwidDeviceLimit"] = hwid
-
+ 
     try:
         async with httpx.AsyncClient(verify=True) as client:
             r = await client.patch(
@@ -965,7 +556,7 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
     except Exception as e:
         log.error("[Remna] extend_user: %s", e)
         return None
-
+ 
 async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
     payload = dict(payload)
     payload["uuid"] = uuid_
@@ -982,7 +573,7 @@ async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
     except Exception as e:
         log.error("[Remna] update_user: %s", e)
         return None
-
+ 
 async def remna_update_user_verbose(uuid_: str, payload: dict) -> tuple[dict | None, str]:
     payload = dict(payload)
     payload["uuid"] = uuid_
@@ -1001,11 +592,11 @@ async def remna_update_user_verbose(uuid_: str, payload: dict) -> tuple[dict | N
     except Exception as e:
         log.error("[Remna] update_user: %s", e)
         return None, str(e)
-
+ 
 async def remna_disable_user(uuid_: str) -> bool:
     result = await remna_update_user(uuid_, {"status": "DISABLED"})
     return result is not None
-
+ 
 async def remna_get_all_users() -> list:
     """Получает ВСЕХ пользователей через start+size (единственная рабочая пагинация)."""
     all_users: list = []
@@ -1033,7 +624,7 @@ async def remna_get_all_users() -> list:
     except Exception as e:
         log.error("[Remna] get_all_users: %s", e)
     return all_users
-
+ 
 async def remna_get_user_hwid(uuid_: str) -> list:
     """Список HWID-устройств пользователя: GET /api/users/{uuid}/hwid"""
     try:
@@ -1052,7 +643,7 @@ async def remna_get_user_hwid(uuid_: str) -> list:
     except Exception as e:
         log.error("[Remna] get_user_hwid: %s", e)
         return []
-
+ 
 async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: datetime) -> list:
     """
     Трафик по каждому юзеру на конкретной ноде, по дням.
@@ -1076,7 +667,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
     except Exception as e:
         log.error("[Remna] get_node_bandwidth: %s", e)
         return []
-
+ 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
     """Сырые дневные записи трафика для ВСЕХ юз                    в на ноде глушилок."""
     if not WHITELIST_NODE_UUID:
@@ -1094,11 +685,11 @@ async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
             continue
         out.append({"username": uname, "ts": day_ts, "bytes": int(rec.get("total", 0) or 0)})
     return out
-
+ 
 def sum_whitelist_bytes_for_user(records: list[dict], user_id: int, since_ts: int) -> int:
     uname = remna_username(user_id)
     return sum(r["bytes"] for r in records if r["username"] == uname and r["ts"] >= since_ts)
-
+ 
 async def activate_subscription(user_id: int, days: int, hwid: int = 1,
                                  squad_uuid: str | list[str] | None = None,
                                  whitelist_gb: int = 0) -> dict | None:
@@ -1113,7 +704,7 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1,
         result = await remna_extend_user(user_id, days, hwid, squad_uuid)
     else:
         result = await remna_create_user(user_id, days, hwid, squad_uuid or SQUAD_UUID_BASIC)
-
+ 
     if result:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1130,7 +721,7 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1,
             elif squad_uuid is not None and SQUAD_UUID_WHITELIST not in _normalize_squads(squad_uuid):
                 await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
     return result
-
+ 
 # ─────────────────────────────────────────────
 #  ОБЩИЕ ХЕЛПЕРЫ
 # ─────────────────────────────────────────────
@@ -1144,21 +735,21 @@ def parse_dt(value) -> int:
         return int(dt.timestamp())
     except Exception:
         return 0
-
+ 
 def format_sub_url(user: dict) -> str:
     sub = user.get("subscriptionUrl", "")
     if not sub:
         short = user.get("shortUuid", "")
         sub = f"{SUB_BASE_URL}/{short}" if short else ""
     return sub
-
+ 
 async def is_subscribed(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
         return member.status not in ("left", "kicked")
     except Exception:
         return True
-
+ 
 async def is_admin_sale_notify(admin_id: int) -> bool:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT sale_notify FROM admin_settings WHERE admin_id=$1", admin_id)
@@ -1166,7 +757,7 @@ async def is_admin_sale_notify(admin_id: int) -> bool:
             return True
         v = row["sale_notify"]
         return v if v is not None else True
-
+ 
 async def notify_admins_sale(u_id: int, username: str | None, item_name: str,
                               days: int, price: float, is_trial: bool):
     uname = f"@{username}" if username else f"ID:{u_id}"
@@ -1187,7 +778,7 @@ async def notify_admins_sale(u_id: int, username: str | None, item_name: str,
                 await bot.send_message(admin_id, text)
             except Exception:
                 pass
-
+ 
 async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str | None,
                            item_name: str, price: float):
     """
@@ -1215,15 +806,15 @@ async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str |
         )
     except Exception:
         pass
-
+ 
 def calc_plan_price(plan_key: str, months: int) -> int:
     """Линейная цена без скидок за срок: price_month * months."""
     return PLANS[plan_key]["price_month"] * months
-
+ 
 def calc_upgrade_price(extra_devices: int) -> int:
     """
     Доплата за апгрейд VPN -> VPN с обходом глушилок.
-
+ 
     Дн   подписки при   пгрейде не пересчитываются и не трогаются — остаются
     ровно те же, что были. Поэтому доплата — просто фиксированная разница
     между тарифами:
@@ -1236,7 +827,7 @@ def calc_upgrade_price(extra_devices: int) -> int:
     plan_diff   = bypass["price_month"] - vpn["price_month"]
     device_diff = max(0, bypass["device_price"] - vpn["device_price"]) * max(extra_devices, 0)
     return plan_diff + device_diff
-
+ 
 # ─────────────────────────────────────────────
 #  КЛАВИАТУРЫ
 # ─────────────────────────────────────────────
@@ -1245,12 +836,12 @@ def sub_required_kb():
         [btn("Подписаться на канал", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
         [btn("Я подписался", emoji_id=BTN_ICON_CHECK_SUB, callback_data="check_sub")],
     ])
-
+ 
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="back")]
     ])
-
+ 
 # ─────────────────────────────────────────────
 #  СТАРТ / ПРОФИЛЬ (единственный домашний экран)
 # ─────────────────────────────────────────────
@@ -1279,13 +870,13 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
     section = (section or "").lower().strip()
     parts   = section.split("_")
     head    = parts[0] if parts else ""
-
+ 
     def _tail_int() -> int | None:
         """Число в хвосте диплинка (например 5 из dev_5) либо None."""
         if len(parts) >= 2 and parts[-1].isdigit():
             return int(parts[-1])
         return None
-
+ 
     if head == "buy" or section == "vpn":
         # buy_<план>_<месяцев>: сразу открываем оплату выбранного тарифа.
         plan_key = None
@@ -1308,7 +899,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         text, kb = _buy_open_content()
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
         return True
-
+ 
     if head == "extend":
         # extend_<месяцев>: продлеваем текущий тариф пользователя.
         months = _tail_int()
@@ -1329,7 +920,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
         )
         return True
-
+ 
     if head == "trial":
         async with pool.acquire() as conn:
             used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", u_id)
@@ -1342,7 +933,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             whitelist_gb=TRIAL["whitelist_gb"], is_trial=True,
         )
         return True
-
+ 
     if head in ("dev", "devices"):
         # dev_<кол-во>: если количество передано — сразу создаём оплату,
         # иначе спрашиваем количество (старый сценарий).
@@ -1371,7 +962,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             parse_mode="HTML", reply_markup=cancel_kb(),
         )
         return True
-
+ 
     if head == "upgrade" or section == "plan_upgrade":
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT plan, extra_devices FROM users WHERE user_id=$1", u_id)
@@ -1389,7 +980,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             price=price, days=0, display_prefix=EMOJI_UPGRADE,
         )
         return True
-
+ 
     if head in ("wl", "whitelist"):
         # wl_<ГБ>: если объём передан — сразу оплата, иначе спрашиваем ГБ.
         gb = _tail_int()
@@ -1413,9 +1004,9 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             parse_mode="HTML", reply_markup=cancel_kb(),
         )
         return True
-
+ 
     return False
-
+ 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     u_id = message.from_user.id
@@ -1432,7 +1023,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             # (личного кабинета) для переброса в раздел оплаты.
             # Поддерживаем как "cab_buy", так и просто "buy".
             section = arg[4:] if arg.startswith("cab_") else arg
-
+ 
     now = int(time.time())
     async with pool.acquire() as conn:
         exists = await conn.fetchrow("SELECT user_id FROM users WHERE user_id=$1", u_id)
@@ -1444,23 +1035,23 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         else:
             await conn.execute("UPDATE users SET username=$1 WHERE user_id=$2",
                                message.from_user.username, u_id)
-
+ 
     if not await is_subscribed(u_id):
         await message.answer(
             f"{EMOJI_TRUBAVPN} {hbold('TrubaVPN')}\n\nПодпишитесь на канал, чтобы пользоваться ботом.",
             reply_markup=sub_required_kb(), parse_mode="HTML",
         )
         return
-
+ 
     # Переброс из личного кабинета в конкретный раздел оплаты.
     if section:
         await state.clear()
         if await _open_paysection_from_message(message, state, section):
             return
-
+ 
     text, kb = await _build_profile_view(u_id)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
-
+ 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_cb(cb: CallbackQuery):
     await cb.answer()
@@ -1469,12 +1060,12 @@ async def check_sub_cb(cb: CallbackQuery):
         return
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-
+ 
 def get_cabinet_webapp_url() -> str | None:
     """URL мини-приложения личного кабинета для кнопки-WebApp.
     Вход в аккаунт — автоматический по Telegram initData, без кодов."""
     return MINIAPP_URL or None
-
+ 
 def _cabinet_button_row() -> list[InlineKeyboardButton]:
     """Строка клавиатуры с кнопкой «Личный кабинет».
     Если URL мини-приложения задан — кнопка открывает его как Telegram Mini App
@@ -1486,7 +1077,7 @@ def _cabinet_button_row() -> list[InlineKeyboardButton]:
                     web_app=WebAppInfo(url=url))]
     return [btn("Управление подпиской", emoji_id="5282843764451195532",
                 callback_data="cabinet_unavailable")]
-
+ 
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """
     Профиль = единственный домашний экран. Показывает вариант подписки,
@@ -1502,7 +1093,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     trial_used    = db_row["trial_used"] if db_row else False
     remna = await remna_get_user(user_id)
     now   = int(time.time())
-
+ 
     lines = [f"{EMOJI_PROFILE} {hbold('Профиль')}", ""]
     subscription_active = bool(
         remna and parse_dt(remna.get("expireAt")) > now and remna.get("status") != "DISABLED"
@@ -1514,7 +1105,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         sub_url  = format_sub_url(remna)
         current_squads = _squad_uuids(remna.get("activeInternalSquads"))
         has_whitelist  = SQUAD_UUID_WHITELIST in current_squads
-
+ 
         # Тариф определ  ется ЖИВОЙ проверкой сквадов на каждый показ профиля
         # (не по значению в БД) — так текст и кнопки всегда соответствуют
         # реальному состоянию в Remnawave, даже если plan в БД устарел/не
@@ -1527,7 +1118,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         else:
             live_plan = "vpn_bypass" if has_whitelist else "vpn"
             plan_name = PLANS[live_plan]["name"]
-
+ 
         if plan != live_plan:
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -1535,10 +1126,10 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                     live_plan, max(0, hwid - 1), user_id,
                 )
         plan = live_plan
-
+ 
         # Остаток трафика на глушилках — только если реально отслеживается
         # (есть строка в whitelist_limits с лимит  м > 0). Своя отдельная строка,
-        #   е смешивается с тарифом/устройствами.
+        # не смешивается с тарифом/устройствами.
         gb_line = ""
         if has_whitelist:
             async with pool.acquire() as conn:
@@ -1550,7 +1141,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 used_gb   = sum_whitelist_bytes_for_user(records, user_id, wl_row["period_start"]) / 1024 ** 3
                 remaining = max(0.0, wl_row["gb_limit"] - used_gb)
                 gb_line = f"Осталось трафика на глушилках: {remaining:.1f}/{wl_row['gb_limit']} ГБ"
-
+ 
         lines += [
             f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}",
             f"Устройств: {hwid}",
@@ -1558,31 +1149,31 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if gb_line:
             lines.append(gb_line)
         lines.append(f"{EMOJI_ACTIVE_UNTIL} Активна до: {date_str}")
-
+ 
         if sub_url:
             lines += ["", f"{EMOJI_SUB_LINK} Ссылка на подписку:", hcode(sub_url)]
     else:
         lines += ["Подписка не активна."]
-
+ 
     lines += ["", f"Поддержка: @{SUPPORT_USERNAME}"]
     text = "\n".join(lines)
-
+ 
     rows = []
     cabinet_row    = _cabinet_button_row()
     user_is_admin  = is_admin(user_id)
     admin_site_url = "https://accept-finances-cyber-itself.trycloudflare.com/"
-
+ 
     def _place_cabinet():
         # Кнопка «Личный кабинет», а для админов — сразу под ней ссылка на
         # админ-сайт.
         rows.append(cabinet_row)
         if user_is_admin:
             rows.append([btn("Админ-сайт", emoji_id=BTN_ICON_ADMIN, url=admin_site_url)])
-
+ 
     # Кнопка «Пробная подписка» показывается только если подписка не активна
     # и пробный период ещё не использован.
     show_trial = (not subscription_active or plan not in PLANS) and not trial_used
-
+ 
     # Расположение кнопки «Личный кабинет»:
     #     пробная подписка УЖЕ использована (trial_used) → ЛК стоит выше всех
     #    остальных кнопок;
@@ -1592,7 +1183,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     # кнопка «Пробная подписка» — тогда ЛК ставится сразу под ней (ниже).
     if not show_trial:
         _place_cabinet()
-
+ 
     # Кнопки "Купить VPN"/"Пробная" показываются, пока не куплен РЕАЛЬНЫЙ тариф
     # (vpn / vpn_bypass) И подписка при этом реально активна. Проверка именно
     # subscription_active (а не только plan) защищает от случая, когда старое
@@ -1618,21 +1209,21 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             # рендерился поверх текста и ломал надпись кнопки («Доку  ить»).
             rows.append([btn("Докупить трафик (глушилки)", emoji_id=BTN_ICON_GB_TOPUP,
                  callback_data="wl_topup")])
-
+ 
     rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
     rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
     rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
     if is_admin(user_id):
         rows.append([btn("Панель", emoji_id=BTN_ICON_ADMIN, callback_data="admin_panel")])
-
+ 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
-
+ 
 # ─────────────────────────────────────────────
 #  ЛИЧНЫЙ КАБИНЕТ (веб-панель, отдельная от бота)
 # ─────────────────────────────────────────────
 _CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
-
+ 
 async def get_cabinet_url(user_id: int) -> str | None:
     """Ссылка на страницу входа в личный кабинет на сайте.
     Вход только по 9-значному коду (без UID). Если SITE_URL не задан —
@@ -1640,11 +1231,11 @@ async def get_cabinet_url(user_id: int) -> str | None:
     if not SITE_URL:
         return None
     return f"{SITE_URL}/cab"
-
+ 
 # Алфавит для кода входа (без похожих символов I, O, 0, 1).
 _LOGIN_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 _LOGIN_DIGITS  = "23456789"
-
+ 
 def _gen_login_code() -> str:
     """Код вида XXXX-YYYY: в каждой половине ровно 2 буквы и 2 цифры."""
     rng = secrets.SystemRandom()
@@ -1654,7 +1245,7 @@ def _gen_login_code() -> str:
         rng.shuffle(chars)
         return "".join(chars)
     return f"{half()}-{half()}"
-
+ 
 # Кнопка «Личный кабинет» теперь — это WebApp-кнопка (Telegram Mini App),
 # которая открывает мини-приложение прямо в Telegram. Вход в аккаунт
 # происходит автоматическ   — мини-приложение получает подписанные
@@ -1664,35 +1255,35 @@ def _gen_login_code() -> str:
 @router.callback_query(F.data == "cabinet_unavailable")
 async def cabinet_unavailable_cb(cb: CallbackQuery):
     await cb.answer("Личный кабинет временно недоступен.", show_alert=True)
-
+ 
 async def _show_home(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-
+ 
 def cancel_kb() -> InlineKeyboardMarkup:
     """Универсальная кнопка отмены — очищает любое активное FSM-состояние и
     возвращает в профиль. Используется вместо текстовой подсказки /cancel."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Отмена", callback_data="cancel_to_profile")]
     ])
-
+ 
 @router.callback_query(F.data == "cancel_to_profile")
 async def cancel_to_profile_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
     await _show_home(cb)
-
+ 
 @router.callback_query(F.data == "back")
 async def back_to_home(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
     await _show_home(cb)
-
+ 
 @router.callback_query(F.data == "profile")
 async def profile_cb(cb: CallbackQuery):
     await cb.answer()
     await _show_home(cb)
-
+ 
 # ─────────   ───────────────────────────────────
 #  ОБЩАЯ СТРАНИЦА ОПЛАТЫ (YooKassa)
 # ───────  ─────────────────────────────────────
@@ -1730,14 +1321,14 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
     except Exception as e:
         log.exception("Payment create error: %s", e)
         return None, None
-
+ 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn("Оплатить", emoji_id=BTN_ICON_PAY, style="success", url=payment.confirmation.confirmation_url)],
         [btn("Проверить оплату", emoji_id=BTN_ICON_CHECK_SUB, callback_data=f"paycheck_{payment.id}")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
     return payment, kb
-
+ 
 async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | list[str] | None = None, whitelist_gb: int = 0,
@@ -1760,7 +1351,7 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
         f"{prefix}{hbold(item_name)}\n{desc_block}\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
         parse_mode="HTML", reply_markup=kb,
     )
-
+ 
 async def _create_payment_page_from_message(message: types.Message, *, kind: str, item_name: str,
                                              price: int, days: int = 0, hwid: int | None = None,
                                              squad: str | list[str] | None = None, whitelist_gb: int = 0,
@@ -1773,14 +1364,14 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
     )
     if not payment:
-        await message.answer("Ошибка создания п  ат  жа.")
+        await message.answer("Ошибка создания плат  жа.")
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     await message.answer(
         f"{prefix}{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
         parse_mode="HTML", reply_markup=kb,
     )
-
+ 
 @router.callback_query(F.data.startswith("paycheck_"))
 async def check_payment_cb(cb: CallbackQuery):
     await cb.answer()
@@ -1794,7 +1385,7 @@ async def check_payment_cb(cb: CallbackQuery):
     if payment.status != "succeeded":
         await cb.answer("Платёж ещё не подтверждён. Попробуйте через минуту.", show_alert=True)
         return
-
+ 
     md          = payment.metadata
     u_id        = int(md["user_id"])
     kind        = md.get("kind", "plan")
@@ -1807,9 +1398,9 @@ async def check_payment_cb(cb: CallbackQuery):
     plan_key    = md.get("plan_key") or None
     price       = float(md.get("price", 0))
     is_trial    = md.get("is_trial", "0") == "1"
-    item_name   = md.get("item_name", "Пок  пка")
+    item_name   = md.get("item_name", "Покупка")
     qty         = int(md.get("qty", 0) or 0)
-
+ 
     async with pool.acquire() as conn:
         db_row = await conn.fetchrow(
             "SELECT username, referrer_id, has_paid, extra_devices, plan FROM users WHERE user_id=$1", u_id
@@ -1818,7 +1409,7 @@ async def check_payment_cb(cb: CallbackQuery):
     referrer_id = db_row["referrer_id"] if db_row else None
     extra_devices_now = db_row["extra_devices"] if db_row else 0
     current_plan_now  = db_row["plan"] if db_row else None
-
+ 
     # Идемпотентность: если "Проверить оплату" нажали повторно уже ПОСЛЕ
     # успешной обработки этого же платежа, всё что ниже (активация,
     # начисление устройств/ГБ, уведомление админам,   еферальный процент)
@@ -1831,9 +1422,9 @@ async def check_payment_cb(cb: CallbackQuery):
             pay_id, int(time.time()),
         )
     already_processed = inserted is None
-
+ 
     result_user = None
-
+ 
     if not already_processed:
         if kind in ("trial", "plan"):
             result_user = await activate_subscription(u_id, days, hwid or 1, squad_uuid=squad, whitelist_gb=whitelist_gb)
@@ -1850,7 +1441,7 @@ async def check_payment_cb(cb: CallbackQuery):
                         "UPDATE users SET plan=$1, extra_devices=0, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
                         plan_key, result_user.get("uuid"), u_id,
                     )
-
+ 
         elif kind == "device":
             remna = await remna_get_user(u_id)
             if not remna:
@@ -1866,7 +1457,7 @@ async def check_payment_cb(cb: CallbackQuery):
                 await conn.execute(
                     "UPDATE users SET extra_devices = extra_devices + $1 WHERE user_id=$2", add_count, u_id
                 )
-
+ 
         elif kind == "upgrade":
             remna = await remna_get_user(u_id)
             if not remna:
@@ -1885,7 +1476,7 @@ async def check_payment_cb(cb: CallbackQuery):
                     "ON CONFLICT (user_id) DO UPDATE SET gb_limit=$2, period_start=$3, cut_off=FALSE",
                     u_id, wl_gb, int(time.time()),
                 )
-
+ 
         elif kind == "wl_topup":
             add_gb = whitelist_gb if whitelist_gb > 0 else 1
             async with pool.acquire() as conn:
@@ -1908,39 +1499,26 @@ async def check_payment_cb(cb: CallbackQuery):
                     current_squads.append(SQUAD_UUID_WHITELIST)
                     await remna_update_user(remna["uuid"], {"activeInternalSquads": current_squads})
             result_user = remna or {}
-
+ 
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, created_at) VALUES ($1,$2,$3,$4,$5,$6)",
                 u_id, price, kind, days, is_trial, int(time.time()),
             )
-
+ 
         await notify_admins_sale(u_id, uname, item_name, days, price, is_trial)
-
+ 
         if referrer_id and not is_trial:
             await credit_referral(referrer_id, u_id, uname, item_name, price)
-
-        # Автоматический чек в «Мой налог» (самозанятость). Сумма и дата —
-        # из самого платежа YooKassa. Ошибки не ломают выдачу подписки.
-        receipt = await nalog_issue_receipt(payment, price, item_name, is_trial)
-        if receipt and receipt.get("url"):
-            try:
-                await bot.send_message(
-                    u_id,
-                    f"🧾 Чек «Мой налог» сформирован:\n{receipt['url']}",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-
+ 
     text, kb = await _build_profile_view(u_id)
     await cb.message.edit_text(
         f"Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
     )
-
+ 
 # ─────────────────────────────────────────────
 #  ПРОБНАЯ ПОДПИСКА
-# ─────────────────────────────  ───────────────
+# ─────────────────────────────────────────────
 @router.callback_query(F.data == "trial_buy")
 async def trial_buy_cb(cb: CallbackQuery):
     await cb.answer()
@@ -1954,7 +1532,7 @@ async def trial_buy_cb(cb: CallbackQuery):
         hwid=TRIAL["hwid"], squad=TRIAL["squad"], whitelist_gb=TRIAL["whitelist_gb"], is_trial=True,
         extra_desc=TRIAL["desc"],
     )
-
+ 
 # ─────────────────────────────────────────────
 #  КУПИТЬ VPN — выбор тарифа, затем срока
 # ─────────────────────────────────────────────
@@ -1974,13 +1552,13 @@ def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
     return text, kb
-
+ 
 @router.callback_query(F.data == "buy_open")
 async def buy_open_cb(cb: CallbackQuery):
     await cb.answer()
     text, kb = _buy_open_content()
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-
+ 
 @router.callback_query(F.data.startswith("buyplan_"))
 async def buyplan_cb(cb: CallbackQuery):
     await cb.answer()
@@ -2001,7 +1579,7 @@ async def buyplan_cb(cb: CallbackQuery):
         f"{EMOJI_CHOOSE_TERM} Выберите срок:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
-
+ 
 @router.callback_query(F.data.startswith("buymonths_"))
 async def buymonths_cb(cb: CallbackQuery):
     await cb.answer()
@@ -2018,7 +1596,7 @@ async def buymonths_cb(cb: CallbackQuery):
         cb, kind="plan", item_name=f"{plan['name']} · {months} мес.", price=price, days=days,
         hwid=1, squad=plan["squad"], whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
     )
-
+ 
 # ─────────────────────────────────────────────
 #  ДОБАВИТЬ УСТРОЙСТВА
 # ─────────────────────────────────────────────
@@ -2039,12 +1617,12 @@ async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
         f"Введите, сколько устройств хотите докупить:",
         parse_mode="HTML", reply_markup=cancel_kb(),
     )
-
+ 
 @router.message(Command("cancel"), DeviceTopupState.waiting_count)
 async def dev_add_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
-
+ 
 @router.message(DeviceTopupState.waiting_count)
 async def dev_add_count_handler(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().isdigit():
@@ -2067,7 +1645,7 @@ async def dev_add_count_handler(message: types.Message, state: FSMContext):
         message, kind="device", item_name=f"+{count} {word} ({PLANS[plan]['name']})",
         price=price, days=0, qty=count,
     )
-
+ 
 # ─────────────────────────────────────────────
 #  УЛУЧШИТЬ ТАРИФ (VPN -> VPN с обходом глушилок)
 # ─────────────────────────────────────────────
@@ -2089,8 +1667,8 @@ async def plan_upgrade_cb(cb: CallbackQuery):
         cb, kind="upgrade", item_name="Улучшение тарифа до VPN с обходом глушилок",
         price=price, days=0, display_prefix=EMOJI_UPGRADE,
     )
-
-# ──────────────  ──────────────────────────────
+ 
+# ─────────────────────────────────────────────
 #  ДОКУПИТЬ ТРАФИК НА БЕЛЫХ СПИСКАХ
 # ─────────────────────────────   ───────────────
 @router.callback_query(F.data == "wl_topup")
@@ -2108,12 +1686,12 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
         f"Введите, сколько ГБ хотите докупить:",
         parse_mode="HTML", reply_markup=cancel_kb(),
     )
-
+ 
 @router.message(Command("cancel"), WhitelistTopupState.waiting_gb)
 async def wl_topup_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
-
+ 
 @router.message(WhitelistTopupState.waiting_gb)
 async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().isdigit():
@@ -2129,7 +1707,7 @@ async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
         message, kind="wl_topup", item_name=f"+{gb} ГБ на глушилках",
         price=price, days=0, whitelist_gb=gb,
     )
-
+ 
 # ─────────────────────────────────────────────
 #  ЗАРАБОТАТЬ (реферальная система)
 # ─────────────────────────────────────────────
@@ -2143,7 +1721,7 @@ async def earn_open_cb(cb: CallbackQuery):
         balance = await conn.fetchval("SELECT referral_balance FROM users WHERE user_id=$1", u_id) or 0
         ref_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id=$1", u_id) or 0
     balance = float(balance)
-
+ 
     text = (
         f"{EMOJI_EARN} {hbold('Заработать')}\n\n"
         f"{EMOJI_INVITE} Приглашайте друзей — получайте {REFERRAL_PERCENT}% с их оплат.\n\n"
@@ -2160,7 +1738,7 @@ async def earn_open_cb(cb: CallbackQuery):
         rows.append([InlineKeyboardButton(text="Написать для вывода", url=withdraw_url)])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
+ 
 # ─────────────────────────────────────────────
 #  ПРОМОКОД (логика не меняется — просто ссылается на новые планы)
 # ─────────────────────────────────────────────
@@ -2170,7 +1748,7 @@ def _free_plan_kb(code: str):
         rows.append([InlineKeyboardButton(text=plan["name"], callback_data=f"pfree_{key}_{code}")])
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
+ 
 @router.callback_query(F.data == "promo_enter")
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -2181,13 +1759,13 @@ async def promo_enter(cb: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")],
         ]),
     )
-
+ 
 @router.callback_query(F.data == "promo_cancel")
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
     await _show_home(cb)
-
+ 
 @router.message(PromoState.waiting_code)
 async def handle_promo(message: types.Message, state: FSMContext):
     code = (message.text or "").upper().strip()
@@ -2214,7 +1792,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
     promo_type = row["promo_type"] or "days"
     tariff_key = row["tariff_key"]
     days = row["days"]; uses = row["uses"]
-
+ 
     # Скидочный промокод применяется на шаге оплаты, а не здесь. Иначе он
     # ошибочно «активировал» бы подписку на 0 дней и сгорал впустую.
     if promo_type == "discount":
@@ -2226,7 +1804,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
         text, kb = await _build_profile_view(message.from_user.id)
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
         return
-
+ 
     if promo_type == "free_tariff" and tariff_key and tariff_key in PLANS:
         await state.clear()
         plan = PLANS[tariff_key]
@@ -2243,14 +1821,14 @@ async def handle_promo(message: types.Message, state: FSMContext):
         await message.answer(f"Промокод {code} активирован — {plan['name']}, {days} дн.\n\n{text}",
                              parse_mode="HTML", reply_markup=kb)
         return
-
+ 
     if promo_type == "free_choice":
         await state.set_state(PromoState.choosing_tariff)
         await state.update_data(promo_code=code, promo_days=days, promo_uses=uses)
         await message.answer(f"Промокод {code} — {days} дней бесплатно. Выберите тариф:",
                              reply_markup=_free_plan_kb(code))
         return
-
+ 
     user = await activate_subscription(message.from_user.id, days)
     async with pool.acquire() as conn:
         if uses <= 1:
@@ -2261,7 +1839,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
     text, kb = await _build_profile_view(message.from_user.id)
     await message.answer(f"Промокод {code} активирован — добавлено {days} дн.\n\n{text}",
                          parse_mode="HTML", reply_markup=kb)
-
+ 
 @router.callback_query(F.data.startswith("pfree_"))
 async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -2291,7 +1869,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(f"Промокод {promo_code} активирован — {plan['name']}, {days} дн.\n\n{text}",
                                parse_mode="HTML", reply_markup=kb)
-
+ 
 #   ────────────────────────────────────────────
 #  О СЕРВИСЕ
 # ─────────────────────────────────────────────
@@ -2311,7 +1889,7 @@ async def info_tab(cb: CallbackQuery):
             [InlineKeyboardButton(text="Назад", callback_data="back")],
         ]),
     )
-
+ 
 # ─────────────────────────────────────────────
 #  АДМИН-ПАНЕЛЬ
 # ─────────────────────────────────────────────
@@ -2333,7 +1911,7 @@ def admin_panel_kb(is_main: bool = False):
         rows.append([InlineKeyboardButton(text="Админы", callback_data="admin_admins")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
+ 
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel_cb(cb: CallbackQuery):
     await cb.answer()
@@ -2343,13 +1921,13 @@ async def admin_panel_cb(cb: CallbackQuery):
         f"{EMOJI_ADMIN} Админ-панель", parse_mode="HTML",
         reply_markup=admin_panel_kb(is_main_admin(cb.from_user.id)),
     )
-
+ 
 # ─────────────────────────────────────────────
 #  УПРАВЛЕНИЕ АДМИНАМИ (только для главных админов из ADMIN_ID_1/ADMIN_ID_2)
 # ─────────────────────────────────────────────
 class AdminManageState(StatesGroup):
     waiting_username = State()
-
+ 
 async def _render_admins_list(target_send):
     lines = ["Админы", ""]
     lines.append("Главные (из переменных окружения, нельзя удалить здесь):")
@@ -2377,7 +1955,7 @@ async def _render_admins_list(target_send):
         await target_send.answer(text, reply_markup=kb)
     else:
         await target_send.message.edit_text(text, reply_markup=kb)
-
+ 
 @router.callback_query(F.data == "admin_admins")
 async def admin_admins_cb(cb: CallbackQuery):
     await cb.answer()
@@ -2385,7 +1963,7 @@ async def admin_admins_cb(cb: CallbackQuery):
         await cb.answer("Доступно только главным админам.", show_alert=True)
         return
     await _render_admins_list(cb)
-
+ 
 @router.callback_query(F.data == "admin_add_start")
 async def admin_add_start_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -2395,10 +1973,10 @@ async def admin_add_start_cb(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminManageState.waiting_username)
     await cb.message.answer(
         "Введите username (без @) пользователя, которого нужно сделать админом.\n"
-        "Пользователь должен хотя бы раз запуска  ь бота (нажать /start).",
+        "Пользователь должен хотя бы раз запускать бота (нажать /start).",
         reply_markup=cancel_kb(),
     )
-
+ 
 @router.message(AdminManageState.waiting_username)
 async def admin_add_username_handler(message: types.Message, state: FSMContext):
     if not is_main_admin(message.from_user.id):
@@ -2431,7 +2009,7 @@ async def admin_add_username_handler(message: types.Message, state: FSMContext):
     except Exception:
         pass
     await _render_admins_list(message)
-
+ 
 @router.callback_query(F.data.startswith("admin_del_"))
 async def admin_del_cb(cb: CallbackQuery):
     await cb.answer()
@@ -2448,19 +2026,19 @@ async def admin_del_cb(cb: CallbackQuery):
     except Exception:
         pass
     await _render_admins_list(cb)
-
+ 
 # ─────────────────────────────────────────────
 #  ПОДПИСЧИКИ — кнопки с пагинацией (только активные)
 # ─────────────────────────────────────────────
 SUBS_PAGE_SIZE = 8
-
+ 
 async def _get_sorted_subs() -> list:
     now = int(time.time())
     all_users = await remna_get_all_users()
     our = [u for u in all_users if u.get("username", "").startswith("truba_")]
     active = [u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"]
     return sorted(active, key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
-
+ 
 def _subs_page_kb(users_page: list, page: int, total: int) -> InlineKeyboardMarkup:
     rows = []
     for u in users_page:
@@ -2481,20 +2059,20 @@ def _subs_page_kb(users_page: list, page: int, total: int) -> InlineKeyboardMark
     rows.append([InlineKeyboardButton(text="Обновить", callback_data="admin_subs")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
+ 
 async def _render_subs_page(cb: CallbackQuery, page: int):
     await cb.message.edit_text("Загружаю подписчиков...")
     try:
         all_subs = await _get_sorted_subs()
         total = len(all_subs)
         page_users = all_subs[page * SUBS_PAGE_SIZE:(page + 1) * SUBS_PAGE_SIZE]
-
+ 
         uid_list = []
         for u in page_users:
             uid_str = u["username"].replace("truba_", "")
             if uid_str.isdigit():
                 uid_list.append(int(uid_str))
-
+ 
         db_map = {}
         if uid_list:
             async with pool.acquire() as conn:
@@ -2502,7 +2080,7 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
                     "SELECT user_id, username FROM users WHERE user_id = ANY($1::bigint[])", uid_list,
                 )
             db_map = {r["user_id"]: r["username"] for r in db_rows}
-
+ 
         for u in page_users:
             uid_str = u["username"].replace("truba_", "")
             if uid_str.isdigit():
@@ -2511,7 +2089,7 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
                 u["_tg_label"] = f"@{tg_name}" if tg_name else f"ID:{uid_int}"
             else:
                 u["_tg_label"] = f"ID:{uid_str}"
-
+ 
         header = f"Активных подписчиков: {total}\nНажмите на подписчика для управления"
         await cb.message.edit_text(header, reply_markup=_subs_page_kb(page_users, page, total))
     except Exception as e:
@@ -2523,25 +2101,25 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
                 [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
             ]),
         )
-
+ 
 @router.callback_query(F.data == "admin_subs")
 async def admin_subs_cb(cb: CallbackQuery):
     await cb.answer()
     if not is_admin(cb.from_user.id):
         return
     await _render_subs_page(cb, 0)
-
+ 
 @router.callback_query(F.data.startswith("subs_page_"))
 async def subs_page_cb(cb: CallbackQuery):
     await cb.answer()
     if not is_admin(cb.from_user.id):
         return
     await _render_subs_page(cb, int(cb.data.removeprefix("subs_page_")))
-
+ 
 @router.callback_query(F.data == "subs_noop")
 async def subs_noop(cb: CallbackQuery):
     await cb.answer()
-
+ 
 @router.callback_query(F.data.startswith("sub_view_"))
 async def sub_view_cb(cb: CallbackQuery):
     await cb.answer()
@@ -2552,7 +2130,7 @@ async def sub_view_cb(cb: CallbackQuery):
         await cb.answer("Некорректный ID.", show_alert=True)
         return
     await _render_check(cb, int(uid_str))
-
+ 
 # ─────────────────────────────────────────────
 #  КАРТОЧКА ПОДПИСЧИКА (/check)
 # ──────────────────  ──────────────────────────
@@ -2566,7 +2144,7 @@ def _check_kb(user_id: int, hwid: int, has_whitelist: bool = False) -> InlineKey
             rows.append(preset_row); preset_row = []
     if preset_row:
         rows.append(preset_row)
-
+ 
     whitelist_btn_text = "Забрать глушилки" if has_whitelist else "Дать глушилки"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="+ Дни", callback_data=f"ca_adddays_{user_id}"),
@@ -2579,7 +2157,7 @@ def _check_kb(user_id: int, hwid: int, has_whitelist: bool = False) -> InlineKey
         [InlineKeyboardButton(text="Забрать подписку", callback_data=f"quicktake_{user_id}")],
         [InlineKeyboardButton(text="Подписчики", callback_data="admin_subs")],
     ])
-
+ 
 async def _render_check(target_send, user_id: int):
     now = int(time.time())
     async with pool.acquire() as conn:
@@ -2593,7 +2171,7 @@ async def _render_check(target_send, user_id: int):
         )
         ref_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id=$1", user_id)
         wl_row    = await conn.fetchrow("SELECT gb_limit, period_start, cut_off FROM whitelist_limits WHERE user_id=$1", user_id)
-
+ 
     if not db_row:
         txt = f"Пользователь {user_id} не найден."
         if isinstance(target_send, types.Message):
@@ -2601,11 +2179,11 @@ async def _render_check(target_send, user_id: int):
         else:
             await target_send.message.answer(txt)
         return
-
+ 
     username = db_row["username"] or str(user_id)
     plan_name = PLANS.get(db_row["plan"], {}).get("name", "нет") if db_row["plan"] else "нет"
     remna = await remna_get_user(user_id)
-
+ 
     lines = [
         f"@{username} (ID: {user_id})",
         f"Тариф: {plan_name}",
@@ -2641,18 +2219,18 @@ async def _render_check(target_send, user_id: int):
             )
     else:
         lines.append("Подписки нет")
-
+ 
     if payments:
         lines += ["", "Платежи:"]
         for p in payments:
             dt = fmt_dt(p["created_at"], "%d.%m.%Y")
             lines.append(f"  {dt} · {p['amount']:.0f} руб. · {p['tariff_key'] or '-'}")
-
+ 
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n\n... обрезано"
     kb = _check_kb(user_id, hwid, has_whitelist_squad)
-
+ 
     if isinstance(target_send, types.Message):
         await target_send.answer(text, reply_markup=kb)
     else:
@@ -2660,7 +2238,7 @@ async def _render_check(target_send, user_id: int):
             await target_send.message.edit_text(text, reply_markup=kb)
         except Exception:
             await target_send.message.answer(text, reply_markup=kb)
-
+ 
 @router.message(Command("check"))
 async def admin_check_cmd(message: types.Message, command: CommandObject):
     if not is_admin(message.from_user.id):
@@ -2678,7 +2256,7 @@ async def admin_check_cmd(message: types.Message, command: CommandObject):
         await message.answer(f"Пользователь {target} не найден.")
         return
     await _render_check(message, row["user_id"])
-
+ 
 # ─────────────────────────────────────────────
 #  БЫСТРЫЕ ПРЕСЕТЫ УСТРОЙСТВ
 # ─────────────────────────────────────────────
@@ -2705,7 +2283,7 @@ async def set_hwid_limit(cb: CallbackQuery):
         await cb.message.edit_reply_markup(reply_markup=_check_kb(user_id, hwid2, has_wl))
     except Exception:
         pass
-
+ 
 # ─────────────────────────────────────────────
 #  ДНИ: добавить / убрать / ус  ановить дату
 # ─────────────────────────────────────────────
@@ -2718,7 +2296,7 @@ async def ca_adddays_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(CheckActionState.waiting_days_add)
     await state.update_data(ca_uid=user_id)
     await cb.message.answer(f"Добавить дни для ID:{user_id}\n\nВведите количество дней:", reply_markup=cancel_kb())
-
+ 
 @router.message(CheckActionState.waiting_days_add)
 async def ca_adddays_handler(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2748,7 +2326,7 @@ async def ca_adddays_handler(message: types.Message, state: FSMContext):
     new_ts = parse_dt(result.get("expireAt"))
     await message.answer(f"ID:{user_id} — добавлено +{days} дн. Новая дата: {fmt_dt(new_ts)}")
     await _render_check(message, user_id)
-
+ 
 @router.callback_query(F.data.startswith("ca_subdays_"))
 async def ca_subdays_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -2758,7 +2336,7 @@ async def ca_subdays_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(CheckActionState.waiting_days_sub)
     await state.update_data(ca_uid=user_id)
     await cb.message.answer(f"Убрать дни у ID:{user_id}\n\nВведите количество дней:", reply_markup=cancel_kb())
-
+ 
 @router.message(CheckActionState.waiting_days_sub)
 async def ca_subdays_handler(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2790,7 +2368,7 @@ async def ca_subdays_handler(message: types.Message, state: FSMContext):
     new_ts = parse_dt(result.get("expireAt"))
     await message.answer(f"ID:{user_id} — убрано -{days} дн. Новая дата: {fmt_dt(new_ts)}")
     await _render_check(message, user_id)
-
+ 
 @router.callback_query(F.data.startswith("ca_setdate_"))
 async def ca_setdate_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -2804,7 +2382,7 @@ async def ca_setdate_start(cb: CallbackQuery, state: FSMContext):
         f"Введите дату в формате ДД.ММ.ГГГГ (по МСК, время 23:59):",
         reply_markup=cancel_kb(),
     )
-
+ 
 @router.message(CheckActionState.waiting_days_set)
 async def ca_setdate_handler(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2830,7 +2408,7 @@ async def ca_setdate_handler(message: types.Message, state: FSMContext):
         return
     await message.answer(f"ID:{user_id} — дата установлена: {message.text.strip()} 23:59 МСК")
     await _render_check(message, user_id)
-
+ 
 # ─────────────────────────────────────────────
 #  УСТРОЙСТВА: установить число вручную
 # ─────────────────────────────────────────────
@@ -2843,7 +2421,7 @@ async def ca_sethwid_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(CheckActionState.waiting_hwid_set)
     await state.update_data(ca_uid=user_id)
     await cb.message.answer(f"Установить лимит устройств для ID:{user_id}\n\nВведите число (0 = без лимита):", reply_markup=cancel_kb())
-
+ 
 @router.message(CheckActionState.waiting_hwid_set)
 async def ca_sethwid_handler(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2868,7 +2446,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
         return
     await message.answer(f"ID:{user_id} — лимит устройств: {hwid}")
     await _render_check(message, user_id)
-
+ 
 @router.message(Command("cancel"), CheckActionState.waiting_days_add)
 @router.message(Command("cancel"), CheckActionState.waiting_days_sub)
 @router.message(Command("cancel"), CheckActionState.waiting_days_set)
@@ -2877,10 +2455,10 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
 async def ca_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
-
+ 
 # ───────────  ─────────────────────────────────
 #  СПИСО   УСТРОЙСТВ (HWID inspector)
-# ────────────────────   ────────────────────────
+# ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_devices_"))
 async def ca_devices_show(cb: CallbackQuery):
     await cb.answer()
@@ -2905,7 +2483,7 @@ async def ca_devices_show(cb: CallbackQuery):
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
     await cb.message.answer(text)
-
+ 
 # ─────────────────────────────────────────────
 #  БЕЛЫЕ СПИСКИ: выдать/забрать вручную + лимит
 # ─────────────────────────────────────────────
@@ -2921,7 +2499,7 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
         return
     current_squads = _squad_uuids(remna.get("activeInternalSquads"))
     has_whitelist  = SQUAD_UUID_WHITELIST in current_squads
-
+ 
     if has_whitelist:
         new_squads = [s for s in current_squads if s != SQUAD_UUID_WHITELIST]
         if SQUAD_UUID_BASIC not in new_squads:
@@ -2932,7 +2510,7 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
             return
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
-        await cb.message.answer(f"ID:{user_id} — доступ к глушилкам от  зван.")
+        await cb.message.answer(f"ID:{user_id} — доступ к глушилкам отозван.")
         await _render_check(cb, user_id)
     else:
         await cb.message.answer(
@@ -2942,7 +2520,7 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
         )
         await state.set_state(CheckActionState.waiting_whitelist_gb)
         await state.update_data(ca_uid=user_id)
-
+ 
 @router.message(CheckActionState.waiting_whitelist_gb)
 async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2954,7 +2532,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
     data     = await state.get_data()
     user_id  = data["ca_uid"]
     await state.clear()
-
+ 
     remna = await remna_get_user(user_id)
     if not remna:
         await message.answer("Пользователь не найден в Remnawave.")
@@ -2967,7 +2545,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
     if not result:
         await message.answer(f"Ошибка обновления сквада.\nОтправлено: {new_squads}\nОтвет: {err_text}")
         return
-
+ 
     async with pool.acquire() as conn:
         if gb_limit > 0:
             await conn.execute(
@@ -2978,11 +2556,11 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
             )
         else:
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
-
+ 
     limit_label = f"{gb_limit} GB" if gb_limit > 0 else "без лимита"
     await message.answer(f"ID:{user_id} — доступ к глушилкам выдан. Лимит: {limit_label}")
     await _render_check(message, user_id)
-
+ 
 # ─────────────────────────────────────────────
 #  ЗАБРАТЬ ПОДПИСКУ
 # ──────────────   ───   ──────────────────────────
@@ -3008,7 +2586,7 @@ async def quick_take(cb: CallbackQuery):
         await bot.send_message(user_id, "Ваша подписка отозвана администратором.")
     except Exception:
         pass
-
+ 
 # ─────────────────────────────────────────────
 #  ПРОМОКОДЫ (админ)
 # ─────────────────────────────────────────────
@@ -3040,7 +2618,7 @@ async def _save_promo(message: types.Message, parts: list):
             code, days, uses, promo_type, tariff_key, discount_percent,
         )
     await message.answer(f"Промокод {code} создан. Тип: {promo_type}. Дней: {days}. Исп.: {uses}")
-
+ 
 @router.message(Command("add_promo"))
 async def add_promo(message: types.Message, command: CommandObject):
     if not is_admin(message.from_user.id):
@@ -3055,7 +2633,7 @@ async def add_promo(message: types.Message, command: CommandObject):
         )
         return
     await _save_promo(message, parts)
-
+ 
 @router.message(Command("genpromo"))
 async def admin_genpromo(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -3069,12 +2647,12 @@ async def admin_genpromo(message: types.Message, state: FSMContext):
         "Число вместо кода → авто генерация",
         reply_markup=cancel_kb(),
     )
-
+ 
 @router.message(Command("cancel"), AdminPromoState.waiting_input)
 async def genpromo_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
-
+ 
 @router.message(AdminPromoState.waiting_input)
 async def admin_genpromo_handle(message: types.Message, state: FSMContext):
     await state.clear()
@@ -3085,7 +2663,7 @@ async def admin_genpromo_handle(message: types.Message, state: FSMContext):
         await message.answer("Неверный формат.")
         return
     await _save_promo(message, parts)
-
+ 
 @router.message(Command("list_promos"))
 async def admin_list_promos(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -3108,7 +2686,7 @@ async def admin_list_promos(message: types.Message):
         days_str = f"{r['days']} дн." if r["days"] else "-"
         lines.append(f"{r['code']} — {days_str}, {r['uses']} исп.{extra}")
     await message.answer("\n".join(lines))
-
+ 
 @router.callback_query(F.data == "admin_promos")
 async def admin_promos_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3127,7 +2705,7 @@ async def admin_promos_cb(cb: CallbackQuery):
         [InlineKeyboardButton(text="Создать промокод", callback_data="promogen_start")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 # ─────────────────────────────────────────────
 #  ГЕНЕРАЦИЯ ПРОМОКОДА КНОПКАМИ (без текстовых команд)
 #
@@ -3146,7 +2724,7 @@ async def _create_promo(code: str, days: int, uses: int, promo_type: str, tariff
             "ON CONFLICT (code) DO UPDATE SET days=$2,uses=$3,promo_type=$4,tariff_key=$5,discount_percent=0",
             code, days, uses, promo_type, tariff_key,
         )
-
+ 
 @router.callback_query(F.data == "promogen_start")
 async def promogen_start_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3160,7 +2738,7 @@ async def promogen_start_cb(cb: CallbackQuery):
             [InlineKeyboardButton(text="Назад", callback_data="admin_promos")],
         ]),
     )
-
+ 
 @router.callback_query(F.data == "promogen_type_days")
 async def promogen_type_days_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3171,7 +2749,7 @@ async def promogen_type_days_cb(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         "Сколько дней добавляет промокод? Введите число:", reply_markup=cancel_kb()
     )
-
+ 
 @router.callback_query(F.data == "promogen_type_free")
 async def promogen_type_free_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3186,7 +2764,7 @@ async def promogen_type_free_cb(cb: CallbackQuery):
             [InlineKeyboardButton(text="Назад", callback_data="promogen_start")],
         ]),
     )
-
+ 
 @router.callback_query(F.data.startswith("promogen_freeplan_"))
 async def promogen_freeplan_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3201,7 +2779,7 @@ async def promogen_freeplan_cb(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         "Сколько дней бесплатного доступа? Введите число:", reply_markup=cancel_kb()
     )
-
+ 
 def _uses_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1", callback_data="promogen_uses_1"),
@@ -3211,7 +2789,7 @@ def _uses_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Своё число", callback_data="promogen_uses_custom")],
         [InlineKeyboardButton(text="Отмена", callback_data="cancel_to_profile")],
     ])
-
+ 
 @router.message(PromoGenState.waiting_days)
 async def promogen_days_handler(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().isdigit():
@@ -3223,7 +2801,7 @@ async def promogen_days_handler(message: types.Message, state: FSMContext):
         return
     await state.update_data(days=days)
     await message.answer("Сколько раз можно использовать промокод?", reply_markup=_uses_kb())
-
+ 
 @router.callback_query(F.data.startswith("promogen_uses_"))
 async def promogen_uses_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3240,7 +2818,7 @@ async def promogen_uses_cb(cb: CallbackQuery, state: FSMContext):
         "Введите код промокода (латиница/цифры), либо отправьте 0 для автогенерации:",
         reply_markup=cancel_kb(),
     )
-
+ 
 @router.message(PromoGenState.waiting_uses_custom)
 async def promogen_uses_custom_handler(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().isdigit():
@@ -3256,7 +2834,7 @@ async def promogen_uses_custom_handler(message: types.Message, state: FSMContext
         "Введите код промокода (латиница/цифры), либо отправьте 0 для автогенерации:",
         reply_markup=cancel_kb(),
     )
-
+ 
 @router.message(PromoGenState.waiting_code)
 async def promogen_code_handler(message: types.Message, state: FSMContext):
     raw = message.text.strip()
@@ -3279,7 +2857,7 @@ async def promogen_code_handler(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="К списку промокодов", callback_data="admin_promos")],
         ]),
     )
-
+ 
 # ─────────────────────────────────────────────
 #  РАССЫЛКА
 # ─────────────────────────────────────────────
@@ -3289,17 +2867,17 @@ async def broadcast_start(message: types.Message, state: FSMContext):
         return
     await state.set_state(BroadcastState.waiting_text)
     await message.answer("Рассылка\n\nВв  дите текст.", reply_markup=cancel_kb())
-
+ 
 @router.message(Command("cancel"), BroadcastState.waiting_text)
 async def broadcast_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Рассылка отменена.")
-
+ 
 @router.message(Command("cancel"), BroadcastState.confirming)
 async def broadcast_cancel2(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Рассылка отменена.")
-
+ 
 @router.message(BroadcastState.waiting_text)
 async def broadcast_preview(message: types.Message, state: FSMContext):
     await state.update_data(broadcast_text=message.text)
@@ -3312,7 +2890,7 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="Отмена", callback_data="bc_cancel")],
         ]),
     )
-
+ 
 async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = False):
     data = await state.get_data()
     text_body = data.get("broadcast_text", "")
@@ -3335,27 +2913,27 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
             fail += 1
         await asyncio.sleep(0.05)
     await cb.message.edit_text(f"Готово.\nОтправлено: {ok} · Ошибок: {fail}")
-
+ 
 @router.callback_query(F.data == "bc_confirm")
 async def broadcast_confirm(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     if not is_admin(cb.from_user.id):
         return
     await _do_broadcast(cb, state, subs_only=False)
-
+ 
 @router.callback_query(F.data == "bc_confirm_subs")
 async def broadcast_confirm_subs(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     if not is_admin(cb.from_user.id):
         return
     await _do_broadcast(cb, state, subs_only=True)
-
+ 
 @router.callback_query(F.data == "bc_cancel")
 async def broadcast_cancel_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
     await cb.message.edit_text("Рассылка отменена.")
-
+ 
 # ─────────────────────────────────────────────
 #  РЕФЕРАЛЫ (админ)
 # ─────────────────────────────────────────────
@@ -3392,7 +2970,7 @@ async def admin_referrals_cb(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 @router.message(Command("payout"))
 async def admin_payout(message: types.Message, command: CommandObject):
     """Отметить реферальный баланс юзера как выплаченный (обнулить + записать в историю)."""
@@ -3425,7 +3003,7 @@ async def admin_payout(message: types.Message, command: CommandObject):
         await bot.send_message(row["user_id"], f"Ваш реферальный баланс {balance:.2f} руб. выплачен.")
     except Exception:
         pass
-
+ 
 # ─────────────────────────────────────────────
 #  ОТЧЁТ (кнопка панели — отправить сразу)
 # ────────────────────────  ────────────────────
@@ -3439,7 +3017,7 @@ async def admin_report_cb(cb: CallbackQuery):
     await cb.message.edit_text("Отчёт отправлен в личные сообщения.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 # ─────────────────────────────────────────────
 #  ВЫДАТЬ (кнопка панели — conversational flow)
 # ─────────────────────────────────────────────
@@ -3450,14 +3028,14 @@ async def admin_give_start_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminGiveState.waiting_username)
     await cb.message.answer("Выдача подписки\n\nВведите username (без @):", reply_markup=cancel_kb())
-
+ 
 @router.message(Command("cancel"), AdminGiveState.waiting_username)
 @router.message(Command("cancel"), AdminGiveState.waiting_days)
 @router.message(Command("cancel"), AdminGiveState.waiting_devices)
 async def admin_give_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
-
+ 
 @router.message(AdminGiveState.waiting_username)
 async def admin_give_username(message: types.Message, state: FSMContext):
     username = message.text.strip().lstrip("@")
@@ -3469,7 +3047,7 @@ async def admin_give_username(message: types.Message, state: FSMContext):
     await state.update_data(target_id=row["user_id"], target_username=username)
     await state.set_state(AdminGiveState.waiting_days)
     await message.answer(f"@{username}\n\nСколько дней выдать?", reply_markup=cancel_kb())
-
+ 
 @router.message(AdminGiveState.waiting_days)
 async def admin_give_days(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().lstrip("-").isdigit():
@@ -3479,7 +3057,7 @@ async def admin_give_days(message: types.Message, state: FSMContext):
     await state.update_data(days=days)
     await state.set_state(AdminGiveState.waiting_devices)
     await message.answer("Сколько устройств выставить? (0 = не менять текущее значение)", reply_markup=cancel_kb())
-
+ 
 @router.message(AdminGiveState.waiting_devices)
 async def admin_give_devices(message: types.Message, state: FSMContext):
     if not message.text or not message.text.strip().isdigit():
@@ -3490,7 +3068,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
         [InlineKeyboardButton(text="VPN", callback_data="giveplan_vpn")],
-        [InlineKeyboardButton(text="VPN с обходом   лушилок", callback_data="giveplan_vpn_bypass")],
+        [InlineKeyboardButton(text="VPN с обходом глушилок", callback_data="giveplan_vpn_bypass")],
         [InlineKeyboardButton(text="Пробный доступ (глушилки, 3 ГБ)", callback_data="giveplan_trial")],
     ])
     await message.answer(
@@ -3502,7 +3080,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
         "купленный тариф (кнопки покупки в профиле останутся).",
         reply_markup=kb,
     )
-
+ 
 @router.callback_query(F.data.startswith("giveplan_"))
 async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3514,18 +3092,18 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text("Сессия истекла, начните заново через «Выдать».")
         return
     await state.clear()
-
+ 
     target_id    = data["target_id"]
     target_uname = data["target_username"]
     days         = data["days"]
     devices      = data.get("devices", 0)
     hwid         = devices if devices > 0 else None
-
+ 
     squad_uuid   = None
     whitelist_gb = 0
     new_plan     = None       # None = не трогать поле plan в БД
     clear_plan   = False      # explicit сброс plan на NULL (для "не менять" не используется)
-
+ 
     if choice == "vpn":
         squad_uuid = SQUAD_UUID_BASIC
         new_plan   = "vpn"
@@ -3538,14 +3116,14 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         whitelist_gb = TRIAL["whitelist_gb"]
         new_plan     = "trial"
     # choice == "none":   ставляем squad_uuid=None, new_plan=None (ничего не трогаем)
-
+ 
     user = await activate_subscription(
         target_id, days, hwid or 1, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
     )
     if not user:
         await cb.message.edit_text("Ошибка активации.")
         return
-
+ 
     async with pool.acquire() as conn:
         if new_plan is not None:
             extra_devices = max(0, (hwid or 1) - 1)
@@ -3553,7 +3131,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
                 "UPDATE users SET plan=$1, extra_devices=$2 WHERE user_id=$3",
                 new_plan, extra_devices, target_id,
             )
-
+ 
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN с обходом", "trial": "пробный доступ"}[choice]
@@ -3562,7 +3140,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         await bot.send_message(target_id, f"Администратор выдал вам {days} дней.", parse_mode="HTML")
     except Exception:
         pass
-
+ 
 # ─────────────────────────────────────────────
 #  НАЙТИ ЮЗЕРА (кнопка панели)
 # ─────────────────────────────────────────────
@@ -3573,12 +3151,12 @@ async def admin_find_start_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminFindState.waiting_query)
     await cb.message.answer("Введите username или user_id для поиска:", reply_markup=cancel_kb())
-
+ 
 @router.message(Command("cancel"), AdminFindState.waiting_query)
 async def admin_find_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
-
+ 
 @router.message(AdminFindState.waiting_query)
 async def admin_find_handler(message: types.Message, state: FSMContext):
     await state.clear()
@@ -3592,7 +3170,7 @@ async def admin_find_handler(message: types.Message, state: FSMContext):
         await message.answer(f"Пользователь {target} не найден.")
         return
     await _render_check(message, row["user_id"])
-
+ 
 # ─────────────────────────────────────────────
 #  КТО ОНЛАЙН
 # ─────────────────────────────────────────────
@@ -3629,7 +3207,7 @@ async def admin_online_cb(cb: CallbackQuery):
         [InlineKeyboardButton(text="Обновить", callback_data="admin_online")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 # ─────────────────────────────────────────────
 #  РАССЫЛКА (запуск кнопкой из панели)
 # ─────────────────────────────────────────────
@@ -3640,7 +3218,7 @@ async def admin_broadcast_start_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(BroadcastState.waiting_text)
     await cb.message.answer("Рассылка\n\nВведите текст.", reply_markup=cancel_kb())
-
+ 
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ
 # ─────────────────────────────────────────────
@@ -3658,7 +3236,7 @@ async def admin_settings_cb(cb: CallbackQuery):
         )],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 @router.callback_query(F.data == "admin_toggle_sale_notify")
 async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3681,7 +3259,7 @@ async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
         )],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 # ─────────────────────────────────────────────
 #  ОПРОС (рейтинг сервиса среди платников)
 # ─────────────────────────────────────────────
@@ -3689,7 +3267,7 @@ def _rating_kb() -> InlineKeyboardMarkup:
     row1 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(1, 6)]
     row2 = [InlineKeyboardButton(text=str(i), callback_data=f"survey_rate_{i}") for i in range(6, 11)]
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
-
+ 
 @router.callback_query(F.data == "admin_survey")
 async def admin_survey_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3700,7 +3278,7 @@ async def admin_survey_cb(cb: CallbackQuery):
         [InlineKeyboardButton(text="Результаты", callback_data="admin_survey_results")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 @router.callback_query(F.data == "admin_survey_send")
 async def admin_survey_send_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3725,7 +3303,7 @@ async def admin_survey_send_cb(cb: CallbackQuery):
     await cb.message.edit_text(f"Опрос разослан.\nДоставлено: {ok} · Ошибок: {fail}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
     ]))
-
+ 
 @router.callback_query(F.data.startswith("survey_rate_"))
 async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3744,7 +3322,7 @@ async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="Пропустить", callback_data="survey_skip_comment")],
         ]),
     )
-
+ 
 @router.callback_query(F.data == "survey_skip_comment")
 async def survey_skip_comment_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3753,7 +3331,7 @@ async def survey_skip_comment_cb(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await _save_survey(cb.from_user, rating, None)
     await cb.message.edit_text("Спасибо за вашу оценку.")
-
+ 
 @router.message(SurveyState.waiting_comment)
 async def survey_comment_handler(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -3762,7 +3340,7 @@ async def survey_comment_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await _save_survey(message.from_user, rating, comment)
     await message.answer("Спасибо за ваш отзыв.")
-
+ 
 async def _save_survey(user, rating: int, comment: str | None):
     async with pool.acquire() as conn:
         await conn.execute(
@@ -3777,7 +3355,7 @@ async def _save_survey(user, rating: int, comment: str | None):
             await bot.send_message(admin_id, text)
         except Exception:
             pass
-
+ 
 @router.callback_query(F.data == "admin_survey_results")
 async def admin_survey_results_cb(cb: CallbackQuery):
     await cb.answer()
@@ -3814,7 +3392,7 @@ async def admin_survey_results_cb(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
     ]))
-
+ 
 # ─────────────────────────────────────────────
 #  СТАТИСТИКА
 # ─────────────────────────────────────────────
@@ -3843,7 +3421,7 @@ async def admin_stats_cb(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
-
+ 
 @router.message(Command("sale_notify"))
 async def toggle_sale_notify(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -3858,7 +3436,7 @@ async def toggle_sale_notify(message: types.Message):
         else:
             await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
     await message.answer("Уведомления о покупках включены." if new_val else "Уведомления о покупках выключены.")
-
+ 
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
     """Выдать дни вручную, без привязки к тарифу (сквад не меняется)."""
@@ -3886,7 +3464,7 @@ async def admin_give(message: types.Message, command: CommandObject):
         await bot.send_message(row["user_id"], f"Администратор выдал вам {days} дней.", parse_mode="HTML")
     except Exception:
         pass
-
+ 
 @router.message(Command("admin"))
 async def admin_help(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -3903,7 +3481,7 @@ async def admin_help(message: types.Message):
         "/whitelist_check, /whitelist_status — лимиты глушилок\n\n"
         "Кнопка «Панель» в профиле открывает то же самое через интерфейс."
     )
-
+ 
 # ───────────────────────────────────────   ─────
 #  ЛИМИТ ТРАФИКА НА СЕРВЕРЕ БЕЛЫХ СПИСКОВ
 # ─────────────────────────────────────────────
@@ -3946,12 +3524,12 @@ async def check_whitelist_limits():
                         pass
     except Exception as e:
         log.error("check_whitelist_limits error: %s", e)
-
+ 
 async def whitelist_limit_scheduler():
     while True:
         await asyncio.sleep(30 * 60)
         await check_whitelist_limits()
-
+ 
 @router.message(Command("whitelist_check"))
 async def admin_whitelist_check_now(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -3962,7 +3540,7 @@ async def admin_whitelist_check_now(message: types.Message):
     await message.answer("Проверяю лимиты глушилок...")
     await check_whitelist_limits()
     await message.answer("Готово. Смотри /whitelist_status для деталей.")
-
+ 
 @router.message(Command("whitelist_status"))
 async def admin_whitelist_status(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -3994,7 +3572,7 @@ async def admin_whitelist_status(message: types.Message):
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
     await message.answer(text)
-
+ 
 # ─────────────────────────────────────────────
 #  ЕЖЕДНЕВНЫЙ ОТЧЁТ
 # ─────────────────────────────────────────────
@@ -4029,7 +3607,7 @@ async def send_daily_report():
                 pass
     except Exception as e:
         log.error("send_daily_report error: %s", e)
-
+ 
 async def daily_report_scheduler():
     while True:
         now    = msk_now()
@@ -4038,14 +3616,14 @@ async def daily_report_scheduler():
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
         await send_daily_report()
-
+ 
 @router.message(Command("report"))
 async def admin_report_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     await message.answer("Формирую отчёт...")
     await send_daily_report()
-
+ 
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────   ───────────────────────────────
@@ -4054,8 +3632,8 @@ async def admin_report_cmd(message: types.Message):
 # ─────────────────────────────────────────────
 _EXPIRY_WINDOWS = [("3d", 3 * 86400), ("1d", 86400), ("1h", 3600)]
 _EXPIRY_LABELS  = {"3d": "около 3 дней", "1d": "около 1 дня", "1h": "около 1 часа"}
-
-
+ 
+ 
 def _renew_kb(plan_key: str) -> InlineKeyboardMarkup:
     """Клавиатура продления для напоминания. Тап по кнопке уже создаёт саму
     ссылку на оплату (экран «Оплатить» / «Проверить оплату»)."""
@@ -4073,8 +3651,8 @@ def _renew_kb(plan_key: str) -> InlineKeyboardMarkup:
             callback_data="plan_upgrade",
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
+ 
+ 
 @router.callback_query(F.data.startswith("rnw_"))
 async def renew_cb(cb: CallbackQuery):
     await cb.answer()
@@ -4094,8 +3672,8 @@ async def renew_cb(cb: CallbackQuery):
         price=price, days=months * 30, hwid=1, squad=plan["squad"],
         whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
     )
-
-
+ 
+ 
 async def _send_expiry_reminder(user_id: int, plan_key: str, expire_ts: int, kind: str):
     plan = PLANS.get(plan_key)
     if not plan:
@@ -4110,8 +3688,8 @@ async def _send_expiry_reminder(user_id: int, plan_key: str, expire_ts: int, kin
     )
     await bot.send_message(user_id, text, parse_mode="HTML",
                            reply_markup=_renew_kb(plan_key))
-
-
+ 
+ 
 async def _run_expiry_reminders():
     users = await remna_get_all_users()
     now   = int(time.time())
@@ -4166,8 +3744,8 @@ async def _run_expiry_reminders():
                     tg_id, k, expire_ts, now,
                 )
         await asyncio.sleep(0.05)
-
-
+ 
+ 
 async def expiry_reminder_scheduler():
     """Каждые 5 минут напоминает об окончании подписки за 3 дня, 1 день и 1 час.
     Первый прогон — сразу при старте бота, поэтому уведомление приходит быстро."""
@@ -4177,19 +3755,18 @@ async def expiry_reminder_scheduler():
         except Exception as e:
             log.error("expiry_reminder_scheduler: %s", e)
         await asyncio.sleep(5 * 60)
-
-
+ 
+ 
 async def main():
     await init_db()
     await load_extra_admins()
-    await nalog_init()
     dp.include_router(router)
     asyncio.create_task(daily_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
     asyncio.create_task(expiry_reminder_scheduler())
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
+ 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
