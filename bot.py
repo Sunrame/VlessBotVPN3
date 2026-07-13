@@ -4,6 +4,8 @@ import string
 import secrets
 import logging
 import time
+import json
+import base64
 import asyncio
 import asyncpg
 import httpx
@@ -86,7 +88,7 @@ NALOG_ENABLED = os.environ.get("NALOG_ENABLED", "1") == "1"
 NALOG_PHONE = "".join(ch for ch in os.environ.get("NALOG_PHONE", "") if ch.isdigit())
 # Фиксированное название услуги в чеке. Если пусто — берётся название товара.
 NALOG_SERVICE_NAME = os.environ.get("NALOG_SERVICE_NAME", "").strip()
-NALOG_API = "https://lknpd.nalog.ru/api/v1"
+NALOG_API = "https://lknpd.nalog.ru"  # базовый хост; версия API указывается в пути
 
 # Основной сквад (все сервера, кроме глушилок)
 SQUAD_UUID = os.environ.get("SQUAD_UUID_BASIC", "")
@@ -368,16 +370,34 @@ class NalogClient:
         except Exception:
             return datetime.now(timezone.utc) + timedelta(minutes=10)
 
+    @staticmethod
+    def _inn_from_token(token: str | None):
+        """ИЗвлекает ИНН из payload JWT access-токена (если не пришёл в profile)."""
+        if not token:
+            return None
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            for k in ("inn", "sub"):
+                if data.get(k):
+                    return str(data[k])
+        except Exception:
+            pass
+        return None
+
     async def _request(self, method: str, path: str, *, json_body=None, auth=False) -> dict:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "Referrer": "https://lknpd.nalog.ru/sales/create",
+            "Referer": "https://lknpd.nalog.ru/",
+            "Referrer": "https://lknpd.nalog.ru/",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
         }
         if auth:
             await self._ensure_token()
             headers["Authorization"] = f"Bearer {self.token}"
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             r = await client.request(method, f"{NALOG_API}{path}", json=json_body, headers=headers)
         if r.status_code >= 400:
             raise RuntimeError(f"nalog {path} -> {r.status_code}: {r.text[:300]}")
@@ -395,15 +415,18 @@ class NalogClient:
         self.token_expire = self._parse_dt(exp) if exp else (
             datetime.now(timezone.utc) + timedelta(minutes=10)
         )
+        if not self.inn and self.token:
+            self.inn = self._inn_from_token(self.token)
 
     # ── авторизация по SMS ───────────────────
     async def request_sms(self, phone: str) -> None:
         phone = "".join(ch for ch in str(phone) if ch.isdigit())
         if not phone:
             raise RuntimeError("Не указан номер телефона.")
+        # Актуальный endpoint запроса SMS — v2 /auth/challenge/sms/start.
         data = await self._request(
-            "POST", "/auth/challenge",
-            json_body={"phone": phone, "requestTime": self._now_iso_utc(), "type": "PHONE"},
+            "POST", "/api/v2/auth/challenge/sms/start",
+            json_body={"phone": phone, "requireTpToBeActive": True},
         )
         self._challenge_token = data.get("challengeToken")
         self._challenge_phone = phone
@@ -413,8 +436,9 @@ class NalogClient:
     async def verify_sms(self, code: str) -> None:
         if not self._challenge_token or not self._challenge_phone:
             raise RuntimeError("Сначала запросите SMS-код (/nalog_login).")
+        # Актуальный endpoint подтверждения — v1 /auth/challenge/sms/verify.
         data = await self._request(
-            "POST", "/auth/challenge/verify",
+            "POST", "/api/v1/auth/challenge/sms/verify",
             json_body={
                 "phone": self._challenge_phone,
                 "code": str(code).strip(),
@@ -425,15 +449,19 @@ class NalogClient:
         self._apply_token_response(data)
         self.phone = self._challenge_phone
         self._challenge_token = None
+        if not self.refresh_token:
+            raise RuntimeError(f"Вход не завершён (нет refreshToken): {data}")
+        # Получаем access-токен и ИНН (verify может вернуть только refreshToken).
+        await self._refresh()
         if not self.ready:
-            raise RuntimeError(f"Вход не завершён (нет токена/ИНН): {data}")
+            raise RuntimeError(f"Вход не завершён (не получен ИНН): {data}")
         await self._save()
 
     async def _refresh(self) -> None:
         if not self.refresh_token:
             raise RuntimeError("Нет refresh-токена. Требуется вход по SMS.")
         data = await self._request(
-            "POST", "/auth/token",
+            "POST", "/api/v1/auth/token",
             json_body={"deviceInfo": self._device_info(), "refreshToken": self.refresh_token},
         )
         self._apply_token_response(data)
@@ -447,7 +475,7 @@ class NalogClient:
 
     # ── пробитие чека ────────────────────────
     def receipt_url(self, receipt_uuid: str) -> str:
-        return f"{NALOG_API}/receipt/{self.inn}/{receipt_uuid}/print"
+        return f"{NALOG_API}/api/v1/receipt/{self.inn}/{receipt_uuid}/print"
 
     async def add_income(self, amount: float, name: str, when: datetime | None = None) -> dict:
         if not self.ready:
@@ -473,7 +501,7 @@ class NalogClient:
             "ignoreMaxTotalIncomeRestriction": False,
         }
         async with self._lock:
-            data = await self._request("POST", "/income", json_body=body, auth=True)
+            data = await self._request("POST", "/api/v1/income", json_body=body, auth=True)
         receipt_uuid = data.get("approvedReceiptUuid")
         return {
             "uuid": receipt_uuid,
@@ -1510,7 +1538,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
         # Остаток трафика на глушилках — только если реально отслеживается
         # (есть строка в whitelist_limits с лимит  м > 0). Своя отдельная строка,
-        # не смешивается с тарифом/устройствами.
+        #   е смешивается с тарифом/устройствами.
         gb_line = ""
         if has_whitelist:
             async with pool.acquire() as conn:
@@ -1779,7 +1807,7 @@ async def check_payment_cb(cb: CallbackQuery):
     plan_key    = md.get("plan_key") or None
     price       = float(md.get("price", 0))
     is_trial    = md.get("is_trial", "0") == "1"
-    item_name   = md.get("item_name", "Покупка")
+    item_name   = md.get("item_name", "Пок  пка")
     qty         = int(md.get("qty", 0) or 0)
 
     async with pool.acquire() as conn:
@@ -2367,7 +2395,7 @@ async def admin_add_start_cb(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminManageState.waiting_username)
     await cb.message.answer(
         "Введите username (без @) пользователя, которого нужно сделать админом.\n"
-        "Пользователь должен хотя бы раз запускать бота (нажать /start).",
+        "Пользователь должен хотя бы раз запуска  ь бота (нажать /start).",
         reply_markup=cancel_kb(),
     )
 
@@ -2904,7 +2932,7 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
             return
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM whitelist_limits WHERE user_id=$1", user_id)
-        await cb.message.answer(f"ID:{user_id} — доступ к глушилкам отозван.")
+        await cb.message.answer(f"ID:{user_id} — доступ к глушилкам от  зван.")
         await _render_check(cb, user_id)
     else:
         await cb.message.answer(
