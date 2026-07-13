@@ -77,6 +77,17 @@ MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") or (f"{SITE_URL}/tga
 
 Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
+# ─────────────────────────────────────────────
+#  «МОЙ НАЛОГ» (самозанятость) — КОНФИГУРАЦИЯ
+# ─────────────────────────────────────────────
+# Включение авточеков. NALOG_ENABLED=0 — полностью отключить.
+NALOG_ENABLED = os.environ.get("NALOG_ENABLED", "1") == "1"
+# Телефон самозанятого (только цифры, напр. 79001234567) — для входа по SMS.
+NALOG_PHONE = "".join(ch for ch in os.environ.get("NALOG_PHONE", "") if ch.isdigit())
+# Фиксированное название услуги в чеке. Если пусто — берётся название товара.
+NALOG_SERVICE_NAME = os.environ.get("NALOG_SERVICE_NAME", "").strip()
+NALOG_API = "https://lknpd.nalog.ru/api/v1"
+
 # Основной сквад (все сервера, кроме глушилок)
 SQUAD_UUID = os.environ.get("SQUAD_UUID_BASIC", "")
 SQUAD_UUID_BASIC = SQUAD_UUID
@@ -297,6 +308,355 @@ dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
 pool: asyncpg.Pool = None
 
+
+# ─────────────────────────────────────────────
+#  «МОЙ НАЛОГ» (lknpd.nalog.ru) — КЛИЕНТ АВТОЧЕКОВ
+#
+#  После успешной оплаты YooKassa автоматически пробивается чек в сервисе
+#  ФНС «Мой налог». Авторизация — по телефону + SMS-коду (при первом
+#  запуске), далее access-токен обновляется сам по refresh-токену,
+#  который вместе с ИНН хранится в БД (таблица nalog_auth). Повторно SMS
+#  не запрашивается, пока refresh-токен жив.
+# ─────────────────────────────────────────────
+class NalogClient:
+    """Тонкий асинхронный клиент API «Мой налог» (ФНС)."""
+
+    def __init__(self):
+        self.phone: str | None = None
+        self.inn: str | None = None
+        self.token: str | None = None            # access-токен (короткоживущий)
+        self.token_expire: datetime | None = None
+        self.refresh_token: str | None = None
+        self.device_id: str = "".join(
+            secrets.choice(string.ascii_lowercase + string.digits) for _ in range(21)
+        )
+        self._challenge_token: str | None = None
+        self._challenge_phone: str | None = None
+        self._lock = asyncio.Lock()
+
+    # ── служебное ────────────────────────────
+    def _device_info(self) -> dict:
+        return {
+            "appVersion": "1.0.0",
+            "sourceDeviceId": self.device_id,
+            "sourceType": "WEB",
+            "metaDetails": {
+                "userAgent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            },
+        }
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.refresh_token and self.inn)
+
+    @staticmethod
+    def _now_iso_utc() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    @staticmethod
+    def _now_iso_msk() -> str:
+        return datetime.now(MSK).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+
+    @staticmethod
+    def _parse_dt(value: str) -> datetime:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    async def _request(self, method: str, path: str, *, json_body=None, auth=False) -> dict:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Referrer": "https://lknpd.nalog.ru/sales/create",
+        }
+        if auth:
+            await self._ensure_token()
+            headers["Authorization"] = f"Bearer {self.token}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.request(method, f"{NALOG_API}{path}", json=json_body, headers=headers)
+        if r.status_code >= 400:
+            raise RuntimeError(f"nalog {path} -> {r.status_code}: {r.text[:300]}")
+        return r.json() if r.text else {}
+
+    def _apply_token_response(self, data: dict) -> None:
+        if data.get("token"):
+            self.token = data["token"]
+        if data.get("refreshToken"):
+            self.refresh_token = data["refreshToken"]
+        profile = data.get("profile") or {}
+        if profile.get("inn"):
+            self.inn = profile["inn"]
+        exp = data.get("tokenExpireIn")
+        self.token_expire = self._parse_dt(exp) if exp else (
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        )
+
+    # ── авторизация по SMS ───────────────────
+    async def request_sms(self, phone: str) -> None:
+        phone = "".join(ch for ch in str(phone) if ch.isdigit())
+        if not phone:
+            raise RuntimeError("Не указан номер телефона.")
+        data = await self._request(
+            "POST", "/auth/challenge",
+            json_body={"phone": phone, "requestTime": self._now_iso_utc(), "type": "PHONE"},
+        )
+        self._challenge_token = data.get("challengeToken")
+        self._challenge_phone = phone
+        if not self._challenge_token:
+            raise RuntimeError(f"Не получен challengeToken: {data}")
+
+    async def verify_sms(self, code: str) -> None:
+        if not self._challenge_token or not self._challenge_phone:
+            raise RuntimeError("Сначала запросите SMS-код (/nalog_login).")
+        data = await self._request(
+            "POST", "/auth/challenge/verify",
+            json_body={
+                "phone": self._challenge_phone,
+                "code": str(code).strip(),
+                "challengeToken": self._challenge_token,
+                "deviceInfo": self._device_info(),
+            },
+        )
+        self._apply_token_response(data)
+        self.phone = self._challenge_phone
+        self._challenge_token = None
+        if not self.ready:
+            raise RuntimeError(f"Вход не завершён (нет токена/ИНН): {data}")
+        await self._save()
+
+    async def _refresh(self) -> None:
+        if not self.refresh_token:
+            raise RuntimeError("Нет refresh-токена. Требуется вход по SMS.")
+        data = await self._request(
+            "POST", "/auth/token",
+            json_body={"deviceInfo": self._device_info(), "refreshToken": self.refresh_token},
+        )
+        self._apply_token_response(data)
+        await self._save()
+
+    async def _ensure_token(self) -> None:
+        if (self.token and self.token_expire
+                and self.token_expire - timedelta(seconds=60) > datetime.now(timezone.utc)):
+            return
+        await self._refresh()
+
+    # ── пробитие чека ────────────────────────
+    def receipt_url(self, receipt_uuid: str) -> str:
+        return f"{NALOG_API}/receipt/{self.inn}/{receipt_uuid}/print"
+
+    async def add_income(self, amount: float, name: str, when: datetime | None = None) -> dict:
+        if not self.ready:
+            raise RuntimeError("«Мой налог» не авторизован (нужен вход по SMS).")
+        amount = round(float(amount), 2)
+        op_time = (when or datetime.now(MSK)).astimezone(MSK)
+        body = {
+            "operationTime": op_time.strftime("%Y-%m-%dT%H:%M:%S+03:00"),
+            "requestTime": self._now_iso_msk(),
+            "services": [{
+                "name": name or "Оказание услуг",
+                "amount": amount,
+                "quantity": 1,
+            }],
+            "totalAmount": str(amount),
+            "client": {
+                "contactPhone": None,
+                "displayName": None,
+                "incomeType": "FROM_INDIVIDUAL",
+                "inn": None,
+            },
+            "paymentType": "CASH",
+            "ignoreMaxTotalIncomeRestriction": False,
+        }
+        async with self._lock:
+            data = await self._request("POST", "/income", json_body=body, auth=True)
+        receipt_uuid = data.get("approvedReceiptUuid")
+        return {
+            "uuid": receipt_uuid,
+            "url": self.receipt_url(receipt_uuid) if receipt_uuid else None,
+        }
+
+    # ── хранение авторизации в БД ─────────────
+    async def _save(self) -> None:
+        if pool is None:
+            return
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO nalog_auth (id, phone, inn, refresh_token, device_id, updated_at) "
+                    "VALUES (1,$1,$2,$3,$4,$5) "
+                    "ON CONFLICT (id) DO UPDATE SET phone=$1, inn=$2, refresh_token=$3, "
+                    "device_id=$4, updated_at=$5",
+                    self.phone, self.inn, self.refresh_token, self.device_id, int(time.time()),
+                )
+        except Exception as e:
+            log.error("nalog _save: %s", e)
+
+    async def load(self) -> None:
+        if pool is None:
+            return
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT phone, inn, refresh_token, device_id FROM nalog_auth WHERE id=1"
+                )
+        except Exception as e:
+            log.error("nalog load: %s", e)
+            return
+        if row:
+            self.phone = row["phone"]
+            self.inn = row["inn"]
+            self.refresh_token = row["refresh_token"]
+            if row["device_id"]:
+                self.device_id = row["device_id"]
+
+
+nalog = NalogClient()
+
+
+def _parse_payment_dt(raw):
+    """Дата платежа YooKassa (ISO-строка или datetime) → datetime | None."""
+    if isinstance(raw, datetime):
+        return raw
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+async def nalog_issue_receipt(payment, price: float, item_name: str, is_trial: bool):
+    """Пробивает чек в «Мой налог» после успешной оплаты. Любая ошибка тут
+    НЕ должна ломать выдачу подписки — только логируется. Возвращает
+    {\"uuid\", \"url\"} или None."""
+    if not NALOG_ENABLED or is_trial:
+        return None
+    try:
+        amount = float(getattr(getattr(payment, "amount", None), "value", None) or price or 0)
+    except Exception:
+        amount = float(price or 0)
+    if amount <= 0:
+        return None
+    if not nalog.ready:
+        log.warning("«Мой налог»: чек не пробит — нет авторизации (payment %s).",
+                    getattr(payment, "id", "?"))
+        return None
+    when = None
+    for attr in ("captured_at", "created_at"):
+        parsed = _parse_payment_dt(getattr(payment, attr, None))
+        if parsed:
+            when = parsed
+            break
+    try:
+        res = await nalog.add_income(
+            amount=amount, name=(NALOG_SERVICE_NAME or item_name), when=when,
+        )
+        log.info("«Мой налог»: чек пробит на %.2f ₽ (uuid %s).", amount, res.get("uuid"))
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO nalog_receipts (payment_id, receipt_uuid, url, amount, created_at) "
+                    "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (payment_id) DO NOTHING",
+                    getattr(payment, "id", None), res.get("uuid"), res.get("url"),
+                    amount, int(time.time()),
+                )
+        except Exception as e:
+            log.error("«Мой налог»: не сохранил чек в БД: %s", e)
+        return res
+    except Exception as e:
+        log.exception("«Мой налог»: ошибка пробития чека: %s", e)
+        return None
+
+
+async def nalog_init():
+    """Инициализация «Мой налог» при старте бота. Если авторизация уже
+    сохранена — просто проверяем токен. Если нет и задан NALOG_PHONE —
+    запрашиваем SMS-код и просим админа ввести его через /nalog_code."""
+    if not NALOG_ENABLED:
+        log.info("«Мой налог»: отключён (NALOG_ENABLED=0).")
+        return
+    await nalog.load()
+    if nalog.ready:
+        try:
+            await nalog._ensure_token()
+            log.info("«Мой налог»: авторизация активна (ИНН %s).", nalog.inn)
+        except Exception as e:
+            log.error("«Мой налог»: refresh не удался (%s). Нужен вход /nalog_login.", e)
+        return
+    if NALOG_PHONE:
+        try:
+            await nalog.request_sms(NALOG_PHONE)
+            msg = (
+                "🧾 «Мой налог»: нужен вход для авточеков.\n"
+                f"На номер +{NALOG_PHONE} отправлен SMS-код.\n"
+                "Введите его командой: /nalog_code КОД"
+            )
+            for admin_id in all_admin_ids():
+                try:
+                    await bot.send_message(admin_id, msg)
+                except Exception:
+                    pass
+            log.info("«Мой налог»: запрошен SMS-код на %s. Ждём /nalog_code.", NALOG_PHONE)
+        except Exception as e:
+            log.error("«Мой налог»: не удалось запросить SMS (%s).", e)
+    else:
+        log.warning("«Мой налог»: NALOG_PHONE не задан — авточеки выключены до /nalog_login.")
+
+
+@router.message(Command("nalog_login"))
+async def nalog_login_cmd(message: types.Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    phone = "".join(ch for ch in (command.args or "").strip() if ch.isdigit()) or NALOG_PHONE
+    if not phone:
+        await message.answer("Укажите номер: /nalog_login 79001234567")
+        return
+    try:
+        await nalog.request_sms(phone)
+    except Exception as e:
+        await message.answer(f"Не удалось запросить SMS: {e}")
+        return
+    await message.answer(f"SMS-код отправлен на +{phone}.\nВведите: /nalog_code КОД")
+
+
+@router.message(Command("nalog_code"))
+async def nalog_code_cmd(message: types.Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    code = "".join(ch for ch in (command.args or "").strip() if ch.isdigit())
+    if not code:
+        await message.answer("Укажите код: /nalog_code 1234")
+        return
+    try:
+        await nalog.verify_sms(code)
+    except Exception as e:
+        await message.answer(f"Не удалось подтвердить код: {e}")
+        return
+    await message.answer(
+        f"✅ «Мой налог» подключён. ИНН: {nalog.inn}\n"
+        "Теперь чеки пробиваются автоматически после каждой оплаты."
+    )
+
+
+@router.message(Command("nalog_status"))
+async def nalog_status_cmd(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    if not NALOG_ENABLED:
+        await message.answer("«Мой налог»: отключён (NALOG_ENABLED=0).")
+        return
+    if nalog.ready:
+        await message.answer(
+            f"«Мой налог»: подключён ✅\nИНН: {nalog.inn}\nТелефон: +{nalog.phone or '—'}"
+        )
+    else:
+        await message.answer("«Мой налог»: не авторизован. Войдите: /nalog_login")
+
 # ─────────────────────────────────────────────
 #  DATABASE
 # ─────────────────────────────────────────────
@@ -413,6 +773,27 @@ async def init_db():
                 kind       TEXT,
                 text       TEXT,
                 created_at BIGINT DEFAULT 0
+            )
+        """)
+        # «Мой налог»: сохранённая авторизация (один самозанятый на бота).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS nalog_auth (
+                id            INTEGER PRIMARY KEY DEFAULT 1,
+                phone         TEXT,
+                inn           TEXT,
+                refresh_token TEXT,
+                device_id     TEXT,
+                updated_at    BIGINT DEFAULT 0
+            )
+        """)
+        # «Мой налог»: связь платёж → пробитый чек (история/идемпотентность).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS nalog_receipts (
+                payment_id   TEXT PRIMARY KEY,
+                receipt_uuid TEXT,
+                url          TEXT,
+                amount       NUMERIC,
+                created_at   BIGINT DEFAULT 0
             )
         """)
         # Миграции на случай старой БД
@@ -1364,7 +1745,7 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
     )
     if not payment:
-        await message.answer("Ошибка создания плат  жа.")
+        await message.answer("Ошибка создания п  ат  жа.")
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     await message.answer(
@@ -1511,6 +1892,19 @@ async def check_payment_cb(cb: CallbackQuery):
         if referrer_id and not is_trial:
             await credit_referral(referrer_id, u_id, uname, item_name, price)
 
+        # Автоматический чек в «Мой налог» (самозанятость). Сумма и дата —
+        # из самого платежа YooKassa. Ошибки не ломают выдачу подписки.
+        receipt = await nalog_issue_receipt(payment, price, item_name, is_trial)
+        if receipt and receipt.get("url"):
+            try:
+                await bot.send_message(
+                    u_id,
+                    f"🧾 Чек «Мой налог» сформирован:\n{receipt['url']}",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
     text, kb = await _build_profile_view(u_id)
     await cb.message.edit_text(
         f"Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
@@ -1518,7 +1912,7 @@ async def check_payment_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  ПРОБНАЯ ПОДПИСКА
-# ─────────────────────────────────────────────
+# ─────────────────────────────  ───────────────
 @router.callback_query(F.data == "trial_buy")
 async def trial_buy_cb(cb: CallbackQuery):
     await cb.answer()
@@ -1668,7 +2062,7 @@ async def plan_upgrade_cb(cb: CallbackQuery):
         price=price, days=0, display_prefix=EMOJI_UPGRADE,
     )
 
-# ─────────────────────────────────────────────
+# ──────────────  ──────────────────────────────
 #  ДОКУПИТЬ ТРАФИК НА БЕЛЫХ СПИСКАХ
 # ─────────────────────────────   ───────────────
 @router.callback_query(F.data == "wl_topup")
@@ -2458,7 +2852,7 @@ async def ca_cancel(message: types.Message, state: FSMContext):
 
 # ───────────  ─────────────────────────────────
 #  СПИСО   УСТРОЙСТВ (HWID inspector)
-# ─────────────────────────────────────────────
+# ────────────────────   ────────────────────────
 @router.callback_query(F.data.startswith("ca_devices_"))
 async def ca_devices_show(cb: CallbackQuery):
     await cb.answer()
@@ -3068,7 +3462,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
         [InlineKeyboardButton(text="VPN", callback_data="giveplan_vpn")],
-        [InlineKeyboardButton(text="VPN с обходом глушилок", callback_data="giveplan_vpn_bypass")],
+        [InlineKeyboardButton(text="VPN с обходом   лушилок", callback_data="giveplan_vpn_bypass")],
         [InlineKeyboardButton(text="Пробный доступ (глушилки, 3 ГБ)", callback_data="giveplan_trial")],
     ])
     await message.answer(
@@ -3760,6 +4154,7 @@ async def expiry_reminder_scheduler():
 async def main():
     await init_db()
     await load_extra_admins()
+    await nalog_init()
     dp.include_router(router)
     asyncio.create_task(daily_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
