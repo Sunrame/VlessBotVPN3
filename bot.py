@@ -1261,6 +1261,11 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     # без этого кнопки "Добавить устройства"/"Улучшить тариф" продолжали бы
     # показываться, хотя подписки уже нет.
     if not subscription_active or plan not in PLANS:
+        # Если платный тариф уже был выбран, его можно продлить даже после
+        # окончания срока — оплата снова активирует ту же подписку.
+        if plan in PLANS:
+            rows.append([btn("Продлить подписку", emoji_id=BTN_ICON_PAY,
+                             style="success", callback_data="renew_open")])
         if not trial_used:
             rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
                              callback_data="trial_buy")])
@@ -1269,6 +1274,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                          callback_data="buy_open")])
     else:
+        rows.append([btn("Продлить подписку", emoji_id=BTN_ICON_PAY,
+                         style="success", callback_data="renew_open")])
         rows.append([btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
                          callback_data="dev_add")])
         if plan == "vpn":
@@ -1630,6 +1637,30 @@ async def buy_open_cb(cb: CallbackQuery):
     await cb.answer()
     text, kb = _buy_open_content()
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "renew_open")
+async def renew_open_cb(cb: CallbackQuery):
+    """Открывает выбор срока продления прямо из главного экрана /start."""
+    await cb.answer()
+    async with pool.acquire() as conn:
+        plan_key = await conn.fetchval(
+            "SELECT plan FROM users WHERE user_id=$1", cb.from_user.id
+        )
+    if plan_key not in PLANS:
+        await cb.answer(
+            "Текущий тариф не найден. Сначала выберите тариф.",
+            show_alert=True,
+        )
+        return
+    plan = PLANS[plan_key]
+    await cb.message.edit_text(
+        f"{hbold('Продлить подписку')}\n\n"
+        f"Тариф: {plan['name']}\n"
+        f"Выберите срок продления:",
+        parse_mode="HTML",
+        reply_markup=_renew_kb(plan_key, include_back=True),
+    )
 
 @router.callback_query(F.data.startswith("buyplan_"))
 async def buyplan_cb(cb: CallbackQuery):
@@ -3925,7 +3956,7 @@ _EXPIRY_WINDOWS = [("3d", 3 * 86400), ("1d", 86400), ("1h", 3600)]
 _EXPIRY_LABELS  = {"3d": "около 3 дней", "1d": "около 1 дня", "1h": "около 1 часа"}
 
 
-def _renew_kb(plan_key: str) -> InlineKeyboardMarkup:
+def _renew_kb(plan_key: str, include_back: bool = False) -> InlineKeyboardMarkup:
     """Клавиатура продления для напоминания. Тап по кнопке уже создаёт саму
     ссылку на оплату (экран «Оплатить» / «Проверить оплату»)."""
     rows = []
@@ -3941,6 +3972,8 @@ def _renew_kb(plan_key: str) -> InlineKeyboardMarkup:
             text="Добавить обход белых списков",
             callback_data="plan_upgrade",
         )])
+    if include_back:
+        rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
