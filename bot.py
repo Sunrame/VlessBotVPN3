@@ -1923,8 +1923,9 @@ async def _promo_claim_error(target, error: str):
     if error == "already":
         text = "Вы уже активировали этот промокод ранее."
     elif error.startswith("age:"):
-        _, required, left = error.split(":")
-        text = f"Промокод доступен после {required} дн. с регистрации в боте. Попробуйте примерно через {left} дн."
+        # Не раскрываем антиабуз-ограничение и не создаём впечатление, что
+        # кнопка не сработала: пользователь получает простую ошибку.
+        text = "Ошибка активации промокода."
     elif error.startswith("tariff:"):
         _, current, target_plan = error.split(":")
         current_name = PLANS.get(current, {}).get("name", current)
@@ -2061,7 +2062,6 @@ async def handle_promo(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("pfree_"))
 async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
     # plan_key может содержать «_» (например vpn_bypass), поэтому разбираем по
     # известным ключам тарифов, а не простым split (иначе выбор тарифа
     # «VPN с обходом» через промокод ломался).
@@ -2080,8 +2080,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
         if claim_error == "already":
             error_text = "Вы уже активировали этот промокод ранее."
         elif claim_error.startswith("age:"):
-            _, required, left = claim_error.split(":")
-            error_text = f"Промокод доступен после {required} дн. с регистрации. Попробуйте через {left} дн."
+            error_text = "Ошибка активации промокода."
         elif claim_error.startswith("tariff:"):
             _, current, target = claim_error.split(":")
             error_text = (
@@ -2110,6 +2109,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
             cb.from_user.id, plan_key, days, promo_code, int(time.time()),
         )
     await _finish_promo_claim(promo_code)
+    await cb.answer("Промокод активирован.")
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(f"Промокод {promo_code} активирован — {plan['name']}, {days} дн.\n\n{text}",
                                parse_mode="HTML", reply_markup=kb)
