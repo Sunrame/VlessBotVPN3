@@ -18,6 +18,7 @@ from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo
 
 from yookassa import Configuration, Payment
+from payment_titles import for_yookassa
 
 # ─────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ
@@ -1380,7 +1381,9 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
             "amount":       {"value": f"{price}.00", "currency": "RUB"},
             "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
             "capture":      True,
-            "description":  f"TrubaVPN — {item_name}",
+            # item_name остаётся прежним для Telegram и metadata. Только
+            # отображаемое название платежа в YooKassa заменяется на LTE.
+            "description":  for_yookassa(f"TrubaVPN — {item_name}"),
             "metadata": {
                 "user_id":      str(user_id),
                 "kind":         kind,
