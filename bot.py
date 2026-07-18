@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent
 
 from yookassa import Configuration, Payment
 
@@ -301,6 +301,38 @@ bot    = Bot(token=API_TOKEN)
 dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
 pool: asyncpg.Pool = None
+
+
+async def safe_answer(cb: CallbackQuery, *args, **kwargs) -> None:
+    """
+    cb.answer() — это просто технический "ACK" нажатия кнопки, но он стоял
+    первой строкой почти в каждом хендлере без защиты. Из-за этого разовый
+    сетевой сбой при обращении к Telegram (таймаут соединения, "query is too
+    old" и т.п. — см. TelegramNetworkError в логах) валил исключением ВЕСЬ
+    хендлер ещё ДО того, как выполнялась настоящая логика (открытие панели,
+    проверка оплаты, активация подписки...). Человек просто не получал
+    вообще никакого ответа на нажатие кнопки. Эта обёртка гасит такие сбои
+    здесь, чтобы обработчик спокойно продолжил выполняться дальше.
+    """
+    try:
+        await cb.answer(*args, **kwargs)
+    except Exception as e:
+        log.warning("cb.answer() не выполнился (%s): %s", type(e).__name__, e)
+
+
+@dp.error()
+async def global_error_handler(event: ErrorEvent) -> None:
+    """
+    Общая подстраховка на случай, если сетевой сбой всё же долетит до
+    какого-нибудь вызова Telegram API, не прикрытого своим try/except (сам
+    aiogram и без этого не роняет процесс на одном сбойном апдейте — он
+    просто помечает его необработанным и идёт дальше, но лог получается
+    60-строчным трейсбеком). Здесь — компактная запись в одну строку.
+    """
+    log.warning(
+        "Необработанная ошибка при обработке апдейта %s: %r",
+        getattr(event.update, "update_id", "?"), event.exception,
+    )
 
 # ─────────────────────────────────────────────
 #  DATABASE
@@ -1133,9 +1165,9 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not await is_subscribed(cb.from_user.id):
-        await cb.answer("Вы ещё не подписаны.", show_alert=True)
+        await safe_answer(cb, "Вы ещё не подписаны.", show_alert=True)
         return
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1340,7 +1372,7 @@ def _gen_login_code() -> str:
 # остаётся только заглушка на случай, когда URL мини-приложения не задан.
 @router.callback_query(F.data == "cabinet_unavailable")
 async def cabinet_unavailable_cb(cb: CallbackQuery):
-    await cb.answer("Личный кабинет временно недоступен.", show_alert=True)
+    await safe_answer(cb, "Личный кабинет временно недоступен.", show_alert=True)
 
 async def _show_home(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
@@ -1355,19 +1387,19 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "cancel_to_profile")
 async def cancel_to_profile_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     await state.clear()
     await _show_home(cb)
 
 @router.callback_query(F.data == "back")
 async def back_to_home(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     await state.clear()
     await _show_home(cb)
 
 @router.callback_query(F.data == "profile")
 async def profile_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     await _show_home(cb)
 
 # ─────────   ───────────────────────────────────
@@ -1431,7 +1463,7 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
     )
     if not payment:
-        await cb.answer("Ошибка создания платежа.", show_alert=True)
+        await safe_answer(cb, "Ошибка создания платежа.", show_alert=True)
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     desc_block = f"\n{extra_desc}\n" if extra_desc else ""
@@ -1462,16 +1494,16 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
 
 @router.callback_query(F.data.startswith("paycheck_"))
 async def check_payment_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     pay_id = cb.data.removeprefix("paycheck_")
     try:
         payment = Payment.find_one(pay_id)
     except Exception as e:
         log.exception("Payment find error: %s", e)
-        await cb.answer("Ошибка проверки платежа.", show_alert=True)
+        await safe_answer(cb, "Ошибка проверки платежа.", show_alert=True)
         return
     if payment.status != "succeeded":
-        await cb.answer("Платёж ещё не подтверждён. Попробуйте через минуту.", show_alert=True)
+        await safe_answer(cb, "Платёж ещё не подтверждён. Попробуйте через минуту.", show_alert=True)
         return
 
     md          = payment.metadata
@@ -1517,7 +1549,7 @@ async def check_payment_cb(cb: CallbackQuery):
         if kind in ("trial", "plan"):
             result_user = await activate_subscription(u_id, days, hwid or 1, squad_uuid=squad, whitelist_gb=whitelist_gb)
             if not result_user:
-                await cb.answer("Ошибка активации. Обратитесь в по  держку.", show_alert=True)
+                await safe_answer(cb, "Ошибка активации. Обратитесь в по  держку.", show_alert=True)
                 return
             async with pool.acquire() as conn:
                 if kind == "trial":
@@ -1533,13 +1565,13 @@ async def check_payment_cb(cb: CallbackQuery):
         elif kind == "device":
             remna = await remna_get_user(u_id)
             if not remna:
-                await cb.answer("Пользователь не найден в панели.", show_alert=True)
+                await safe_answer(cb, "Пользователь не найден в панели.", show_alert=True)
                 return
             add_count = qty if qty > 0 else 1
             new_hwid = remna.get("hwidDeviceLimit", 1) + add_count
             result_user = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
             if not result_user:
-                await cb.answer("Ошибка обновления устройств.", show_alert=True)
+                await safe_answer(cb, "Ошибка обновления устройств.", show_alert=True)
                 return
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -1549,11 +1581,11 @@ async def check_payment_cb(cb: CallbackQuery):
         elif kind == "upgrade":
             remna = await remna_get_user(u_id)
             if not remna:
-                await cb.answer("Пользователь не найден в панели.", show_alert=True)
+                await safe_answer(cb, "Пользователь не найден в панели.", show_alert=True)
                 return
             result_user = await remna_update_user(remna["uuid"], {"activeInternalSquads": [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]})
             if not result_user:
-                await cb.answer("Ошибка обновления тарифа.", show_alert=True)
+                await safe_answer(cb, "Ошибка обновления тарифа.", show_alert=True)
                 return
             async with pool.acquire() as conn:
                 await conn.execute("UPDATE users SET plan='vpn_bypass' WHERE user_id=$1", u_id)
@@ -1609,11 +1641,11 @@ async def check_payment_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "trial_buy")
 async def trial_buy_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     async with pool.acquire() as conn:
         used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", cb.from_user.id)
     if used:
-        await cb.answer("Пробная подписка уже использована.", show_alert=True)
+        await safe_answer(cb, "Пробная подписка уже использована.", show_alert=True)
         return
     await _create_payment_page(
         cb, kind="trial", item_name=TRIAL["name"], price=TRIAL["price"], days=TRIAL["days"],
@@ -1645,7 +1677,7 @@ def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
 
 @router.callback_query(F.data == "buy_open")
 async def buy_open_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     text, kb = _buy_open_content()
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
@@ -1653,13 +1685,13 @@ async def buy_open_cb(cb: CallbackQuery):
 @router.callback_query(F.data == "renew_open")
 async def renew_open_cb(cb: CallbackQuery):
     """Открывает выбор срока продления прямо из главного экрана /start."""
-    await cb.answer()
+    await safe_answer(cb)
     async with pool.acquire() as conn:
         plan_key = await conn.fetchval(
             "SELECT plan FROM users WHERE user_id=$1", cb.from_user.id
         )
     if plan_key not in PLANS:
-        await cb.answer(
+        await safe_answer(cb, 
             "Текущий тариф не найден. Сначала выберите тариф.",
             show_alert=True,
         )
@@ -1675,10 +1707,10 @@ async def renew_open_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("buyplan_"))
 async def buyplan_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     plan_key = cb.data.removeprefix("buyplan_")
     if plan_key not in PLANS:
-        await cb.answer("Тариф не найден.", show_alert=True)
+        await safe_answer(cb, "Тариф не найден.", show_alert=True)
         return
     plan = PLANS[plan_key]
     plan_emoji = EMOJI_PLAN_BYPASS if plan_key == "vpn_bypass" else EMOJI_PLAN_VPN
@@ -1698,12 +1730,12 @@ async def buyplan_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("buymonths_"))
 async def buymonths_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     rest = cb.data.removeprefix("buymonths_")
     plan_key, months_str = rest.rsplit("_", 1)
     months = int(months_str)
     if plan_key not in PLANS:
-        await cb.answer("Тариф не найден.", show_alert=True)
+        await safe_answer(cb, "Тариф не найден.", show_alert=True)
         return
     plan  = PLANS[plan_key]
     price = calc_plan_price(plan_key, months)
@@ -1718,11 +1750,11 @@ async def buymonths_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "dev_add")
 async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     async with pool.acquire() as conn:
         plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
     if plan not in PLANS:
-        await cb.answer("Сначала оформите подписку.", show_alert=True)
+        await safe_answer(cb, "Сначала оформите подписку.", show_alert=True)
         return
     device_price = PLANS[plan]["device_price"]
     await state.set_state(DeviceTopupState.waiting_count)
@@ -1767,16 +1799,16 @@ async def dev_add_count_handler(message: types.Message, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "plan_upgrade")
 async def plan_upgrade_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     u_id = cb.from_user.id
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT plan, extra_devices FROM users WHERE user_id=$1", u_id)
     if not row or row["plan"] != "vpn":
-        await cb.answer("Апгрейд доступен только с тарифа VPN.", show_alert=True)
+        await safe_answer(cb, "Апгрейд доступен только с тарифа VPN.", show_alert=True)
         return
     remna = await remna_get_user(u_id)
     if not remna:
-        await cb.answer("Подписка не найдена.", show_alert=True)
+        await safe_answer(cb, "Подписка не найдена.", show_alert=True)
         return
     price = calc_upgrade_price(row["extra_devices"] or 0)
     await _create_payment_page(
@@ -1786,14 +1818,14 @@ async def plan_upgrade_cb(cb: CallbackQuery):
 
 # ─────────────────────────────────────────────
 #  ДОКУПИТЬ ТРАФИК НА БЕЛЫХ СПИСКАХ
-# ─────────────────────────────   ───────────────
+# ─────────────────────────────────   ───────────
 @router.callback_query(F.data == "wl_topup")
 async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     async with pool.acquire() as conn:
         plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
     if plan != "vpn_bypass":
-        await cb.answer("Докупка доступна только на тарифе VPN с обходом.", show_alert=True)
+        await safe_answer(cb, "Докупка доступна только на тарифе VPN с обходом.", show_alert=True)
         return
     await state.set_state(WhitelistTopupState.waiting_gb)
     await cb.message.edit_text(
@@ -1829,7 +1861,7 @@ async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "earn_open")
 async def earn_open_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     u_id = cb.from_user.id
     me   = await bot.get_me()
     link = f"https://t.me/{me.username}?start={u_id}"
@@ -1956,7 +1988,7 @@ def _free_plan_kb(code: str):
 
 @router.callback_query(F.data == "promo_enter")
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     await state.set_state(PromoState.waiting_code)
     await cb.message.edit_text(
         "Введите промокод:",
@@ -1967,7 +1999,7 @@ async def promo_enter(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "promo_cancel")
 async def promo_cancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     await state.clear()
     await _show_home(cb)
 
@@ -2084,7 +2116,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     days = data.get("promo_days", 30)
     await state.clear()
     if plan_key not in PLANS:
-        await cb.answer("Тариф не найден.", show_alert=True)
+        await safe_answer(cb, "Тариф не найден.", show_alert=True)
         return
     claimed, claim_error = await _claim_promo_once(cb.from_user.id, promo_code, selected_plan=plan_key)
     if claim_error:
@@ -2100,7 +2132,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
             )
         else:
             error_text = "Промокод уже закончился."
-        await cb.answer(error_text, show_alert=True)
+        await safe_answer(cb, error_text, show_alert=True)
         return
     days = int(claimed["days"] or 0)
     plan = PLANS[plan_key]
@@ -2108,7 +2140,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
                                             squad_uuid=plan["squad"], whitelist_gb=plan["whitelist_gb"])
     if not activated:
         await _release_promo_claim(cb.from_user.id, promo_code)
-        await cb.answer("Не удалось применить промокод. Попробуйте позже.", show_alert=True)
+        await safe_answer(cb, "Не удалось применить промокод. Попробуйте позже.", show_alert=True)
         return
     async with pool.acquire() as conn:
         await conn.execute("UPDATE users SET plan=$1, extra_devices=0 WHERE user_id=$2",
@@ -2120,7 +2152,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
             cb.from_user.id, plan_key, days, promo_code, int(time.time()),
         )
     await _finish_promo_claim(promo_code)
-    await cb.answer("Промокод активирован.")
+    await safe_answer(cb, "Промокод активирован.")
     text, kb = await _build_profile_view(cb.from_user.id)
     await cb.message.edit_text(f"Промокод {promo_code} активирован — {plan['name']}, {days} дн.\n\n{text}",
                                parse_mode="HTML", reply_markup=kb)
@@ -2130,7 +2162,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "info_tab")
 async def info_tab(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     await cb.message.edit_text(
         f"{EMOJI_INFO} О сервисе",
         parse_mode="HTML",
@@ -2169,7 +2201,7 @@ def admin_panel_kb(is_main: bool = False):
 
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await cb.message.edit_text(
@@ -2213,17 +2245,17 @@ async def _render_admins_list(target_send):
 
 @router.callback_query(F.data == "admin_admins")
 async def admin_admins_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_main_admin(cb.from_user.id):
-        await cb.answer("Доступно только главным админам.", show_alert=True)
+        await safe_answer(cb, "Доступно только главным админам.", show_alert=True)
         return
     await _render_admins_list(cb)
 
 @router.callback_query(F.data == "admin_add_start")
 async def admin_add_start_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_main_admin(cb.from_user.id):
-        await cb.answer("Дост  пно только главным админам.", show_alert=True)
+        await safe_answer(cb, "Дост  пно только главным админам.", show_alert=True)
         return
     await state.set_state(AdminManageState.waiting_username)
     await cb.message.answer(
@@ -2267,15 +2299,15 @@ async def admin_add_username_handler(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("admin_del_"))
 async def admin_del_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_main_admin(cb.from_user.id):
-        await cb.answer("Доступно только   лавным админам.", show_alert=True)
+        await safe_answer(cb, "Доступно только   лавным админам.", show_alert=True)
         return
     target_id = int(cb.data.removeprefix("admin_del_"))
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM extra_admins WHERE user_id=$1", target_id)
     EXTRA_ADMIN_IDS.discard(target_id)
-    await cb.answer("Админ удалён.", show_alert=True)
+    await safe_answer(cb, "Админ удалён.", show_alert=True)
     try:
         await bot.send_message(target_id, "С вас сняты права администратора бота.")
     except Exception:
@@ -2359,30 +2391,30 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
 
 @router.callback_query(F.data == "admin_subs")
 async def admin_subs_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await _render_subs_page(cb, 0)
 
 @router.callback_query(F.data.startswith("subs_page_"))
 async def subs_page_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await _render_subs_page(cb, int(cb.data.removeprefix("subs_page_")))
 
 @router.callback_query(F.data == "subs_noop")
 async def subs_noop(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
 
 @router.callback_query(F.data.startswith("sub_view_"))
 async def sub_view_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     uid_str = cb.data.removeprefix("sub_view_")
     if not uid_str.isdigit():
-        await cb.answer("Некорректный ID.", show_alert=True)
+        await safe_answer(cb, "Некорректный ID.", show_alert=True)
         return
     await _render_check(cb, int(uid_str))
 
@@ -2517,20 +2549,20 @@ async def admin_check_cmd(message: types.Message, command: CommandObject):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("setlim_"))
 async def set_hwid_limit(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     parts = cb.data.split("_")
     user_id = int(parts[1]); new_hwid = int(parts[2])
     remna = await remna_get_user(user_id)
     if not remna:
-        await cb.answer("Пользователь не найден в Remnawave.", show_alert=True)
+        await safe_answer(cb, "Пользователь не найден в Remnawave.", show_alert=True)
         return
     result = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
     if not result:
-        await cb.answer("Ошибка обновления.", show_alert=True)
+        await safe_answer(cb, "Ошибка обновления.", show_alert=True)
         return
-    await cb.answer(f"Лимит: {new_hwid}", show_alert=True)
+    await safe_answer(cb, f"Лимит: {new_hwid}", show_alert=True)
     remna2 = await remna_get_user(user_id)
     hwid2  = remna2.get("hwidDeviceLimit", new_hwid) if remna2 else new_hwid
     has_wl = SQUAD_UUID_WHITELIST in _squad_uuids(remna2.get("activeInternalSquads")) if remna2 else False
@@ -2544,7 +2576,7 @@ async def set_hwid_limit(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_adddays_"))
 async def ca_adddays_start(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     user_id = int(cb.data.removeprefix("ca_adddays_"))
@@ -2584,7 +2616,7 @@ async def ca_adddays_handler(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("ca_subdays_"))
 async def ca_subdays_start(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     user_id = int(cb.data.removeprefix("ca_subdays_"))
@@ -2626,7 +2658,7 @@ async def ca_subdays_handler(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("ca_setdate_"))
 async def ca_setdate_start(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     user_id = int(cb.data.removeprefix("ca_setdate_"))
@@ -2669,7 +2701,7 @@ async def ca_setdate_handler(message: types.Message, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_sethwid_"))
 async def ca_sethwid_start(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     user_id = int(cb.data.removeprefix("ca_sethwid_"))
@@ -2716,7 +2748,7 @@ async def ca_cancel(message: types.Message, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_devices_"))
 async def ca_devices_show(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     user_id = int(cb.data.removeprefix("ca_devices_"))
@@ -2744,7 +2776,7 @@ async def ca_devices_show(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_whitelist_"))
 async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     user_id = int(cb.data.removeprefix("ca_whitelist_"))
@@ -2821,7 +2853,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
 # ──────────────   ───   ──────────────────────────
 @router.callback_query(F.data.startswith("quicktake_"))
 async def quick_take(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     user_id = int(cb.data.removeprefix("quicktake_"))
@@ -2958,7 +2990,7 @@ async def admin_list_promos(message: types.Message):
 
 @router.callback_query(F.data == "admin_promos")
 async def admin_promos_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     async with pool.acquire() as conn:
@@ -3002,7 +3034,7 @@ async def _create_promo(code: str, days: int, uses: int, promo_type: str,
 
 @router.callback_query(F.data == "promogen_start")
 async def promogen_start_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await cb.message.edit_text(
@@ -3016,7 +3048,7 @@ async def promogen_start_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data == "promogen_type_days")
 async def promogen_type_days_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await state.update_data(promo_type="days", tariff_key=None)
@@ -3027,7 +3059,7 @@ async def promogen_type_days_cb(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "promogen_type_free")
 async def promogen_type_free_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await cb.message.edit_text(
@@ -3042,7 +3074,7 @@ async def promogen_type_free_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("promogen_freeplan_"))
 async def promogen_freeplan_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     choice = cb.data.removeprefix("promogen_freeplan_")
@@ -3099,7 +3131,7 @@ async def promogen_days_handler(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("promogen_uses_"))
 async def promogen_uses_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     choice = cb.data.removeprefix("promogen_uses_")
@@ -3137,7 +3169,7 @@ async def _ask_promo_code(target_message, state: FSMContext, min_age_days: int):
 
 @router.callback_query(F.data.startswith("promogen_age_"))
 async def promogen_age_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     choice = cb.data.removeprefix("promogen_age_")
@@ -3229,7 +3261,7 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
     text_body = data.get("broadcast_text", "")
     await state.clear()
     if not text_body:
-        await cb.answer("Текст не найден.", show_alert=True)
+        await safe_answer(cb, "Текст не найден.", show_alert=True)
         return
     await cb.message.edit_text("Рассылка запущена...")
     async with pool.acquire() as conn:
@@ -3249,21 +3281,21 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
 
 @router.callback_query(F.data == "bc_confirm")
 async def broadcast_confirm(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await _do_broadcast(cb, state, subs_only=False)
 
 @router.callback_query(F.data == "bc_confirm_subs")
 async def broadcast_confirm_subs(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await _do_broadcast(cb, state, subs_only=True)
 
 @router.callback_query(F.data == "bc_cancel")
 async def broadcast_cancel_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     await state.clear()
     await cb.message.edit_text("Рассылка отменена.")
 
@@ -3272,7 +3304,7 @@ async def broadcast_cancel_cb(cb: CallbackQuery, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_referrals")
 async def admin_referrals_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     async with pool.acquire() as conn:
@@ -3342,7 +3374,7 @@ async def admin_payout(message: types.Message, command: CommandObject):
 # ────────────────────────  ────────────────────
 @router.callback_query(F.data == "admin_report")
 async def admin_report_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await cb.message.edit_text("Формирую отчёт...")
@@ -3356,7 +3388,7 @@ async def admin_report_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_give_start")
 async def admin_give_start_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await state.set_state(AdminGiveState.waiting_username)
@@ -3416,7 +3448,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("giveplan_"))
 async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     choice = cb.data.removeprefix("giveplan_")
@@ -3479,7 +3511,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_find_start")
 async def admin_find_start_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await state.set_state(AdminFindState.waiting_query)
@@ -3509,7 +3541,7 @@ async def admin_find_handler(message: types.Message, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_online")
 async def admin_online_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await cb.message.edit_text("Запрашиваю...")
@@ -3546,7 +3578,7 @@ async def admin_online_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_broadcast_start")
 async def admin_broadcast_start_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await state.set_state(BroadcastState.waiting_text)
@@ -3557,7 +3589,7 @@ async def admin_broadcast_start_cb(cb: CallbackQuery, state: FSMContext):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_settings")
 async def admin_settings_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     sale_notify = await is_admin_sale_notify(cb.from_user.id)
@@ -3572,7 +3604,7 @@ async def admin_settings_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_sale_notify")
 async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     admin_id = cb.from_user.id
@@ -3603,7 +3635,7 @@ def _rating_kb() -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "admin_survey")
 async def admin_survey_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await cb.message.edit_text("Опрос", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -3614,7 +3646,7 @@ async def admin_survey_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data == "admin_survey_send")
 async def admin_survey_send_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     await cb.message.edit_text("Рассылаю опрос платникам...")
@@ -3639,11 +3671,11 @@ async def admin_survey_send_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("survey_rate_"))
 async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT has_paid FROM users WHERE user_id=$1", cb.from_user.id)
     if not row or not row["has_paid"]:
-        await cb.answer("Опрос доступен только для платных подписчиков.", show_alert=True)
+        await safe_answer(cb, "Опрос доступен только для платных подписчиков.", show_alert=True)
         return
     rating = int(cb.data.removeprefix("survey_rate_"))
     await state.set_state(SurveyState.waiting_comment)
@@ -3658,7 +3690,7 @@ async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "survey_skip_comment")
 async def survey_skip_comment_cb(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await safe_answer(cb)
     data = await state.get_data()
     rating = data.get("survey_rating", 0)
     await state.clear()
@@ -3691,7 +3723,7 @@ async def _save_survey(user, rating: int, comment: str | None):
 
 @router.callback_query(F.data == "admin_survey_results")
 async def admin_survey_results_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     async with pool.acquire() as conn:
@@ -3731,7 +3763,7 @@ async def admin_survey_results_cb(cb: CallbackQuery):
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "admin_stats")
 async def admin_stats_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
     now = int(time.time())
@@ -3990,14 +4022,14 @@ def _renew_kb(plan_key: str, include_back: bool = False) -> InlineKeyboardMarkup
 
 @router.callback_query(F.data.startswith("rnw_"))
 async def renew_cb(cb: CallbackQuery):
-    await cb.answer()
+    await safe_answer(cb)
     plan_key, _, months_s = cb.data.removeprefix("rnw_").rpartition("_")
     if not plan_key or not months_s.isdigit():
-        await cb.answer("Не удалось определить тариф.", show_alert=True)
+        await safe_answer(cb, "Не удалось определить тариф.", show_alert=True)
         return
     months = int(months_s)
     if plan_key not in PLANS or months <= 0:
-        await cb.answer("Тариф недоступен.", show_alert=True)
+        await safe_answer(cb, "Тариф недоступен.", show_alert=True)
         return
     plan  = PLANS[plan_key]
     price = calc_plan_price(plan_key, months)
