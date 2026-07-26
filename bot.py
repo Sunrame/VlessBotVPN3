@@ -214,7 +214,7 @@ PLANS = {
     "vpn_bypass": {
         "key":          "vpn_bypass",
         "name":         "VPN с обходом белых списков",
-        "price_month":  149,
+        "price_month":  199,
         "device_price": 70,
         "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
         "whitelist_gb": 20,
