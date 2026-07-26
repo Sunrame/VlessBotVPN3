@@ -19,6 +19,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQu
 
 from yookassa import Configuration, Payment
 
+import pricing
+
 
 def _yookassa_description(description: str) -> str:
     """Название только для ЮKassa; Telegram-тексты не меняет."""
@@ -227,6 +229,10 @@ PLANS = {
 
 MONTH_CHOICES = [1, 3, 6, 12]
 
+# Цены за месяц (price_month выше) и скидки за срок редактируются админами —
+# в этом боте («Тарифы» в админ-панели) и на админ-сайте. Актуальные значения
+# лежат в общей таблице pricing_settings, значения выше — только запасные.
+
 # Докупка трафика на белых списках: цена за 1 ГБ. Пользователь сам вводит
 # сколько ГБ хочет купить, итоговая цена = кол-во * цена за ГБ.
 WHITELIST_PRICE_PER_GB = int(os.environ.get("WHITELIST_PRICE_PER_GB", "3"))
@@ -251,6 +257,9 @@ class BroadcastState(StatesGroup):
 
 class AdminPromoState(StatesGroup):
     waiting_input = State()
+
+class AdminPricingState(StatesGroup):
+    waiting_value = State()
 
 class PromoGenState(StatesGroup):
     waiting_days       = State()
@@ -388,6 +397,9 @@ async def init_db():
                 sale_notify BOOLEAN DEFAULT TRUE
             )
         """)
+        # Цены тарифов и скидки за срок. Таблица общая с админ-сайтом:
+        # правка цен в любой из панелей действует и в боте, и в кабинете.
+        await conn.execute(pricing.CREATE_TABLE_SQL)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS whitelist_limits (
                 user_id      BIGINT PRIMARY KEY,
@@ -918,11 +930,71 @@ async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str |
     except Exception:
         pass
 
-def calc_plan_price(plan_key: str, months: int) -> int:
-    """Линейная цена без скидок за срок: price_month * months."""
-    return PLANS[plan_key]["price_month"] * months
+# ─────────────────────────────────────────────
+#  ЦЕНЫ И СКИДКИ ЗА СРОК
+#
+#  Цены за месяц и проценты скидок за 3/6/12 месяцев админ задаёт в панели
+#  («Тарифы») или на админ-сайте — они лежат в общей таблице pricing_settings.
+#  Здесь короткий кэш, чтобы не ходить в базу на каждую кнопку; правка цен
+#  сбрасывает его сразу, чужие правки подхватываются за CACHE_TTL секунд.
+# ─────────────────────────────────────────────
+_pricing_cache: dict = {"ts": 0.0, "data": None}
 
-def calc_upgrade_price(extra_devices: int) -> int:
+async def get_pricing(force: bool = False) -> dict:
+    now = time.monotonic()
+    cached = _pricing_cache["data"]
+    if cached and not force and now - _pricing_cache["ts"] < pricing.CACHE_TTL:
+        return cached
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, value FROM pricing_settings")
+    except Exception as e:
+        log.warning("Не удалось прочитать цены из БД: %r", e)
+        if cached:
+            return cached
+        rows = []
+    data = pricing.build(rows, {k: p["price_month"] for k, p in PLANS.items()})
+    _pricing_cache["data"] = data
+    _pricing_cache["ts"] = now
+    return data
+
+async def get_price_month(plan_key: str) -> int:
+    """Актуальная цена тарифа за один месяц."""
+    settings = await get_pricing()
+    return pricing.price_month(settings, plan_key, PLANS.get(plan_key, {}).get("price_month"))
+
+async def get_discount(months: int) -> int:
+    """Процент скидки за срок (0 — скидки нет)."""
+    return pricing.discount_for(await get_pricing(), months)
+
+async def _discount_hint() -> str:
+    """Строка «Скидки за срок: ...» для экранов покупки (пустая, если скидок нет)."""
+    settings = await get_pricing()
+    parts = [f"{m} мес. −{pricing.discount_for(settings, m)}%"
+             for m in pricing.DISCOUNT_MONTHS if pricing.discount_for(settings, m) > 0]
+    return f"Скидки за срок: {', '.join(parts)}.\n\n" if parts else ""
+
+async def save_pricing(values: dict, admin_id: int | None = None) -> None:
+    """Сохранить цены/скидки ({ключ: значение}) и обновить кэш."""
+    now = int(time.time())
+    async with pool.acquire() as conn:
+        for key, value in values.items():
+            await conn.execute(
+                "INSERT INTO pricing_settings (key, value, updated_at, updated_by) "
+                "VALUES ($1,$2,$3,$4) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, "
+                "updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by",
+                key, int(value), now, admin_id,
+            )
+    await get_pricing(force=True)
+
+async def calc_plan_price(plan_key: str, months: int) -> int:
+    """Цена тарифа за срок: price_month * months минус скидка за этот срок."""
+    settings = await get_pricing()
+    return pricing.plan_total(settings, plan_key, months,
+                              PLANS.get(plan_key, {}).get("price_month"))
+
+async def calc_upgrade_price(extra_devices: int) -> int:
     """
     Доплата за апгрейд VPN -> VPN с обходом белых списков.
 
@@ -935,9 +1007,10 @@ def calc_upgrade_price(extra_devices: int) -> int:
     """
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
-    plan_diff   = bypass["price_month"] - vpn["price_month"]
+    plan_diff   = await get_price_month("vpn_bypass") - await get_price_month("vpn")
     device_diff = max(0, bypass["device_price"] - vpn["device_price"]) * max(extra_devices, 0)
-    return plan_diff + device_diff
+    # Цены задаёт админ: если обход перестал быть дороже, доплаты нет.
+    return max(0, plan_diff + device_diff)
 
 # ─────────────────────────────────────────────
 #  КЛАВИАТУРЫ
@@ -999,7 +1072,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             plan_key = "_".join(parts[1:])
         if plan_key in PLANS and months and months > 0:
             plan  = PLANS[plan_key]
-            price = calc_plan_price(plan_key, months)
+            price = await calc_plan_price(plan_key, months)
             await _create_payment_page_from_message(
                 message, kind="plan", item_name=f"{plan['name']} · {months} мес.",
                 price=price, days=months * 30, hwid=1, squad=plan["squad"],
@@ -1007,7 +1080,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             )
             return True
         # Без конкретного тарифа/срока — показываем экран выбора тарифа.
-        text, kb = _buy_open_content()
+        text, kb = await _buy_open_content()
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
         return True
 
@@ -1020,11 +1093,11 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             await message.answer("Сначала оформите подписку.")
             return True
         if not months or months <= 0:
-            text, kb = _buy_open_content()
+            text, kb = await _buy_open_content()
             await message.answer(text, parse_mode="HTML", reply_markup=kb)
             return True
         plan  = PLANS[plan_key]
-        price = calc_plan_price(plan_key, months)
+        price = await calc_plan_price(plan_key, months)
         await _create_payment_page_from_message(
             message, kind="plan", item_name=f"Продление {plan['name']} · {months} мес.",
             price=price, days=months * 30, hwid=1, squad=plan["squad"],
@@ -1084,7 +1157,10 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         if not remna:
             await message.answer("Подписка не найдена.")
             return True
-        price = calc_upgrade_price(row["extra_devices"] or 0)
+        price = await calc_upgrade_price(row["extra_devices"] or 0)
+        if price <= 0:
+            await message.answer("Апгрейд сейчас недоступен. Напишите в поддержку.")
+            return True
         await _create_payment_page_from_message(
             message, kind="upgrade",
             item_name="Улучшение тарифа до VPN с обходом белых списков",
@@ -1656,15 +1732,18 @@ async def trial_buy_cb(cb: CallbackQuery):
 # ───────────   ─────────────────────────────────
 #  КУПИТЬ VPN — выбор тарифа, затем срока
 # ─────────────────────────────────────────────
-def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
-    """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесен  
+async def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесен
     отдельно, чтобы использовать как из нажатия кнопки, так и при перебросе
     из личного кабинета (диплинк)."""
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
+    vpn_price    = await get_price_month("vpn")
+    bypass_price = await get_price_month("vpn_bypass")
     text = (
-        f"{EMOJI_PLAN_VPN} {hbold(vpn['name'])}\n{vpn['desc']}\n{vpn['price_month']} руб./мес.\n\n"
-        f"{EMOJI_PLAN_BYPASS} {hbold(bypass['name'])}\n{bypass['desc']}\n{bypass['price_month']} руб./мес.\n\n"
+        f"{EMOJI_PLAN_VPN} {hbold(vpn['name'])}\n{vpn['desc']}\n{vpn_price} руб./мес.\n\n"
+        f"{EMOJI_PLAN_BYPASS} {hbold(bypass['name'])}\n{bypass['desc']}\n{bypass_price} руб./мес.\n\n"
+        f"{await _discount_hint()}"
         f"Дополнительные устройства и трафик для обхода белых списков "
         f"докупаются в главном меню после покупки тарифа."
     )
@@ -1678,7 +1757,7 @@ def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
 @router.callback_query(F.data == "buy_open")
 async def buy_open_cb(cb: CallbackQuery):
     await safe_answer(cb)
-    text, kb = _buy_open_content()
+    text, kb = await _buy_open_content()
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -1702,7 +1781,7 @@ async def renew_open_cb(cb: CallbackQuery):
         f"Тариф: {plan['name']}\n"
         f"Выберите срок продления:",
         parse_mode="HTML",
-        reply_markup=_renew_kb(plan_key, include_back=True),
+        reply_markup=await _renew_kb(plan_key, include_back=True),
     )
 
 @router.callback_query(F.data.startswith("buyplan_"))
@@ -1716,12 +1795,16 @@ async def buyplan_cb(cb: CallbackQuery):
     plan_emoji = EMOJI_PLAN_BYPASS if plan_key == "vpn_bypass" else EMOJI_PLAN_VPN
     rows = []
     for months in MONTH_CHOICES:
-        price = calc_plan_price(plan_key, months)
-        label = f"{months} мес. — {price} руб." if months > 1 else f"{months} мес. — {price} руб."
+        price = await calc_plan_price(plan_key, months)
+        percent = await get_discount(months)
+        label = f"{months} мес. — {price} руб."
+        if percent > 0:
+            label += f" (−{percent}%)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buymonths_{plan_key}_{months}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="buy_open")])
     await cb.message.edit_text(
-        f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n\n"
+        f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n"
+        f"{await get_price_month(plan_key)} руб./мес.\n\n"
         f"Дополнительные устройства и трафик для обхода белых списков "
         f"докупаются в главном меню после покупки.\n\n"
         f"{EMOJI_CHOOSE_TERM} Выберите срок:",
@@ -1738,7 +1821,7 @@ async def buymonths_cb(cb: CallbackQuery):
         await safe_answer(cb, "Тариф не найден.", show_alert=True)
         return
     plan  = PLANS[plan_key]
-    price = calc_plan_price(plan_key, months)
+    price = await calc_plan_price(plan_key, months)
     days  = months * 30
     await _create_payment_page(
         cb, kind="plan", item_name=f"{plan['name']} · {months} мес.", price=price, days=days,
@@ -1810,7 +1893,10 @@ async def plan_upgrade_cb(cb: CallbackQuery):
     if not remna:
         await safe_answer(cb, "Подписка не найдена.", show_alert=True)
         return
-    price = calc_upgrade_price(row["extra_devices"] or 0)
+    price = await calc_upgrade_price(row["extra_devices"] or 0)
+    if price <= 0:
+        await safe_answer(cb, "Апгрейд сейчас недоступен. Напишите в поддержку.", show_alert=True)
+        return
     await _create_payment_page(
         cb, kind="upgrade", item_name="Улучшение тарифа до VPN с обходом белых списков",
         price=price, days=0, display_prefix=EMOJI_UPGRADE,
@@ -2190,6 +2276,7 @@ def admin_panel_kb(is_main: bool = False):
          InlineKeyboardButton(text="Кто онлайн", callback_data="admin_online")],
         [InlineKeyboardButton(text="Промокоды", callback_data="admin_promos"),
          InlineKeyboardButton(text="Опрос", callback_data="admin_survey")],
+        [InlineKeyboardButton(text="Тарифы и скидки", callback_data="admin_pricing")],
         [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals"),
          InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast_start")],
         [InlineKeyboardButton(text="Настройки", callback_data="admin_settings")],
@@ -3626,6 +3713,127 @@ async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
     ]))
 
 # ─────────────────────────────────────────────
+#  ТАРИФЫ И СКИДКИ (редактирование цен из бота)
+# ─────────────────────────────────────────────
+async def _pricing_screen():
+    """Текст и клавиатура экрана управления ценами и скидками."""
+    settings = await get_pricing()
+    lines = [f"{hbold('Тарифы и скидки')}", "",
+             "Цена тарифа за 1 месяц:"]
+    rows = []
+    for key, plan in PLANS.items():
+        price = pricing.price_month(settings, key, plan.get("price_month"))
+        lines.append(f"  • {plan['name']}: {price} ₽/мес.")
+        rows.append([InlineKeyboardButton(
+            text=f"Изменить цену: {plan['name']}",
+            callback_data=f"admin_price_{key}",
+        )])
+    lines += ["", "Скидка за срок (в % от цены за весь срок):"]
+    for m in pricing.DISCOUNT_MONTHS:
+        pct = pricing.discount_for(settings, m)
+        example = pricing.plan_total(settings, "vpn", m, PLANS["vpn"].get("price_month"))
+        lines.append(f"  • {m} мес.: {pct}%  (например, VPN за {m} мес. = {example} ₽)")
+        rows.append([InlineKeyboardButton(
+            text=f"Изменить скидку: {m} мес.",
+            callback_data=f"admin_disc_{m}",
+        )])
+    lines += ["", "Цены общие с личным кабинетом на сайте — изменения "
+              "действуют сразу везде."]
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="admin_panel")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+@router.callback_query(F.data == "admin_pricing")
+async def admin_pricing_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    text, kb = await _pricing_screen()
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+@router.callback_query(F.data.startswith("admin_price_"))
+async def admin_price_start_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    plan_key = cb.data.removeprefix("admin_price_")
+    if plan_key not in PLANS:
+        await safe_answer(cb, "Тариф не найден.", show_alert=True)
+        return
+    current = await get_price_month(plan_key)
+    await state.set_state(AdminPricingState.waiting_value)
+    await state.update_data(kind="price", plan_key=plan_key)
+    await cb.message.answer(
+        f"Введите новую цену тарифа «{PLANS[plan_key]['name']}» за 1 месяц, в рублях.\n"
+        f"Сейчас: {current} ₽.\n\n"
+        f"Допустимо {pricing.MIN_PRICE}–{pricing.MAX_PRICE}.",
+        reply_markup=cancel_kb(),
+    )
+
+@router.callback_query(F.data.startswith("admin_disc_"))
+async def admin_disc_start_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    m_str = cb.data.removeprefix("admin_disc_")
+    if not m_str.isdigit() or int(m_str) not in pricing.DISCOUNT_MONTHS:
+        await safe_answer(cb, "Некорректный срок.", show_alert=True)
+        return
+    months = int(m_str)
+    current = await get_discount(months)
+    await state.set_state(AdminPricingState.waiting_value)
+    await state.update_data(kind="discount", months=months)
+    await cb.message.answer(
+        f"Введите скидку при покупке на {months} мес., в процентах.\n"
+        f"Сейчас: {current}%.\n\n"
+        f"Допустимо 0–{pricing.MAX_DISCOUNT}. 0 — без скидки.",
+        reply_markup=cancel_kb(),
+    )
+
+@router.message(AdminPricingState.waiting_value)
+async def admin_pricing_value_handler(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if not raw.lstrip("-").isdigit():
+        await message.answer("Введите целое число.")
+        return
+    value = int(raw)
+    data = await state.get_data()
+    kind = data.get("kind")
+    if kind == "price":
+        plan_key = data.get("plan_key")
+        if plan_key not in PLANS:
+            await state.clear()
+            await message.answer("Тариф не найден.")
+            return
+        if not (pricing.MIN_PRICE <= value <= pricing.MAX_PRICE):
+            await message.answer(f"Цена должна быть от {pricing.MIN_PRICE} до {pricing.MAX_PRICE} ₽.")
+            return
+        await save_pricing({pricing.price_key(plan_key): value}, message.from_user.id)
+        await state.clear()
+        await message.answer(f"Готово. Цена тарифа «{PLANS[plan_key]['name']}» — {value} ₽/мес.")
+    elif kind == "discount":
+        months = data.get("months")
+        if months not in pricing.DISCOUNT_MONTHS:
+            await state.clear()
+            await message.answer("Некорректный срок.")
+            return
+        if not (0 <= value <= pricing.MAX_DISCOUNT):
+            await message.answer(f"Скидка должна быть от 0 до {pricing.MAX_DISCOUNT}%.")
+            return
+        await save_pricing({pricing.discount_key(months): value}, message.from_user.id)
+        await state.clear()
+        await message.answer(f"Готово. Скидка за {months} мес. — {value}%.")
+    else:
+        await state.clear()
+        await message.answer("Не удалось определить, что менять. Откройте раздел «Тарифы» заново.")
+        return
+    text, kb = await _pricing_screen()
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+# ─────────────────────────────────────────────
 #  ОПРОС (рейтинг сервиса среди платников)
 # ─────────────────────────────────────────────
 def _rating_kb() -> InlineKeyboardMarkup:
@@ -3999,14 +4207,18 @@ _EXPIRY_WINDOWS = [("3d", 3 * 86400), ("1d", 86400), ("1h", 3600)]
 _EXPIRY_LABELS  = {"3d": "около 3 дней", "1d": "около 1 дня", "1h": "около 1 часа"}
 
 
-def _renew_kb(plan_key: str, include_back: bool = False) -> InlineKeyboardMarkup:
+async def _renew_kb(plan_key: str, include_back: bool = False) -> InlineKeyboardMarkup:
     """Клавиатура продления для напоминания. Тап по кнопке уже создаёт саму
     ссылку на оплату (экран «Оплатить» / «Проверить оплату»)."""
     rows = []
     for m in MONTH_CHOICES:
-        price = calc_plan_price(plan_key, m)
+        price = await calc_plan_price(plan_key, m)
+        percent = await get_discount(m)
+        label = f"Продлить · {m} мес — {price} ₽"
+        if percent > 0:
+            label += f" (−{percent}%)"
         rows.append([InlineKeyboardButton(
-            text=f"Продлить · {m} мес — {price} ₽",
+            text=label,
             callback_data=f"rnw_{plan_key}_{m}",
         )])
     if plan_key == "vpn":
@@ -4032,7 +4244,7 @@ async def renew_cb(cb: CallbackQuery):
         await safe_answer(cb, "Тариф недоступен.", show_alert=True)
         return
     plan  = PLANS[plan_key]
-    price = calc_plan_price(plan_key, months)
+    price = await calc_plan_price(plan_key, months)
     await _create_payment_page(
         cb, kind="plan",
         item_name=f"Продление {plan['name']} · {months} мес.",
@@ -4054,7 +4266,7 @@ async def _send_expiry_reminder(user_id: int, plan_key: str, expire_ts: int, kin
         f"Продлите подписку, чтобы не потерять доступ:"
     )
     await bot.send_message(user_id, text, parse_mode="HTML",
-                           reply_markup=_renew_kb(plan_key))
+                           reply_markup=await _renew_kb(plan_key))
 
 
 async def _run_expiry_reminders():
