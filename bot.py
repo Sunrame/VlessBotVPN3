@@ -19,8 +19,6 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQu
 
 from yookassa import Configuration, Payment
 
-import pricing
-
 
 def _yookassa_description(description: str) -> str:
     """Название только для ЮKassa; Telegram-тексты не меняет."""
@@ -229,9 +227,214 @@ PLANS = {
 
 MONTH_CHOICES = [1, 3, 6, 12]
 
-# Цены за месяц (price_month выше) и скидки за срок редактируются админами —
-# в этом боте («Тарифы» в админ-панели) и на админ-сайте. Актуальные значения
-# лежат в общей таблице pricing_settings, значения выше — только запасные.
+# ─────────────────────────────────────────────
+#  ЦЕНЫ И СКИДКИ — ХРАНЕНИЕ И РАСЧЁТ
+#
+#  Цены за месяц (price_month выше) и скидки за срок редактируются админами —
+#  в этом боте («Тарифы» в админ-панели) и на админ-сайте. Актуальные значения
+#  лежат в общей таблице pricing_settings, значения выше — только запасные.
+#
+#  Код ниже намеренно продублирован из pricing.py админ-сайта: бот
+#  разворачивается отдельным сервисом, где лежит только bot.py, поэтому
+#  импортировать общий модуль нельзя. Формат ключей, границы значений и
+#  правило округления обязаны совпадать с pricing.py, иначе бот и сайт
+#  покажут разные цены.
+# ─────────────────────────────────────────────
+PRICING_CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS pricing_settings (
+    key        TEXT PRIMARY KEY,
+    value      INTEGER NOT NULL,
+    updated_at BIGINT DEFAULT 0,
+    updated_by BIGINT
+)
+"""
+
+# Сроки, для которых можно задать скидку (за 1 месяц скидки нет).
+DISCOUNT_MONTHS = [m for m in MONTH_CHOICES if m > 1]
+
+# Виды покупок со скидкой за объём.
+QTY_KINDS = ("device", "gb")
+
+MIN_PRICE = 1
+MAX_PRICE = 100_000
+MAX_DISCOUNT = 90
+MAX_QTY_THRESHOLD = 10_000
+
+# Сколько секунд держим цены в памяти, не перечитывая БД.
+PRICING_CACHE_TTL = 20
+
+
+def pricing_price_key(plan_key: str) -> str:
+    return f"price_month:{plan_key}"
+
+
+def pricing_discount_key(months: int) -> str:
+    return f"discount:{int(months)}"
+
+
+def pricing_device_price_key(plan_key: str) -> str:
+    return f"device_price:{plan_key}"
+
+
+GB_PRICE_KEY = "gb_price"
+
+
+def pricing_qty_pct_key(kind: str) -> str:
+    return f"{kind}_discount_pct"
+
+
+def pricing_qty_min_key(kind: str) -> str:
+    return f"{kind}_discount_min"
+
+
+def clamp_price(value) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return MIN_PRICE
+    return max(MIN_PRICE, min(MAX_PRICE, value))
+
+
+def clamp_discount(value) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(MAX_DISCOUNT, value))
+
+
+def clamp_threshold(value) -> int:
+    """Минимальное количество, с которого действует скидка за объём."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(MAX_QTY_THRESHOLD, value))
+
+
+def pricing_build(rows, default_prices: dict | None = None,
+                  default_device_prices: dict | None = None,
+                  default_gb_price: int | None = None) -> dict:
+    """Собрать настройки цен из строк таблицы pricing_settings."""
+    prices = {k: clamp_price(v) for k, v in (default_prices or {}).items()}
+    device_prices = {k: clamp_price(v)
+                     for k, v in (default_device_prices or {}).items()}
+    gb_price_value = clamp_price(default_gb_price if default_gb_price is not None
+                                 else WHITELIST_PRICE_PER_GB)
+    discounts = {m: 0 for m in DISCOUNT_MONTHS}
+    qty = {kind: {"pct": 0, "min": 1} for kind in QTY_KINDS}
+    for row in rows or []:
+        # asyncpg.Record читается по имени колонки, обычный кортеж — по индексу.
+        try:
+            key, value = row["key"], row["value"]
+        except (TypeError, KeyError, IndexError):
+            try:
+                key, value = row[0], row[1]
+            except (TypeError, KeyError, IndexError):
+                continue
+        key = str(key or "")
+        if key.startswith("price_month:"):
+            prices[key.split(":", 1)[1]] = clamp_price(value)
+        elif key.startswith("device_price:"):
+            device_prices[key.split(":", 1)[1]] = clamp_price(value)
+        elif key == GB_PRICE_KEY:
+            gb_price_value = clamp_price(value)
+        elif key.startswith("discount:"):
+            months = key.split(":", 1)[1]
+            if months.isdigit():
+                discounts[int(months)] = clamp_discount(value)
+        else:
+            for kind in QTY_KINDS:
+                if key == pricing_qty_pct_key(kind):
+                    qty[kind]["pct"] = clamp_discount(value)
+                elif key == pricing_qty_min_key(kind):
+                    qty[kind]["min"] = clamp_threshold(value)
+    return {"prices": prices, "discounts": discounts,
+            "device_prices": device_prices, "gb_price": gb_price_value, "qty": qty}
+
+
+def pricing_discount_for(settings: dict, months: int) -> int:
+    """Процент скидки для срока (для 1 месяца скидки нет)."""
+    months = max(1, int(months or 1))
+    if months <= 1:
+        return 0
+    return clamp_discount((settings or {}).get("discounts", {}).get(months, 0))
+
+
+def pricing_price_month(settings: dict, plan_key: str, default: int | None = None) -> int:
+    """Цена тарифа за один месяц."""
+    prices = (settings or {}).get("prices", {})
+    if plan_key in prices:
+        return clamp_price(prices[plan_key])
+    return clamp_price(default if default is not None else MIN_PRICE)
+
+
+def pricing_plan_total(settings: dict, plan_key: str, months: int,
+                       default_month: int | None = None) -> int:
+    """Итоговая цена тарифа за срок с учётом скидки за этот срок."""
+    months = max(1, int(months or 1))
+    base = pricing_price_month(settings, plan_key, default_month) * months
+    percent = pricing_discount_for(settings, months)
+    if percent > 0:
+        base = int(round(base * (100 - percent) / 100))
+    return max(MIN_PRICE, base)
+
+
+def pricing_device_price(settings: dict, plan_key: str, default: int | None = None) -> int:
+    """Цена одного дополнительного устройства на тарифе."""
+    prices = (settings or {}).get("device_prices", {})
+    if plan_key in prices:
+        return clamp_price(prices[plan_key])
+    return clamp_price(default if default is not None else MIN_PRICE)
+
+
+def pricing_gb_price(settings: dict, default: int | None = None) -> int:
+    """Цена 1 ГБ трафика на белых списках."""
+    value = (settings or {}).get("gb_price")
+    if value is not None:
+        return clamp_price(value)
+    return clamp_price(default if default is not None else MIN_PRICE)
+
+
+def pricing_qty_settings(settings: dict, kind: str) -> dict:
+    """Настройка скидки за объём: {"pct": процент, "min": от скольки штук}."""
+    item = ((settings or {}).get("qty", {}) or {}).get(kind, {}) or {}
+    return {"pct": clamp_discount(item.get("pct", 0)),
+            "min": clamp_threshold(item.get("min", 1))}
+
+
+def pricing_qty_discount_for(settings: dict, kind: str, quantity: int) -> int:
+    """Процент скидки за объём — 0, если количество меньше порога."""
+    try:
+        quantity = int(quantity)
+    except (TypeError, ValueError):
+        return 0
+    conf = pricing_qty_settings(settings, kind)
+    if conf["pct"] <= 0 or quantity < conf["min"]:
+        return 0
+    return conf["pct"]
+
+
+def pricing_device_total(settings: dict, plan_key: str, quantity: int,
+                         default_price: int | None = None) -> int:
+    """Итоговая цена за несколько доп. устройств со скидкой за объём."""
+    quantity = max(1, int(quantity or 1))
+    base = pricing_device_price(settings, plan_key, default_price) * quantity
+    percent = pricing_qty_discount_for(settings, "device", quantity)
+    if percent > 0:
+        base = int(round(base * (100 - percent) / 100))
+    return max(MIN_PRICE, base)
+
+
+def pricing_gb_total(settings: dict, quantity: int,
+                     default_price: int | None = None) -> int:
+    """Итоговая цена за несколько ГБ трафика со скидкой за объём."""
+    quantity = max(1, int(quantity or 1))
+    base = pricing_gb_price(settings, default_price) * quantity
+    percent = pricing_qty_discount_for(settings, "gb", quantity)
+    if percent > 0:
+        base = int(round(base * (100 - percent) / 100))
+    return max(MIN_PRICE, base)
 
 # Докупка трафика на белых списках: цена за 1 ГБ. Пользователь сам вводит
 # сколько ГБ хочет купить, итоговая цена = кол-во * цена за ГБ.
@@ -399,7 +602,7 @@ async def init_db():
         """)
         # Цены тарифов и скидки за срок. Таблица общая с админ-сайтом:
         # правка цен в любой из панелей действует и в боте, и в кабинете.
-        await conn.execute(pricing.CREATE_TABLE_SQL)
+        await conn.execute(PRICING_CREATE_TABLE_SQL)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS whitelist_limits (
                 user_id      BIGINT PRIMARY KEY,
@@ -943,7 +1146,7 @@ _pricing_cache: dict = {"ts": 0.0, "data": None}
 async def get_pricing(force: bool = False) -> dict:
     now = time.monotonic()
     cached = _pricing_cache["data"]
-    if cached and not force and now - _pricing_cache["ts"] < pricing.CACHE_TTL:
+    if cached and not force and now - _pricing_cache["ts"] < PRICING_CACHE_TTL:
         return cached
     try:
         async with pool.acquire() as conn:
@@ -953,7 +1156,12 @@ async def get_pricing(force: bool = False) -> dict:
         if cached:
             return cached
         rows = []
-    data = pricing.build(rows, {k: p["price_month"] for k, p in PLANS.items()})
+    data = pricing_build(
+        rows,
+        {k: p["price_month"] for k, p in PLANS.items()},
+        {k: p["device_price"] for k, p in PLANS.items()},
+        WHITELIST_PRICE_PER_GB,
+    )
     _pricing_cache["data"] = data
     _pricing_cache["ts"] = now
     return data
@@ -961,17 +1169,44 @@ async def get_pricing(force: bool = False) -> dict:
 async def get_price_month(plan_key: str) -> int:
     """Актуальная цена тарифа за один месяц."""
     settings = await get_pricing()
-    return pricing.price_month(settings, plan_key, PLANS.get(plan_key, {}).get("price_month"))
+    return pricing_price_month(settings, plan_key, PLANS.get(plan_key, {}).get("price_month"))
 
 async def get_discount(months: int) -> int:
     """Процент скидки за срок (0 — скидки нет)."""
-    return pricing.discount_for(await get_pricing(), months)
+    return pricing_discount_for(await get_pricing(), months)
+
+async def get_device_price(plan_key: str) -> int:
+    """Актуальная цена одного дополнительного устройства."""
+    settings = await get_pricing()
+    return pricing_device_price(settings, plan_key,
+                                PLANS.get(plan_key, {}).get("device_price"))
+
+async def get_gb_price() -> int:
+    """Актуальная цена 1 ГБ трафика на белых списках."""
+    return pricing_gb_price(await get_pricing(), WHITELIST_PRICE_PER_GB)
+
+async def calc_device_price(plan_key: str, qty: int) -> int:
+    """Цена за несколько доп. устройств с учётом скидки за объём."""
+    settings = await get_pricing()
+    return pricing_device_total(settings, plan_key, qty,
+                                PLANS.get(plan_key, {}).get("device_price"))
+
+async def calc_gb_price(gb: int) -> int:
+    """Цена за несколько ГБ трафика с учётом скидки за объём."""
+    return pricing_gb_total(await get_pricing(), gb, WHITELIST_PRICE_PER_GB)
+
+async def _qty_discount_hint(kind: str, unit: str) -> str:
+    """Подсказка «Скидка X% при покупке от N …» (пустая, если скидки нет)."""
+    conf = pricing_qty_settings(await get_pricing(), kind)
+    if conf["pct"] <= 0:
+        return ""
+    return f"Скидка {conf['pct']}% при покупке от {conf['min']} {unit}.\n"
 
 async def _discount_hint() -> str:
     """Строка «Скидки за срок: ...» для экранов покупки (пустая, если скидок нет)."""
     settings = await get_pricing()
-    parts = [f"{m} мес. −{pricing.discount_for(settings, m)}%"
-             for m in pricing.DISCOUNT_MONTHS if pricing.discount_for(settings, m) > 0]
+    parts = [f"{m} мес. −{pricing_discount_for(settings, m)}%"
+             for m in DISCOUNT_MONTHS if pricing_discount_for(settings, m) > 0]
     return f"Скидки за срок: {', '.join(parts)}.\n\n" if parts else ""
 
 async def save_pricing(values: dict, admin_id: int | None = None) -> None:
@@ -991,7 +1226,7 @@ async def save_pricing(values: dict, admin_id: int | None = None) -> None:
 async def calc_plan_price(plan_key: str, months: int) -> int:
     """Цена тарифа за срок: price_month * months минус скидка за этот срок."""
     settings = await get_pricing()
-    return pricing.plan_total(settings, plan_key, months,
+    return pricing_plan_total(settings, plan_key, months,
                               PLANS.get(plan_key, {}).get("price_month"))
 
 async def calc_upgrade_price(extra_devices: int) -> int:
@@ -1005,10 +1240,9 @@ async def calc_upgrade_price(extra_devices: int) -> int:
       2) Плюс разница в цене устройства, умноженная на кол-во уже купленных
          доп. устройств: (device_price_bypass - device_price_vpn) * extra_devices
     """
-    vpn    = PLANS["vpn"]
-    bypass = PLANS["vpn_bypass"]
     plan_diff   = await get_price_month("vpn_bypass") - await get_price_month("vpn")
-    device_diff = max(0, bypass["device_price"] - vpn["device_price"]) * max(extra_devices, 0)
+    device_diff = max(0, await get_device_price("vpn_bypass")
+                      - await get_device_price("vpn")) * max(extra_devices, 0)
     # Цены задаёт админ: если обход перестал быть дороже, доплаты нет.
     return max(0, plan_diff + device_diff)
 
@@ -1127,9 +1361,9 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         if plan not in PLANS:
             await message.answer("Сначала оформите подписку.")
             return True
-        device_price = PLANS[plan]["device_price"]
+        device_price = await get_device_price(plan)
         if qty and qty > 0:
-            price = device_price * qty
+            price = await calc_device_price(plan, qty)
             word = "устройство" if qty == 1 else (
                 "устройства" if 2 <= qty % 10 <= 4 and not (11 <= qty % 100 <= 14) else "устройств")
             await _create_payment_page_from_message(
@@ -1141,7 +1375,8 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         await state.update_data(plan=plan)
         await message.answer(
             f"{EMOJI_DEV_TOPUP} Добавить устройства\n\n"
-            f"Цена одного устройства на   ашем тарифе: {device_price} руб.\n\n"
+            f"Цена одного устройства на вашем тарифе: {device_price} руб.\n"
+            f"{await _qty_discount_hint('device', 'шт.')}\n"
             f"Введите, сколько устройств хотите докупить:",
             parse_mode="HTML", reply_markup=cancel_kb(),
         )
@@ -1177,7 +1412,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             await message.answer("Докупка доступна только на тарифе VPN с обходом.")
             return True
         if gb and gb > 0:
-            price = gb * WHITELIST_PRICE_PER_GB
+            price = await calc_gb_price(gb)
             await _create_payment_page_from_message(
                 message, kind="wl_topup", item_name=f"+{gb} ГБ на белых списках",
                 price=price, days=0, whitelist_gb=gb,
@@ -1186,7 +1421,8 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         await state.set_state(WhitelistTopupState.waiting_gb)
         await message.answer(
             f"{EMOJI_GB_TOPUP} Докупить трафик (белые списки)\n\n"
-            f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
+            f"Цена: {await get_gb_price()} руб. за 1 ГБ.\n"
+            f"{await _qty_discount_hint('gb', 'ГБ')}\n"
             f"Введите, сколько ГБ хотите докупить:",
             parse_mode="HTML", reply_markup=cancel_kb(),
         )
@@ -1839,12 +2075,13 @@ async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
     if plan not in PLANS:
         await safe_answer(cb, "Сначала оформите подписку.", show_alert=True)
         return
-    device_price = PLANS[plan]["device_price"]
+    device_price = await get_device_price(plan)
     await state.set_state(DeviceTopupState.waiting_count)
     await state.update_data(plan=plan)
     await cb.message.edit_text(
         f"{EMOJI_DEV_TOPUP} Добавить устройства\n\n"
-        f"Цена одного устройства на вашем тарифе: {device_price} руб.\n\n"
+        f"Цена одного устройства на вашем тарифе: {device_price} руб.\n"
+        f"{await _qty_discount_hint('device', 'шт.')}\n"
         f"Введите, сколько устройств хотите докупить:",
         parse_mode="HTML", reply_markup=cancel_kb(),
     )
@@ -1869,8 +2106,7 @@ async def dev_add_count_handler(message: types.Message, state: FSMContext):
     if plan not in PLANS:
         await message.answer("Тариф не найден, попробуйте снова из профиля.")
         return
-    device_price = PLANS[plan]["device_price"]
-    price = device_price * count
+    price = await calc_device_price(plan, count)
     word = "устройство" if count == 1 else ("устройства" if 2 <= count % 10 <= 4 and not (11 <= count % 100 <= 14) else "устройств")
     await _create_payment_page_from_message(
         message, kind="device", item_name=f"+{count} {word} ({PLANS[plan]['name']})",
@@ -1916,7 +2152,8 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
     await state.set_state(WhitelistTopupState.waiting_gb)
     await cb.message.edit_text(
         f"Докупить трафик (белые списки)\n\n"
-        f"Цена: {WHITELIST_PRICE_PER_GB} руб. за 1 ГБ.\n\n"
+        f"Цена: {await get_gb_price()} руб. за 1 ГБ.\n"
+        f"{await _qty_discount_hint('gb', 'ГБ')}\n"
         f"Введите, сколько ГБ хотите докупить:",
         parse_mode="HTML", reply_markup=cancel_kb(),
     )
@@ -1936,7 +2173,7 @@ async def wl_topup_gb_handler(message: types.Message, state: FSMContext):
         await message.answer("Число должно быть больше 0.")
         return
     await state.clear()
-    price = gb * WHITELIST_PRICE_PER_GB
+    price = await calc_gb_price(gb)
     await _create_payment_page_from_message(
         message, kind="wl_topup", item_name=f"+{gb} ГБ на белых списках",
         price=price, days=0, whitelist_gb=gb,
@@ -3722,21 +3959,56 @@ async def _pricing_screen():
              "Цена тарифа за 1 месяц:"]
     rows = []
     for key, plan in PLANS.items():
-        price = pricing.price_month(settings, key, plan.get("price_month"))
+        price = pricing_price_month(settings, key, plan.get("price_month"))
         lines.append(f"  • {plan['name']}: {price} ₽/мес.")
         rows.append([InlineKeyboardButton(
             text=f"Изменить цену: {plan['name']}",
             callback_data=f"admin_price_{key}",
         )])
     lines += ["", "Скидка за срок (в % от цены за весь срок):"]
-    for m in pricing.DISCOUNT_MONTHS:
-        pct = pricing.discount_for(settings, m)
-        example = pricing.plan_total(settings, "vpn", m, PLANS["vpn"].get("price_month"))
+    for m in DISCOUNT_MONTHS:
+        pct = pricing_discount_for(settings, m)
+        example = pricing_plan_total(settings, "vpn", m, PLANS["vpn"].get("price_month"))
         lines.append(f"  • {m} мес.: {pct}%  (например, VPN за {m} мес. = {example} ₽)")
         rows.append([InlineKeyboardButton(
             text=f"Изменить скидку: {m} мес.",
             callback_data=f"admin_disc_{m}",
         )])
+    # Доп. устройства.
+    lines += ["", "Цена 1 доп. устройства:"]
+    for key, plan in PLANS.items():
+        dp = pricing_device_price(settings, key, plan.get("device_price"))
+        lines.append(f"  • {plan['name']}: {dp} ₽")
+        rows.append([InlineKeyboardButton(
+            text=f"Изменить цену устройства: {plan['name']}",
+            callback_data=f"admin_devprice_{key}",
+        )])
+    dev_conf = pricing_qty_settings(settings, "device")
+    if dev_conf["pct"] > 0:
+        example = pricing_device_total(settings, "vpn", dev_conf["min"],
+                                       PLANS["vpn"].get("device_price"))
+        lines.append(f"  • скидка: {dev_conf['pct']}% от {dev_conf['min']} шт. "
+                     f"(например, {dev_conf['min']} шт. на VPN = {example} ₽)")
+    else:
+        lines.append("  • скидка за объём: не задана")
+    rows.append([InlineKeyboardButton(text="Скидка на устройства",
+                                      callback_data="admin_qtydisc_device")])
+
+    # Трафик на белых списках.
+    gb_p = pricing_gb_price(settings, WHITELIST_PRICE_PER_GB)
+    gb_conf = pricing_qty_settings(settings, "gb")
+    lines += ["", f"Трафик на белых списках: {gb_p} ₽ за 1 ГБ"]
+    if gb_conf["pct"] > 0:
+        example = pricing_gb_total(settings, gb_conf["min"], WHITELIST_PRICE_PER_GB)
+        lines.append(f"  • скидка: {gb_conf['pct']}% от {gb_conf['min']} ГБ "
+                     f"(например, {gb_conf['min']} ГБ = {example} ₽)")
+    else:
+        lines.append("  • скидка за объём: не задана")
+    rows.append([InlineKeyboardButton(text="Изменить цену за 1 ГБ",
+                                      callback_data="admin_gbprice")])
+    rows.append([InlineKeyboardButton(text="Скидка на трафик",
+                                      callback_data="admin_qtydisc_gb")])
+
     lines += ["", "Цены общие с личным кабинетом на сайте — изменения "
               "действуют сразу везде."]
     rows.append([InlineKeyboardButton(text="Назад", callback_data="admin_panel")])
@@ -3766,7 +4038,7 @@ async def admin_price_start_cb(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(
         f"Введите новую цену тарифа «{PLANS[plan_key]['name']}» за 1 месяц, в рублях.\n"
         f"Сейчас: {current} ₽.\n\n"
-        f"Допустимо {pricing.MIN_PRICE}–{pricing.MAX_PRICE}.",
+        f"Допустимо {MIN_PRICE}–{MAX_PRICE}.",
         reply_markup=cancel_kb(),
     )
 
@@ -3776,7 +4048,7 @@ async def admin_disc_start_cb(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     m_str = cb.data.removeprefix("admin_disc_")
-    if not m_str.isdigit() or int(m_str) not in pricing.DISCOUNT_MONTHS:
+    if not m_str.isdigit() or int(m_str) not in DISCOUNT_MONTHS:
         await safe_answer(cb, "Некорректный срок.", show_alert=True)
         return
     months = int(m_str)
@@ -3786,7 +4058,67 @@ async def admin_disc_start_cb(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(
         f"Введите скидку при покупке на {months} мес., в процентах.\n"
         f"Сейчас: {current}%.\n\n"
-        f"Допустимо 0–{pricing.MAX_DISCOUNT}. 0 — без скидки.",
+        f"Допустимо 0–{MAX_DISCOUNT}. 0 — без скидки.",
+        reply_markup=cancel_kb(),
+    )
+
+@router.callback_query(F.data.startswith("admin_devprice_"))
+async def admin_devprice_start_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    plan_key = cb.data.removeprefix("admin_devprice_")
+    if plan_key not in PLANS:
+        await safe_answer(cb, "Тариф не найден.", show_alert=True)
+        return
+    current = await get_device_price(plan_key)
+    await state.set_state(AdminPricingState.waiting_value)
+    await state.update_data(kind="device_price", plan_key=plan_key)
+    await cb.message.answer(
+        f"Введите цену одного доп. устройства на тарифе "
+        f"«{PLANS[plan_key]['name']}», в рублях.\n"
+        f"Сейчас: {current} ₽.\n\n"
+        f"Допустимо {MIN_PRICE}–{MAX_PRICE}.",
+        reply_markup=cancel_kb(),
+    )
+
+@router.callback_query(F.data == "admin_gbprice")
+async def admin_gbprice_start_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    current = await get_gb_price()
+    await state.set_state(AdminPricingState.waiting_value)
+    await state.update_data(kind="gb_price")
+    await cb.message.answer(
+        f"Введите цену 1 ГБ трафика на белых списках, в рублях.\n"
+        f"Сейчас: {current} ₽.\n\n"
+        f"Допустимо {MIN_PRICE}–{MAX_PRICE}.",
+        reply_markup=cancel_kb(),
+    )
+
+@router.callback_query(F.data.startswith("admin_qtydisc_"))
+async def admin_qtydisc_start_cb(cb: CallbackQuery, state: FSMContext):
+    """Скидка за объём вводится одной строкой: «процент количество»."""
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    kind = cb.data.removeprefix("admin_qtydisc_")
+    if kind not in QTY_KINDS:
+        await safe_answer(cb, "Неизвестный тип скидки.", show_alert=True)
+        return
+    unit = "шт." if kind == "device" else "ГБ"
+    what = "устройства" if kind == "device" else "трафик"
+    conf = pricing_qty_settings(await get_pricing(), kind)
+    await state.set_state(AdminPricingState.waiting_value)
+    await state.update_data(kind="qty_discount", qty_kind=kind)
+    await cb.message.answer(
+        f"Скидка на {what}.\n"
+        f"Сейчас: {conf['pct']}% при покупке от {conf['min']} {unit}.\n\n"
+        f"Введите два числа через пробел: процент и количество.\n"
+        f"Например: «10 3» — скидка 10% при покупке от 3 {unit}.\n"
+        f"Чтобы отключить скидку, введите «0 1».\n\n"
+        f"Процент 0–{MAX_DISCOUNT}, количество 1–{MAX_QTY_THRESHOLD}.",
         reply_markup=cancel_kb(),
     )
 
@@ -3796,36 +4128,89 @@ async def admin_pricing_value_handler(message: types.Message, state: FSMContext)
         await state.clear()
         return
     raw = (message.text or "").strip()
+    data = await state.get_data()
+    kind = data.get("kind")
+
+    # Скидка за объём — два числа через пробел: «процент количество».
+    if kind == "qty_discount":
+        qty_kind = data.get("qty_kind")
+        if qty_kind not in QTY_KINDS:
+            await state.clear()
+            await message.answer("Неизвестный тип скидки.")
+            return
+        parts = raw.split()
+        if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
+            await message.answer("Введите два числа через пробел, например: «10 3».")
+            return
+        pct, qty = int(parts[0]), int(parts[1])
+        if not (0 <= pct <= MAX_DISCOUNT):
+            await message.answer(f"Процент должен быть от 0 до {MAX_DISCOUNT}.")
+            return
+        if not (1 <= qty <= MAX_QTY_THRESHOLD):
+            await message.answer(f"Количество должно быть от 1 до {MAX_QTY_THRESHOLD}.")
+            return
+        await save_pricing({
+            pricing_qty_pct_key(qty_kind): pct,
+            pricing_qty_min_key(qty_kind): qty,
+        }, message.from_user.id)
+        await state.clear()
+        unit = "шт." if qty_kind == "device" else "ГБ"
+        what = "устройства" if qty_kind == "device" else "трафик"
+        if pct > 0:
+            await message.answer(f"Готово. Скидка на {what}: {pct}% от {qty} {unit}.")
+        else:
+            await message.answer(f"Готово. Скидка на {what} отключена.")
+        text, kb = await _pricing_screen()
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return
+
     if not raw.lstrip("-").isdigit():
         await message.answer("Введите целое число.")
         return
     value = int(raw)
-    data = await state.get_data()
-    kind = data.get("kind")
     if kind == "price":
         plan_key = data.get("plan_key")
         if plan_key not in PLANS:
             await state.clear()
             await message.answer("Тариф не найден.")
             return
-        if not (pricing.MIN_PRICE <= value <= pricing.MAX_PRICE):
-            await message.answer(f"Цена должна быть от {pricing.MIN_PRICE} до {pricing.MAX_PRICE} ₽.")
+        if not (MIN_PRICE <= value <= MAX_PRICE):
+            await message.answer(f"Цена должна быть от {MIN_PRICE} до {MAX_PRICE} ₽.")
             return
-        await save_pricing({pricing.price_key(plan_key): value}, message.from_user.id)
+        await save_pricing({pricing_price_key(plan_key): value}, message.from_user.id)
         await state.clear()
         await message.answer(f"Готово. Цена тарифа «{PLANS[plan_key]['name']}» — {value} ₽/мес.")
     elif kind == "discount":
         months = data.get("months")
-        if months not in pricing.DISCOUNT_MONTHS:
+        if months not in DISCOUNT_MONTHS:
             await state.clear()
             await message.answer("Некорректный срок.")
             return
-        if not (0 <= value <= pricing.MAX_DISCOUNT):
-            await message.answer(f"Скидка должна быть от 0 до {pricing.MAX_DISCOUNT}%.")
+        if not (0 <= value <= MAX_DISCOUNT):
+            await message.answer(f"Скидка должна быть от 0 до {MAX_DISCOUNT}%.")
             return
-        await save_pricing({pricing.discount_key(months): value}, message.from_user.id)
+        await save_pricing({pricing_discount_key(months): value}, message.from_user.id)
         await state.clear()
         await message.answer(f"Готово. Скидка за {months} мес. — {value}%.")
+    elif kind == "device_price":
+        plan_key = data.get("plan_key")
+        if plan_key not in PLANS:
+            await state.clear()
+            await message.answer("Тариф не найден.")
+            return
+        if not (MIN_PRICE <= value <= MAX_PRICE):
+            await message.answer(f"Цена должна быть от {MIN_PRICE} до {MAX_PRICE} ₽.")
+            return
+        await save_pricing({pricing_device_price_key(plan_key): value}, message.from_user.id)
+        await state.clear()
+        await message.answer(f"Готово. Цена устройства на «{PLANS[plan_key]['name']}» — {value} ₽.")
+    elif kind == "gb_price":
+        if not (MIN_PRICE <= value <= MAX_PRICE):
+            await message.answer(f"Цена должна быть от {MIN_PRICE} до {MAX_PRICE} ₽.")
+            return
+        await save_pricing({GB_PRICE_KEY: value}, message.from_user.id)
+        await state.clear()
+        await message.answer(f"Готово. Цена 1 ГБ трафика — {value} ₽.")
     else:
         await state.clear()
         await message.answer("Не удалось определить, что менять. Откройте раздел «Тарифы» заново.")
