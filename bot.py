@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import string
 import secrets
@@ -16,6 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent
+from aiogram.exceptions import TelegramBadRequest
 
 from yookassa import Configuration, Payment
 
@@ -1385,11 +1387,12 @@ def start_media_source(media: dict) -> str:
 
 async def send_start_media(chat_id: int, media: dict | None = None,
                            is_new_user: bool = False, force: bool = False) -> bool:
-    """Показать приветственное медиа отдельным сообщением перед меню.
+    """Отправить приветственное медиа отдельным сообщением.
 
-    Отдельным сообщением — намеренно: меню профиля дальше живёт своей жизнью
-    (кнопки перерисовывают его текст), а подпись к фото/видео редактировать
-    так же нельзя.
+    Обычно медиа прикрепляется прямо к сообщению /start (см.
+    ``answer_start_screen``). Этот запасной путь нужен, когда текст экрана не
+    помещается в подпись (лимит Telegram — 1024 символа), и для предпросмотра
+    из админ-панели.
     """
     media = media if media is not None else await get_start_media()
     source = start_media_source(media)
@@ -1417,6 +1420,88 @@ async def send_start_media(chat_id: int, media: dict | None = None,
         # недоступна — просто показываем меню без картинки.
         log.error("start media send: %s", e)
         return False
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def visible_len(text: str) -> int:
+    """Длина текста без HTML-разметки — лимиты Telegram считаются именно так."""
+    return len(_HTML_TAG_RE.sub("", text or ""))
+
+
+async def answer_start_screen(message: types.Message, text: str,
+                              kb: InlineKeyboardMarkup | None = None,
+                              is_new_user: bool = False):
+    """Ответ на /start одним сообщением: медиа + текст экрана + кнопки.
+
+    Приветственная картинка (гифка, видео) прикрепляется к самому сообщению,
+    а текст уходит в подпись — поэтому кнопки и картинка живут вместе, и
+    дальше экраны перерисовываются правкой подписи (см. edit_screen).
+    Если текст в подпись не помещается или Telegram отказал в отправке медиа,
+    остаётся обычное текстовое сообщение — /start не должен ломаться из-за
+    картинки.
+    """
+    media = await get_start_media()
+    source = start_media_source(media)
+    show = bool(source) and bool(media.get("enabled")) and (
+        media.get("mode") != "first" or is_new_user)
+    if show:
+        prefix = (media.get("caption") or "").strip()
+        caption = f"{prefix}\n\n{text}" if prefix else text
+        if visible_len(caption) <= START_MEDIA_MAX_CAPTION:
+            kind = media.get("type") or "photo"
+            try:
+                if kind == "video":
+                    return await message.answer_video(source, caption=caption,
+                                                      parse_mode="HTML", reply_markup=kb)
+                if kind == "animation":
+                    return await message.answer_animation(source, caption=caption,
+                                                          parse_mode="HTML", reply_markup=kb)
+                if kind == "document":
+                    return await message.answer_document(source, caption=caption,
+                                                         parse_mode="HTML", reply_markup=kb)
+                return await message.answer_photo(source, caption=caption,
+                                                  parse_mode="HTML", reply_markup=kb)
+            except Exception as e:
+                log.error("start media: %s", e)
+        else:
+            # Текст длиннее подписи — показываем медиа отдельным сообщением.
+            await send_start_media(message.chat.id, media=media, force=True)
+    return await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def edit_screen(message: types.Message, text: str, **kwargs):
+    """Перерисовать экран бота (замена message.edit_text).
+
+    У обычного сообщения правим текст. Если к сообщению приложено
+    приветственное медиа из /start, Telegram менять текст не разрешает —
+    правим подпись, картинка остаётся на месте. Текст длиннее 1024 символов
+    в подпись не влезает: такое сообщение заменяем обычным текстовым.
+    """
+    has_media = bool(message.photo or message.video or message.animation or message.document)
+    if not has_media:
+        try:
+            return await message.edit_text(text, **kwargs)
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return message
+            raise
+    if visible_len(text) <= START_MEDIA_MAX_CAPTION:
+        # У editMessageCaption нет настроек предпросмотра ссылок.
+        caption_kwargs = {k: v for k, v in kwargs.items()
+                          if k not in ("disable_web_page_preview", "link_preview_options")}
+        try:
+            return await message.edit_caption(caption=text, **caption_kwargs)
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return message
+            log.warning("edit_caption: %s", e)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    return await message.answer(text, **kwargs)
 
 
 def start_media_from_message(message: types.Message) -> tuple[str, str]:
@@ -2155,15 +2240,16 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             await conn.execute("UPDATE users SET username=$1 WHERE user_id=$2",
                                message.from_user.username, u_id)
 
-    # Приветственное медиа (настраивается в админ-панели бота или на сайте) —
-    # отдельным сообщением перед меню: так экраны бота по-прежнему
-    # перерисовываются редактированием текста.
-    await send_start_media(u_id, is_new_user=not exists)
+    # Приветственное медиа (настраивается в админ-панели бота или на сайте)
+    # прикрепляется прямо к сообщению /start: картинка, текст и кнопки — одно
+    # сообщение. Дальше экраны перерисовываются правкой подписи (edit_screen).
+    is_new_user = not exists
 
     if not await is_subscribed(u_id):
-        await message.answer(
+        await answer_start_screen(
+            message,
             f"{EMOJI_TRUBAVPN} {hbold('TrubaVPN')}\n\nПодпишитесь на канал, чтобы пользоваться ботом.",
-            reply_markup=sub_required_kb(), parse_mode="HTML",
+            sub_required_kb(), is_new_user=is_new_user,
         )
         return
 
@@ -2174,7 +2260,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             return
 
     text, kb = await _build_profile_view(u_id)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await answer_start_screen(message, text, kb, is_new_user=is_new_user)
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_cb(cb: CallbackQuery):
@@ -2183,7 +2269,7 @@ async def check_sub_cb(cb: CallbackQuery):
         await safe_answer(cb, "Вы ещё не подписаны.", show_alert=True)
         return
     text, kb = await _build_profile_view(cb.from_user.id)
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
 
 def get_cabinet_webapp_url() -> str | None:
     """URL мини-приложения личного кабинета для кнопки-WebApp.
@@ -2389,7 +2475,7 @@ async def cabinet_unavailable_cb(cb: CallbackQuery):
 
 async def _show_home(cb: CallbackQuery):
     text, kb = await _build_profile_view(cb.from_user.id)
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
 
 def cancel_kb() -> InlineKeyboardMarkup:
     """Универсальная кнопка отмены — очищает любое активное FSM-состояние и
@@ -2480,7 +2566,7 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     desc_block = f"\n{extra_desc}\n" if extra_desc else ""
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"{prefix}{hbold(item_name)}\n{desc_block}\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
         parse_mode="HTML", reply_markup=kb,
     )
@@ -2649,7 +2735,7 @@ async def check_payment_cb(cb: CallbackQuery):
             await credit_referral(referrer_id, u_id, uname, item_name, price)
 
     text, kb = await _build_profile_view(u_id)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
     )
 
@@ -2699,7 +2785,7 @@ async def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
 async def buy_open_cb(cb: CallbackQuery):
     await safe_answer(cb)
     text, kb = await _buy_open_content()
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
 
 
 @router.callback_query(F.data == "renew_open")
@@ -2717,7 +2803,7 @@ async def renew_open_cb(cb: CallbackQuery):
         )
         return
     plan = PLANS[plan_key]
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"{hbold('Продлить подписку')}\n\n"
         f"Тариф: {plan['name']}\n"
         f"Выберите срок продления:",
@@ -2743,7 +2829,7 @@ async def buyplan_cb(cb: CallbackQuery):
             label += f" (−{percent}%)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buymonths_{plan_key}_{months}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="buy_open")])
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n"
         f"{await get_price_month(plan_key)} руб./мес.\n\n"
         f"Дополнительные устройства и трафик для обхода белых списков "
@@ -2783,7 +2869,7 @@ async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
     device_price = await get_device_price(plan)
     await state.set_state(DeviceTopupState.waiting_count)
     await state.update_data(plan=plan)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"{EMOJI_DEV_TOPUP} Добавить устройства\n\n"
         f"Цена одного устройства на вашем тарифе: {device_price} руб.\n"
         f"{await _qty_discount_hint('device', 'шт.')}\n"
@@ -2855,7 +2941,7 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
         await safe_answer(cb, "Докупка доступна только на тарифе VPN с обходом.", show_alert=True)
         return
     await state.set_state(WhitelistTopupState.waiting_gb)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"Докупить трафик (белые списки)\n\n"
         f"Цена: {await get_gb_price()} руб. за 1 ГБ.\n"
         f"{await _qty_discount_hint('gb', 'ГБ')}\n"
@@ -2913,7 +2999,7 @@ async def earn_open_cb(cb: CallbackQuery):
         withdraw_url  = f"{SUPPORT_URL}?text={withdraw_text.replace(' ', '%20')}"
         rows.append([InlineKeyboardButton(text="Написать для вывода", url=withdraw_url)])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 # ─────────────────────────────────────────────
 #  ПРОМОКОД (логика не меняется — просто ссылается на новые планы)
@@ -3018,7 +3104,7 @@ def _free_plan_kb(code: str):
 async def promo_enter(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
     await state.set_state(PromoState.waiting_code)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         "Введите промокод:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")],
@@ -3182,7 +3268,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     await _finish_promo_claim(promo_code)
     await safe_answer(cb, "Промокод активирован.")
     text, kb = await _build_profile_view(cb.from_user.id)
-    await cb.message.edit_text(f"Промокод {promo_code} активирован — {plan['name']}, {days} дн.\n\n{text}",
+    await edit_screen(cb.message, f"Промокод {promo_code} активирован — {plan['name']}, {days} дн.\n\n{text}",
                                parse_mode="HTML", reply_markup=kb)
 
 # ─────────────────────────────────────────────
@@ -3191,7 +3277,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "info_tab")
 async def info_tab(cb: CallbackQuery):
     await safe_answer(cb)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"{EMOJI_INFO} О сервисе",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -3235,7 +3321,7 @@ async def admin_panel_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"{EMOJI_ADMIN} Админ-панель", parse_mode="HTML",
         reply_markup=admin_panel_kb(is_main_admin(cb.from_user.id)),
     )
@@ -3272,7 +3358,7 @@ async def _render_admins_list(target_send):
     if isinstance(target_send, types.Message):
         await target_send.answer(text, reply_markup=kb)
     else:
-        await target_send.message.edit_text(text, reply_markup=kb)
+        await edit_screen(target_send.message, text, reply_markup=kb)
 
 @router.callback_query(F.data == "admin_admins")
 async def admin_admins_cb(cb: CallbackQuery):
@@ -3379,7 +3465,7 @@ def _subs_page_kb(users_page: list, page: int, total: int) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def _render_subs_page(cb: CallbackQuery, page: int):
-    await cb.message.edit_text("Загружаю подписчиков...")
+    await edit_screen(cb.message, "Загружаю подписчиков...")
     try:
         all_subs = await _get_sorted_subs()
         total = len(all_subs)
@@ -3409,10 +3495,10 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
                 u["_tg_label"] = f"ID:{uid_str}"
 
         header = f"Активных подписчиков: {total}\nНажмите на подписчика для управления"
-        await cb.message.edit_text(header, reply_markup=_subs_page_kb(page_users, page, total))
+        await edit_screen(cb.message, header, reply_markup=_subs_page_kb(page_users, page, total))
     except Exception as e:
         log.exception("_render_subs_page error: %s", e)
-        await cb.message.edit_text(
+        await edit_screen(cb.message,
             f"Ошибка загрузки: {e}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Повторить", callback_data="admin_subs")],
@@ -3553,7 +3639,7 @@ async def _render_check(target_send, user_id: int):
         await target_send.answer(text, reply_markup=kb)
     else:
         try:
-            await target_send.message.edit_text(text, reply_markup=kb)
+            await edit_screen(target_send.message, text, reply_markup=kb)
         except Exception:
             await target_send.message.answer(text, reply_markup=kb)
 
@@ -4037,7 +4123,7 @@ async def admin_promos_cb(cb: CallbackQuery):
             days_str = f"{r['days']} дн." if r["days"] else "-"
             age = f", возраст от {r['min_account_age_days']} дн." if r["min_account_age_days"] else ""
             lines.append(f"{r['code']} — {days_str}, {r['uses']} исп. ({r['promo_type']}){age}")
-    await cb.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Создать промокод", callback_data="promogen_start")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
@@ -4068,7 +4154,7 @@ async def promogen_start_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         "Создание промокода\n\nЧто должен давать промокод?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Дни к текущей подписке", callback_data="promogen_type_days")],
@@ -4084,7 +4170,7 @@ async def promogen_type_days_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.update_data(promo_type="days", tariff_key=None)
     await state.set_state(PromoGenState.waiting_days)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         "Сколько дней добавляет промокод? Введите число:", reply_markup=cancel_kb()
     )
 
@@ -4093,7 +4179,7 @@ async def promogen_type_free_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         "Какой тариф выдавать бесплатно?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="promogen_freeplan_vpn")],
@@ -4114,7 +4200,7 @@ async def promogen_freeplan_cb(cb: CallbackQuery, state: FSMContext):
     else:
         await state.update_data(promo_type="free_tariff", tariff_key=choice)
     await state.set_state(PromoGenState.waiting_days)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         "Сколько дней бесплатного доступа? Введите число:", reply_markup=cancel_kb()
     )
 
@@ -4141,7 +4227,7 @@ def _min_age_kb() -> InlineKeyboardMarkup:
 
 
 async def _ask_promo_min_age(target_message):
-    await target_message.edit_text(
+    await edit_screen(target_message,
         "Минимальный возраст аккаунта в боте?\n\n"
         "Пользователь, зарегистрированный позже указанного срока, не сможет активировать код. "
         "Ограничение необязательное.",
@@ -4168,7 +4254,7 @@ async def promogen_uses_cb(cb: CallbackQuery, state: FSMContext):
     choice = cb.data.removeprefix("promogen_uses_")
     if choice == "custom":
         await state.set_state(PromoGenState.waiting_uses_custom)
-        await cb.message.edit_text("Введите число использований:", reply_markup=cancel_kb())
+        await edit_screen(cb.message, "Введите число использований:", reply_markup=cancel_kb())
         return
     await state.update_data(uses=int(choice))
     await _ask_promo_min_age(cb.message)
@@ -4192,7 +4278,7 @@ async def promogen_uses_custom_handler(message: types.Message, state: FSMContext
 async def _ask_promo_code(target_message, state: FSMContext, min_age_days: int):
     await state.update_data(min_account_age_days=max(0, min_age_days))
     await state.set_state(PromoGenState.waiting_code)
-    await target_message.edit_text(
+    await edit_screen(target_message,
         "Введите код промокода (латиница/цифры), либо отправьте 0 для автогенерации:",
         reply_markup=cancel_kb(),
     )
@@ -4206,7 +4292,7 @@ async def promogen_age_cb(cb: CallbackQuery, state: FSMContext):
     choice = cb.data.removeprefix("promogen_age_")
     if choice == "custom":
         await state.set_state(PromoGenState.waiting_min_age_custom)
-        await cb.message.edit_text(
+        await edit_screen(cb.message,
             "Введите минимальный возраст аккаунта в днях (0 — без ограничения):",
             reply_markup=cancel_kb(),
         )
@@ -4294,7 +4380,7 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
     if not text_body:
         await safe_answer(cb, "Текст не найден.", show_alert=True)
         return
-    await cb.message.edit_text("Рассылка запущена...")
+    await edit_screen(cb.message, "Рассылка запущена...")
     async with pool.acquire() as conn:
         if subs_only:
             users = await conn.fetch("SELECT user_id FROM users WHERE has_paid=1")
@@ -4308,7 +4394,7 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-    await cb.message.edit_text(f"Готово.\nОтправлено: {ok} · Ошибок: {fail}")
+    await edit_screen(cb.message, f"Готово.\nОтправлено: {ok} · Ошибок: {fail}")
 
 @router.callback_query(F.data == "bc_confirm")
 async def broadcast_confirm(cb: CallbackQuery, state: FSMContext):
@@ -4328,7 +4414,7 @@ async def broadcast_confirm_subs(cb: CallbackQuery, state: FSMContext):
 async def broadcast_cancel_cb(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
     await state.clear()
-    await cb.message.edit_text("Рассылка отменена.")
+    await edit_screen(cb.message, "Рассылка отменена.")
 
 # ─────────────────────────────────────────────
 #  РЕФЕРАЛЫ (админ)
@@ -4347,7 +4433,7 @@ async def admin_referrals_cb(cb: CallbackQuery):
             ") ORDER BY u.referral_balance DESC"
         )
     if not rows:
-        await cb.message.edit_text("Рефералов пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        await edit_screen(cb.message, "Рефералов пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
         ]))
         return
@@ -4363,7 +4449,7 @@ async def admin_referrals_cb(cb: CallbackQuery):
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
 
@@ -4408,9 +4494,9 @@ async def admin_report_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await cb.message.edit_text("Формирую отчёт...")
+    await edit_screen(cb.message, "Формирую отчёт...")
     await send_daily_report()
-    await cb.message.edit_text("Отчёт отправлен в личные сообщения.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, "Отчёт отправлен в личные сообщения.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
 
@@ -4485,7 +4571,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
     choice = cb.data.removeprefix("giveplan_")
     data = await state.get_data()
     if "target_id" not in data:
-        await cb.message.edit_text("Сессия истекла, начните заново через «Выдать».")
+        await edit_screen(cb.message, "Сессия истекла, начните заново через «Выдать».")
         return
     await state.clear()
 
@@ -4517,7 +4603,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         target_id, days, hwid or 1, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
     )
     if not user:
-        await cb.message.edit_text("Ошибка активации.")
+        await edit_screen(cb.message, "Ошибка активации.")
         return
 
     async with pool.acquire() as conn:
@@ -4531,7 +4617,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
     label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN с обходом", "trial": "пробный доступ"}[choice]
-    await cb.message.edit_text(f"@{target_uname} выдано {days} дн. ({label}). До: {date_str}")
+    await edit_screen(cb.message, f"@{target_uname} выдано {days} дн. ({label}). До: {date_str}")
     try:
         await bot.send_message(target_id, f"Администратор выдал вам {days} дней.", parse_mode="HTML")
     except Exception:
@@ -4575,7 +4661,7 @@ async def admin_online_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await cb.message.edit_text("Запрашиваю...")
+    await edit_screen(cb.message, "Запрашиваю...")
     now = int(time.time())
     all_users = await remna_get_all_users()
     online = [
@@ -4584,7 +4670,7 @@ async def admin_online_cb(cb: CallbackQuery):
         and parse_dt(u.get("userTraffic", {}).get("onlineAt")) > (now - 180)
     ]
     if not online:
-        await cb.message.edit_text("Сейчас никто не подключён.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        await edit_screen(cb.message, "Сейчас никто не подключён.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
         ]))
         return
@@ -4599,7 +4685,7 @@ async def admin_online_cb(cb: CallbackQuery):
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обновить", callback_data="admin_online")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
@@ -4625,7 +4711,7 @@ async def admin_settings_cb(cb: CallbackQuery):
         return
     sale_notify = await is_admin_sale_notify(cb.from_user.id)
     text = f"Настройки\n\nУведомления о покупках: {'вкл' if sale_notify else 'выкл'}"
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="Выключить уведомления" if sale_notify else "Включить уведомления",
             callback_data="admin_toggle_sale_notify",
@@ -4648,7 +4734,7 @@ async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
         else:
             await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
     text = f"Настройки\n\nУведомления о покупках: {'вкл' if new_val else 'выкл'}"
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="Выключить уведомления" if new_val else "Включить уведомления",
             callback_data="admin_toggle_sale_notify",
@@ -4683,7 +4769,8 @@ async def _start_media_screen() -> tuple[str, InlineKeyboardMarkup]:
         lines.append("Медиа не задано — /start приходит без картинки.")
     lines.append(f"Когда показывать: {START_MEDIA_MODES.get(media['mode'], media['mode'])}")
     lines.append("Состояние: " + ("включено" if media["enabled"] and source else "выключено"))
-    lines += ["", "Медиа приходит отдельным сообщением перед меню профиля. "
+    lines += ["", "Медиа прикрепляется к самому сообщению /start: картинка, "
+                  "текст профиля и кнопки — одно сообщение. "
                   "Те же настройки есть в админ-панели на сайте."]
 
     other_mode = "first" if media["mode"] == "always" else "always"
@@ -4706,7 +4793,7 @@ async def _start_media_screen() -> tuple[str, InlineKeyboardMarkup]:
 async def _show_start_media_screen(cb: CallbackQuery):
     text, kb = await _start_media_screen()
     try:
-        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -4903,7 +4990,7 @@ async def _fiscal_screen() -> tuple[str, InlineKeyboardMarkup]:
 async def _show_fiscal_screen(cb: CallbackQuery):
     text, kb = await _fiscal_screen()
     try:
-        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -5179,7 +5266,7 @@ async def admin_pricing_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     text, kb = await _pricing_screen()
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("admin_price_"))
 async def admin_price_start_cb(cb: CallbackQuery, state: FSMContext):
@@ -5389,7 +5476,7 @@ async def admin_survey_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await cb.message.edit_text("Опрос", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, "Опрос", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Разослать опрос платникам", callback_data="admin_survey_send")],
         [InlineKeyboardButton(text="Результаты", callback_data="admin_survey_results")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
@@ -5400,7 +5487,7 @@ async def admin_survey_send_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await cb.message.edit_text("Рассылаю опрос платникам...")
+    await edit_screen(cb.message, "Рассылаю опрос платникам...")
     async with pool.acquire() as conn:
         users = await conn.fetch("SELECT user_id FROM users WHERE has_paid=1")
     ok = fail = 0
@@ -5416,7 +5503,7 @@ async def admin_survey_send_cb(cb: CallbackQuery):
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-    await cb.message.edit_text(f"Опрос разослан.\nДоставлено: {ok} · Ошибок: {fail}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, f"Опрос разослан.\nДоставлено: {ok} · Ошибок: {fail}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
     ]))
 
@@ -5431,7 +5518,7 @@ async def survey_rating_cb(cb: CallbackQuery, state: FSMContext):
     rating = int(cb.data.removeprefix("survey_rate_"))
     await state.set_state(SurveyState.waiting_comment)
     await state.update_data(survey_rating=rating)
-    await cb.message.edit_text(
+    await edit_screen(cb.message,
         f"Вы поставили оценку {rating}/10.\n\n"
         "Напишите короткий комментарий — что понравилось или что можно улучшить.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -5446,7 +5533,7 @@ async def survey_skip_comment_cb(cb: CallbackQuery, state: FSMContext):
     rating = data.get("survey_rating", 0)
     await state.clear()
     await _save_survey(cb.from_user, rating, None)
-    await cb.message.edit_text("Спасибо за вашу оценку.")
+    await edit_screen(cb.message, "Спасибо за вашу оценку.")
 
 @router.message(SurveyState.waiting_comment)
 async def survey_comment_handler(message: types.Message, state: FSMContext):
@@ -5480,7 +5567,7 @@ async def admin_survey_results_cb(cb: CallbackQuery):
     async with pool.acquire() as conn:
         total = await conn.fetchval("SELECT COUNT(*) FROM survey_responses") or 0
         if not total:
-            await cb.message.edit_text("Ответов на опрос пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            await edit_screen(cb.message, "Ответов на опрос пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
             ]))
             return
@@ -5505,7 +5592,7 @@ async def admin_survey_results_cb(cb: CallbackQuery):
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_survey")],
     ]))
 
@@ -5534,7 +5621,7 @@ async def admin_stats_cb(cb: CallbackQuery):
         f"На реф. балансах: {float(ref_balance_total):.2f} руб.\n\n"
         f"Уведомления о покупках: {'вкл' if sale_notify else 'выкл'} (/sale_notify)"
     )
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await edit_screen(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
 
