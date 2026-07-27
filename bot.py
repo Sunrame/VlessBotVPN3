@@ -22,13 +22,74 @@ from aiogram.exceptions import TelegramBadRequest
 from yookassa import Configuration, Payment
 
 
-def _yookassa_description(description: str) -> str:
-    """Название только для ЮKassa; Telegram-тексты не меняет."""
-    text = (description or "TrubaVPN").strip()
-    lowered = text.lower().replace("ё", "е")
-    if any(marker in lowered for marker in ("белые спис", "белых спис", "обход глушил")):
-        return "TrubaVPN — LTE"
-    return text
+# ─────────────────────────────────────────────
+#  ЧТО ВИДИТ ЮKASSA
+# ─────────────────────────────────────────────
+# Наружу уходит только сумма и нейтральное описание: ни в description, ни в
+# metadata нет ни VPN, ни белых списков. Тексты в Telegram и названия тарифов
+# остаются прежними. То же самое продублировано в payment_titles.py для сайта —
+# бот живёт на другом хостинге, поэтому здесь копия, а не импорт.
+
+# Ключ тарифа наружу уходит кодом, обратно разворачивается (пишется в users.plan).
+_PLAN_CODES = {"trial": "p0", "vpn": "p1", "vpn_bypass": "p2"}
+_PLAN_BY_CODE = {code: key for key, code in _PLAN_CODES.items()}
+
+# Замены в названии позиции. Порядок важен: сначала длинные фразы.
+_YK_ITEM_REPLACES = (
+    ("VPN с обходом белых списков", "«Расширенный»"),
+    ("VPN с обходом",               "«Расширенный»"),
+    ("обхода белых списков",        "расширенного доступа"),
+    ("обходом белых списков",       "расширенным доступом"),
+    ("обход белых списков",         "расширенный доступ"),
+    ("на белых списках",            "дополнительного трафика"),
+    ("белых списков",               "расширенного доступа"),
+    ("белые списки",                "расширенный доступ"),
+    ("обход глушилок",              "расширенный доступ"),
+    ("VPN",                         "«Базовый»"),
+    ("ВПН",                         "«Базовый»"),
+)
+
+
+def _rub_word(amount: int) -> str:
+    """рубль / рубля / рублей — по числу."""
+    n = abs(int(amount))
+    if 11 <= n % 100 <= 14:
+        return "рублей"
+    tail = n % 10
+    if tail == 1:
+        return "рубль"
+    if 2 <= tail <= 4:
+        return "рубля"
+    return "рублей"
+
+
+def _yookassa_description(amount) -> str:
+    """Описание платежа для ЮKassa: только сумма, без названия сервиса."""
+    try:
+        rub = int(round(float(amount or 0)))
+    except (TypeError, ValueError):
+        rub = 0
+    return f"Интернет-Сервис. Пополнение баланса на {rub} {_rub_word(rub)}"
+
+
+def _yookassa_item(item_name: str) -> str:
+    """Название позиции для metadata — без VPN и белых списков."""
+    text = (item_name or "Пополнение баланса").strip()
+    for src, dst in _YK_ITEM_REPLACES:
+        text = re.sub(re.escape(src), dst, text, flags=re.IGNORECASE)
+    return text[:128]
+
+
+def _pack_plan(plan_key: str) -> str:
+    key = (plan_key or "").strip()
+    return _PLAN_CODES.get(key, key)
+
+
+def _unpack_plan(code: str) -> str:
+    """Код из metadata → ключ тарифа. Старые платежи (ключ как есть)
+    возвращаются без изменений."""
+    value = (code or "").strip()
+    return _PLAN_BY_CODE.get(value, value)
 
 # ─────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ
@@ -2520,9 +2581,10 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
             "amount":       {"value": f"{price}.00", "currency": "RUB"},
             "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
             "capture":      True,
-            # item_name остаётся прежним для Telegram и metadata. Только
-            # отображаемое название платежа в YooKassa заменяется на LTE.
-            "description":  _yookassa_description(f"TrubaVPN — {item_name}"),
+            # В ЮKassa уходит только сумма: «Интернет-Сервис. Пополнение
+            # баланса на N рублей». В metadata название позиции обезличено,
+            # ключ тарифа — кодом; тексты для пользователя не меняются.
+            "description":  _yookassa_description(price),
             "metadata": {
                 "user_id":      str(user_id),
                 "kind":         kind,
@@ -2530,10 +2592,10 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                 "hwid":         str(hwid) if hwid is not None else "",
                 "squad":        ",".join(squad) if isinstance(squad, list) else (squad or ""),
                 "whitelist_gb": str(whitelist_gb),
-                "plan_key":     plan_key or "",
+                "plan_key":     _pack_plan(plan_key),
                 "price":        str(price),
                 "is_trial":     "1" if is_trial else "0",
-                "item_name":    item_name,
+                "item_name":    _yookassa_item(item_name),
                 "qty":          str(qty),
             },
         }, str(uuid.uuid4()))
@@ -2614,7 +2676,8 @@ async def check_payment_cb(cb: CallbackQuery):
     squad_raw   = md.get("squad") or None
     squad       = squad_raw.split(",") if squad_raw and "," in squad_raw else squad_raw
     whitelist_gb= int(md.get("whitelist_gb", 0) or 0)
-    plan_key    = md.get("plan_key") or None
+    # Ключ тарифа лежит кодом (p1/p2); старые платежи разворачиваются как есть.
+    plan_key    = _unpack_plan(md.get("plan_key") or "") or None
     price       = float(md.get("price", 0))
     is_trial    = md.get("is_trial", "0") == "1"
     item_name   = md.get("item_name", "Покупка")
