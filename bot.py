@@ -678,6 +678,39 @@ async def init_db():
                 created_at BIGINT DEFAULT 0
             )
         """)
+        # Общие с админ-сайтом настройки «ключ → значение»: медиа для /start,
+        # фискализация через НалоGo. Правка на сайте сразу действует в боте.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT,
+                updated_at BIGINT DEFAULT 0,
+                updated_by BIGINT
+            )
+        """)
+        # Очередь и журнал чеков «Мой налог» (см. раздел «ФИСКАЛИЗАЦИЯ»).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS naloggo_receipts (
+                id          BIGSERIAL PRIMARY KEY,
+                payment_id  TEXT UNIQUE,
+                user_id     BIGINT,
+                amount      NUMERIC DEFAULT 0,
+                name        TEXT,
+                status      TEXT DEFAULT 'pending',
+                receipt_id  TEXT,
+                receipt_url TEXT,
+                error       TEXT,
+                attempts    INTEGER DEFAULT 0,
+                source      TEXT DEFAULT 'bot',
+                created_at  BIGINT DEFAULT 0,
+                attempted_at BIGINT DEFAULT 0,
+                sent_at     BIGINT DEFAULT 0
+            )
+        """)
+        try:
+            await conn.execute("ALTER TABLE naloggo_receipts ADD COLUMN IF NOT EXISTS attempted_at BIGINT DEFAULT 0")
+        except Exception:
+            pass
         # Миграции на случай старой БД
         for col in [
             "remna_uuid TEXT", "created_at BIGINT DEFAULT 0",
@@ -1247,6 +1280,669 @@ async def calc_upgrade_price(extra_devices: int) -> int:
     return max(0, plan_diff + device_diff)
 
 # ─────────────────────────────────────────────
+#  ОБЩИЕ НАСТРОЙКИ С АДМИН-САЙТОМ (таблица bot_settings)
+#
+#  Простой справочник «ключ → значение», общий с сайтом: медиа приветствия
+#  /start и фискализация через НалоGo. Правка в любой панели действует сразу
+#  и в боте, и на сайте.
+# ─────────────────────────────────────────────
+async def get_bot_settings(keys=None) -> dict:
+    """Значения из bot_settings (все или только перечисленные ключи)."""
+    try:
+        async with pool.acquire() as conn:
+            if keys:
+                rows = await conn.fetch(
+                    "SELECT key, value FROM bot_settings WHERE key = ANY($1::text[])",
+                    list(keys),
+                )
+            else:
+                rows = await conn.fetch("SELECT key, value FROM bot_settings")
+        return {r["key"]: (r["value"] or "") for r in rows}
+    except Exception as e:
+        log.error("bot_settings read: %s", e)
+        return {}
+
+
+async def save_bot_settings(values: dict, admin_id: int | None = None) -> None:
+    """Записать значения в bot_settings."""
+    now = int(time.time())
+    try:
+        async with pool.acquire() as conn:
+            for key, value in (values or {}).items():
+                await conn.execute(
+                    "INSERT INTO bot_settings (key, value, updated_at, updated_by) "
+                    "VALUES ($1,$2,$3,$4) ON CONFLICT (key) DO UPDATE "
+                    "SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at, "
+                    "updated_by=EXCLUDED.updated_by",
+                    key, "" if value is None else str(value), now, admin_id,
+                )
+    except Exception as e:
+        log.error("bot_settings save: %s", e)
+
+
+def _setting_on(value) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on", "да")
+
+
+# ─────────────────────────────────────────────
+#  МЕДИА ДЛЯ /start
+#
+#  Админ загружает картинку, гифку или видео — в этом боте («Медиа /start» в
+#  панели) или на админ-сайте. Файл один раз уходит через Bot API, дальше
+#  хранится только его file_id, поэтому показ мгновенный.
+#
+#  Код зеркалит startmedia.py админ-сайта: бот разворачивается отдельным
+#  сервисом, где лежит только bot.py, поэтому общий модуль импортировать
+#  нельзя. Названия ключей обязаны совпадать со startmedia.py.
+# ─────────────────────────────────────────────
+SM_KEY_ENABLED = "start_media_enabled"
+SM_KEY_TYPE = "start_media_type"
+SM_KEY_FILE_ID = "start_media_file_id"
+SM_KEY_URL = "start_media_url"
+SM_KEY_CAPTION = "start_media_caption"
+SM_KEY_MODE = "start_media_mode"
+SM_KEY_FILE_NAME = "start_media_file_name"
+
+START_MEDIA_KEYS = (SM_KEY_ENABLED, SM_KEY_TYPE, SM_KEY_FILE_ID, SM_KEY_URL,
+                    SM_KEY_CAPTION, SM_KEY_MODE, SM_KEY_FILE_NAME)
+
+START_MEDIA_TYPES = {
+    "photo": "Фото",
+    "video": "Видео",
+    "animation": "GIF-анимация",
+    "document": "Файл",
+}
+START_MEDIA_MODES = {
+    "always": "При каждом /start",
+    "first": "Только при первом запуске",
+}
+START_MEDIA_MAX_CAPTION = 1024
+
+
+async def get_start_media() -> dict:
+    """Настройки приветственного медиа."""
+    data = await get_bot_settings(START_MEDIA_KEYS)
+    media_type = (data.get(SM_KEY_TYPE) or "photo").strip().lower()
+    if media_type not in START_MEDIA_TYPES:
+        media_type = "photo"
+    mode = (data.get(SM_KEY_MODE) or "always").strip().lower()
+    if mode not in START_MEDIA_MODES:
+        mode = "always"
+    return {
+        "enabled": _setting_on(data.get(SM_KEY_ENABLED)),
+        "type": media_type,
+        "file_id": (data.get(SM_KEY_FILE_ID) or "").strip(),
+        "url": (data.get(SM_KEY_URL) or "").strip(),
+        "caption": (data.get(SM_KEY_CAPTION) or "")[:START_MEDIA_MAX_CAPTION],
+        "mode": mode,
+    }
+
+
+def start_media_source(media: dict) -> str:
+    """Что отправлять: сохранённый file_id либо прямая ссылка."""
+    return ((media or {}).get("file_id") or (media or {}).get("url") or "").strip()
+
+
+async def send_start_media(chat_id: int, media: dict | None = None,
+                           is_new_user: bool = False, force: bool = False) -> bool:
+    """Показать приветственное медиа отдельным сообщением перед меню.
+
+    Отдельным сообщением — намеренно: меню профиля дальше живёт своей жизнью
+    (кнопки перерисовывают его текст), а подпись к фото/видео редактировать
+    так же нельзя.
+    """
+    media = media if media is not None else await get_start_media()
+    source = start_media_source(media)
+    if not source:
+        return False
+    if not force:
+        if not media.get("enabled"):
+            return False
+        if media.get("mode") == "first" and not is_new_user:
+            return False
+    caption = (media.get("caption") or "").strip() or None
+    kind = media.get("type") or "photo"
+    try:
+        if kind == "video":
+            await bot.send_video(chat_id=chat_id, video=source, caption=caption, parse_mode="HTML")
+        elif kind == "animation":
+            await bot.send_animation(chat_id=chat_id, animation=source, caption=caption, parse_mode="HTML")
+        elif kind == "document":
+            await bot.send_document(chat_id=chat_id, document=source, caption=caption, parse_mode="HTML")
+        else:
+            await bot.send_photo(chat_id=chat_id, photo=source, caption=caption, parse_mode="HTML")
+        return True
+    except Exception as e:
+        # Медиа не должно ломать /start: если file_id протух или ссылка
+        # недоступна — просто показываем меню без картинки.
+        log.error("start media send: %s", e)
+        return False
+
+
+def start_media_from_message(message: types.Message) -> tuple[str, str]:
+    """Тип и file_id из присланного админом сообщения ('' — медиа не найдено)."""
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    if message.animation:
+        return "animation", message.animation.file_id
+    if message.video:
+        return "video", message.video.file_id
+    if message.document:
+        return "document", message.document.file_id
+    return "", ""
+
+
+# ─────────────────────────────────────────────
+#  🧾 ФИСКАЛИЗАЦИЯ ЧЕРЕЗ НалоGo (для самозанятых)
+#
+#  После каждой успешной оплаты доход регистрируется в «Мой налог» (НалоGo)
+#  через API личного кабинета НПД — https://lknpd.nalog.ru/api/v1, — а
+#  покупателю уходит ссылка на чек. Настройки (ИНН, пароль, тексты) общие с
+#  админ-сайтом и лежат в bot_settings; журнал чеков — в naloggo_receipts.
+#
+#  Если ФНС недоступна, покупка всё равно активируется, а чек остаётся в
+#  очереди: его добьёт планировщик (раз в NALOGO_QUEUE_CHECK_INTERVAL секунд)
+#  или кнопка «Отправить очередь» в панели.
+#
+#  Код зеркалит naloggo.py админ-сайта (бот развёрнут отдельным сервисом и
+#  не может импортировать общий модуль). Ключи настроек и формат запросов
+#  обязаны совпадать с naloggo.py.
+# ─────────────────────────────────────────────
+NALOGO_API = "https://lknpd.nalog.ru/api/v1"
+NALOGO_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+# Прокси до lknpd.nalog.ru — нужен, если сервер вне РФ (ФНС пускает только
+# российские адреса).
+NALOGO_PROXY = (os.environ.get("NALOGO_PROXY") or "").strip()
+NALOGO_MAX_ATTEMPTS = 10
+NALOGO_QUEUE_INTERVAL = int(os.environ.get("NALOGO_QUEUE_CHECK_INTERVAL", "300"))
+NALOGO_QUEUE_DELAY = int(os.environ.get("NALOGO_QUEUE_RECEIPT_DELAY", "3"))
+NALOGO_STUCK_AFTER = 600  # через сколько секунд «зависший» чек берём заново
+
+NG_KEY_ENABLED = "naloggo_enabled"
+NG_KEY_INN = "naloggo_inn"
+NG_KEY_PASSWORD = "naloggo_password"
+NG_KEY_DEVICE_ID = "naloggo_device_id"
+NG_KEY_SERVICE_NAME = "naloggo_service_name"
+NG_KEY_AUTO = "naloggo_auto"
+NG_KEY_NOTIFY = "naloggo_notify_user"
+NG_KEY_TOKEN = "naloggo_token"
+NG_KEY_TOKEN_EXPIRE = "naloggo_token_expire"
+NG_KEY_REFRESH = "naloggo_refresh_token"
+NG_KEY_STATE_INN = "naloggo_state_inn"
+
+NALOGO_SETTINGS_KEYS = (NG_KEY_ENABLED, NG_KEY_INN, NG_KEY_PASSWORD, NG_KEY_DEVICE_ID,
+                        NG_KEY_SERVICE_NAME, NG_KEY_AUTO, NG_KEY_NOTIFY)
+NALOGO_STATE_KEYS = (NG_KEY_TOKEN, NG_KEY_TOKEN_EXPIRE, NG_KEY_REFRESH,
+                     NG_KEY_STATE_INN, NG_KEY_DEVICE_ID)
+
+NALOGO_DEFAULT_SERVICE_NAME = "Оплата услуг сервиса TrubaVPN — {item}"
+NALOGO_CANCEL_REASONS = {
+    "refund": "Возврат средств",
+    "mistake": "Чек сформирован ошибочно",
+}
+
+
+def naloggo_gen_device_id() -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(21))
+
+
+def naloggo_now_iso(shift_seconds: int = 0) -> str:
+    """Время в формате, который ждёт НПД: 2024-01-31T12:00:00+03:00."""
+    return (msk_now() + timedelta(seconds=shift_seconds)).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+
+
+async def naloggo_settings() -> dict:
+    """Настройки фискализации (база, затем значения окружения)."""
+    data = await get_bot_settings(NALOGO_SETTINGS_KEYS)
+
+    def _get(key, env_name):
+        value = (data.get(key) or "").strip()
+        return value or (os.environ.get(env_name, "") or "").strip()
+
+    return {
+        "enabled": _setting_on(data.get(NG_KEY_ENABLED) or os.environ.get("NALOGO_ENABLED")),
+        "inn": _get(NG_KEY_INN, "NALOGO_INN"),
+        "password": (data.get(NG_KEY_PASSWORD) or os.environ.get("NALOGO_PASSWORD", "")).strip(),
+        "device_id": _get(NG_KEY_DEVICE_ID, "NALOGO_DEVICE_ID"),
+        "service_name": (data.get(NG_KEY_SERVICE_NAME) or NALOGO_DEFAULT_SERVICE_NAME).strip(),
+        "auto": _setting_on(data.get(NG_KEY_AUTO)) if data.get(NG_KEY_AUTO) else True,
+        "notify_user": _setting_on(data.get(NG_KEY_NOTIFY)) if data.get(NG_KEY_NOTIFY) else True,
+    }
+
+
+async def naloggo_state() -> dict:
+    """Сохранённые токены НалоGo."""
+    data = await get_bot_settings(NALOGO_STATE_KEYS)
+    try:
+        expire = int(data.get(NG_KEY_TOKEN_EXPIRE) or 0)
+    except (TypeError, ValueError):
+        expire = 0
+    return {
+        "token": data.get(NG_KEY_TOKEN, ""),
+        "token_expire": expire,
+        "refresh_token": data.get(NG_KEY_REFRESH, ""),
+        "inn": data.get(NG_KEY_STATE_INN, ""),
+        "device_id": data.get(NG_KEY_DEVICE_ID, ""),
+    }
+
+
+async def naloggo_save_state(state: dict) -> None:
+    await save_bot_settings({
+        NG_KEY_TOKEN: state.get("token", "") or "",
+        NG_KEY_TOKEN_EXPIRE: str(int(state.get("token_expire") or 0)),
+        NG_KEY_REFRESH: state.get("refresh_token", "") or "",
+        NG_KEY_STATE_INN: state.get("inn", "") or "",
+        NG_KEY_DEVICE_ID: state.get("device_id", "") or "",
+    })
+
+
+def naloggo_configured(settings: dict) -> bool:
+    return bool((settings or {}).get("inn") and (settings or {}).get("password"))
+
+
+def naloggo_active(settings: dict) -> bool:
+    return bool((settings or {}).get("enabled")) and naloggo_configured(settings)
+
+
+def naloggo_service_name(settings: dict, item_name: str) -> str:
+    """Название услуги в чеке: {item} — название покупки."""
+    template = ((settings or {}).get("service_name") or NALOGO_DEFAULT_SERVICE_NAME).strip()
+    item = (item_name or "Оплата услуг").strip()
+    try:
+        name = template.format(item=item) if "{item}" in template else template
+    except Exception:
+        name = template
+    return (name or item)[:255]
+
+
+def naloggo_receipt_url(inn: str, receipt_id: str) -> str:
+    if not inn or not receipt_id:
+        return ""
+    return f"{NALOGO_API}/receipt/{inn}/{receipt_id}/print"
+
+
+def naloggo_device_info(state: dict) -> dict:
+    return {
+        "appVersion": "1.0.0",
+        "sourceDeviceId": (state or {}).get("device_id") or "",
+        "sourceType": "WEB",
+        "metaDetails": {"userAgent": NALOGO_USER_AGENT},
+    }
+
+
+def _naloggo_parse_expire(value) -> int:
+    text = str(value or "").strip()
+    if text:
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return int(datetime.fromisoformat(text).timestamp())
+        except Exception:
+            pass
+    return int(time.time()) + 3600
+
+
+def _naloggo_error(status: int, data) -> str:
+    if isinstance(data, dict):
+        message = data.get("message") or data.get("error") or data.get("code")
+        if message:
+            return f"{message} (HTTP {status})"
+    if isinstance(data, str) and data.strip():
+        return f"{data.strip()[:200]} (HTTP {status})"
+    return f"HTTP {status}"
+
+
+def _naloggo_client() -> httpx.AsyncClient:
+    """HTTP-клиент до ФНС (при необходимости — через прокси)."""
+    if NALOGO_PROXY:
+        try:
+            return httpx.AsyncClient(verify=True, timeout=30, proxy=NALOGO_PROXY)
+        except TypeError:  # httpx старых версий
+            return httpx.AsyncClient(verify=True, timeout=30, proxies=NALOGO_PROXY)
+    return httpx.AsyncClient(verify=True, timeout=30)
+
+
+async def naloggo_request(method: str, path: str, *, token: str = "",
+                          payload: dict | None = None) -> tuple[int, object]:
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": NALOGO_USER_AGENT,
+        "Referrer": "https://lknpd.nalog.ru/",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    async with _naloggo_client() as client:
+        r = await client.request(method, NALOGO_API + path, json=payload, headers=headers)
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, r.text
+
+
+async def naloggo_login(settings: dict, state: dict) -> tuple[dict, str]:
+    """Вход в «Мой налог» по ИНН и паролю."""
+    state = dict(state or {})
+    if not state.get("device_id"):
+        state["device_id"] = settings.get("device_id") or naloggo_gen_device_id()
+    payload = {
+        "username": settings.get("inn", ""),
+        "password": settings.get("password", ""),
+        "deviceInfo": naloggo_device_info(state),
+    }
+    try:
+        status, data = await naloggo_request("POST", "/auth/lkfl", payload=payload)
+    except Exception as e:
+        log.error("naloggo login: %s", e)
+        return state, f"Нет связи с НалоGo: {e}"
+    if status != 200 or not isinstance(data, dict) or not data.get("token"):
+        return state, _naloggo_error(status, data)
+    state["token"] = data.get("token", "")
+    state["refresh_token"] = data.get("refreshToken", "") or state.get("refresh_token", "")
+    state["token_expire"] = _naloggo_parse_expire(data.get("tokenExpireIn"))
+    state["inn"] = (data.get("profile") or {}).get("inn") or settings.get("inn", "")
+    return state, ""
+
+
+async def naloggo_refresh(settings: dict, state: dict) -> tuple[dict, str]:
+    """Продление токена по refreshToken."""
+    state = dict(state or {})
+    if not state.get("refresh_token"):
+        return state, "Нет refreshToken"
+    payload = {
+        "deviceInfo": naloggo_device_info(state),
+        "refreshToken": state.get("refresh_token", ""),
+    }
+    try:
+        status, data = await naloggo_request("POST", "/auth/token", payload=payload)
+    except Exception as e:
+        log.error("naloggo refresh: %s", e)
+        return state, f"Нет связи с НалоGo: {e}"
+    if status != 200 or not isinstance(data, dict) or not data.get("token"):
+        return state, _naloggo_error(status, data)
+    state["token"] = data.get("token", "")
+    if data.get("refreshToken"):
+        state["refresh_token"] = data["refreshToken"]
+    state["token_expire"] = _naloggo_parse_expire(data.get("tokenExpireIn"))
+    state["inn"] = state.get("inn") or settings.get("inn", "")
+    return state, ""
+
+
+async def naloggo_ensure_token(settings: dict, state: dict) -> tuple[dict, str]:
+    """Живой токен: кэш → продление → повторный вход по паролю."""
+    state = dict(state or {})
+    if not naloggo_configured(settings):
+        return state, "Не заданы ИНН и пароль от «Мой налог»"
+    if not state.get("device_id"):
+        state["device_id"] = settings.get("device_id") or naloggo_gen_device_id()
+    if state.get("inn") and settings.get("inn") and state["inn"] != settings["inn"]:
+        state.update({"token": "", "refresh_token": "", "token_expire": 0, "inn": ""})
+    if state.get("token") and int(state.get("token_expire") or 0) > int(time.time()) + 60:
+        return state, ""
+    if state.get("refresh_token"):
+        state, error = await naloggo_refresh(settings, state)
+        if not error:
+            return state, ""
+        log.info("naloggo: продлить токен не вышло (%s) — логинимся заново", error)
+    return await naloggo_login(settings, state)
+
+
+async def naloggo_register_income(settings: dict, state: dict, *, name: str,
+                                  amount, quantity: int = 1) -> dict:
+    """Пробить чек. Возвращает {ok, receipt_id, url, error, state}."""
+    result = {"ok": False, "receipt_id": "", "url": "", "error": "", "state": state or {}}
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        result["error"] = "Некорректная сумма"
+        return result
+    if amount <= 0:
+        result["error"] = "Сумма должна быть больше нуля"
+        return result
+    quantity = max(1, int(quantity or 1))
+
+    state, error = await naloggo_ensure_token(settings, state)
+    result["state"] = state
+    if error:
+        result["error"] = error
+        return result
+
+    payload = {
+        "paymentType": "CASH",
+        "ignoreMaxTotalIncomeRestriction": False,
+        "client": {
+            "contactPhone": None,
+            "displayName": None,
+            "inn": None,
+            "incomeType": "FROM_INDIVIDUAL",
+        },
+        "requestTime": naloggo_now_iso(),
+        "operationTime": naloggo_now_iso(),
+        "services": [{
+            "name": (name or "Оплата услуг")[:255],
+            "amount": amount,
+            "quantity": quantity,
+        }],
+        "totalAmount": str(round(amount * quantity, 2)),
+    }
+    try:
+        status, data = await naloggo_request("POST", "/income",
+                                             token=state.get("token", ""), payload=payload)
+    except Exception as e:
+        log.error("naloggo income: %s", e)
+        result["error"] = f"Нет связи с НалоGo: {e}"
+        return result
+
+    # Токен мог протухнуть раньше срока — один раз перелогиниваемся.
+    if status in (401, 403):
+        state.update({"token": "", "token_expire": 0})
+        state, error = await naloggo_ensure_token(settings, state)
+        result["state"] = state
+        if error:
+            result["error"] = error
+            return result
+        try:
+            status, data = await naloggo_request("POST", "/income",
+                                                 token=state.get("token", ""), payload=payload)
+        except Exception as e:
+            result["error"] = f"Нет связи с НалоGo: {e}"
+            return result
+
+    receipt_id = data.get("approvedReceiptUuid") if isinstance(data, dict) else None
+    if status != 200 or not receipt_id:
+        result["error"] = _naloggo_error(status, data)
+        return result
+    result["ok"] = True
+    result["receipt_id"] = receipt_id
+    result["url"] = naloggo_receipt_url(state.get("inn") or settings.get("inn"), receipt_id)
+    return result
+
+
+async def naloggo_cancel_income(settings: dict, state: dict, receipt_id: str,
+                                reason: str = "refund") -> dict:
+    """Аннулировать чек в «Мой налог»."""
+    result = {"ok": False, "error": "", "state": state or {}}
+    if not receipt_id:
+        result["error"] = "Не указан чек"
+        return result
+    state, error = await naloggo_ensure_token(settings, state)
+    result["state"] = state
+    if error:
+        result["error"] = error
+        return result
+    payload = {
+        "operationTime": naloggo_now_iso(),
+        "requestTime": naloggo_now_iso(),
+        "comment": NALOGO_CANCEL_REASONS.get(reason, NALOGO_CANCEL_REASONS["refund"]),
+        "receiptUuid": receipt_id,
+        "partnerCode": None,
+    }
+    try:
+        status, data = await naloggo_request("POST", "/cancel",
+                                             token=state.get("token", ""), payload=payload)
+    except Exception as e:
+        log.error("naloggo cancel: %s", e)
+        result["error"] = f"Нет связи с НалоGo: {e}"
+        return result
+    if status != 200:
+        result["error"] = _naloggo_error(status, data)
+        return result
+    result["ok"] = True
+    return result
+
+
+# ── Очередь чеков ─────────────────────────────────────────────────
+async def naloggo_enqueue(payment_id: str, user_id: int | None, amount,
+                          item_name: str, source: str = "bot") -> int | None:
+    """Поставить чек в очередь. Повторный payment_id игнорируется."""
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO naloggo_receipts (payment_id, user_id, amount, name, status, source, created_at) "
+                "VALUES ($1,$2,$3,$4,'pending',$5,$6) ON CONFLICT (payment_id) DO NOTHING RETURNING id",
+                payment_id, user_id, float(amount or 0), item_name, source, int(time.time()),
+            )
+        return row["id"] if row else None
+    except Exception as e:
+        log.error("naloggo enqueue: %s", e)
+        return None
+
+
+async def naloggo_send(row_id: int) -> dict:
+    """Пробить один чек из очереди."""
+    settings = await naloggo_settings()
+    if not naloggo_configured(settings):
+        return {"ok": False, "error": "Не заданы ИНН и пароль от «Мой налог»", "url": ""}
+
+    # Атомарно забираем чек себе: сайт и бот работают с одной очередью,
+    # так один и тот же доход не уйдёт в ФНС дважды.
+    now = int(time.time())
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE naloggo_receipts SET status='sending', attempts=COALESCE(attempts,0)+1, "
+            "attempted_at=$2 WHERE id=$1 AND (status IN ('pending','failed') "
+            "OR (status='sending' AND COALESCE(attempted_at,0) < $3)) RETURNING *",
+            row_id, now, now - NALOGO_STUCK_AFTER,
+        )
+    if not row:
+        existing = None
+        async with pool.acquire() as conn:
+            existing = await conn.fetchrow("SELECT status, receipt_url FROM naloggo_receipts WHERE id=$1", row_id)
+        if existing and existing["status"] == "sent":
+            return {"ok": True, "error": "", "url": existing["receipt_url"] or ""}
+        return {"ok": False, "error": "Чек уже обрабатывается", "url": ""}
+
+    result = await naloggo_register_income(
+        settings, await naloggo_state(),
+        name=naloggo_service_name(settings, row["name"]),
+        amount=row["amount"] or 0,
+    )
+    await naloggo_save_state(result.get("state") or {})
+
+    if result.get("ok"):
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE naloggo_receipts SET status='sent', receipt_id=$2, receipt_url=$3, "
+                "error='', sent_at=$4 WHERE id=$1",
+                row_id, result.get("receipt_id"), result.get("url"), int(time.time()),
+            )
+        if settings.get("notify_user") and row["user_id"]:
+            try:
+                await bot.send_message(
+                    row["user_id"],
+                    f"🧾 {hbold('Чек об оплате')}\n\n"
+                    f"{row['name'] or 'Покупка'} — {float(row['amount'] or 0):.0f} ₽\n\n"
+                    f"<a href=\"{result.get('url')}\">Открыть чек</a>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return {"ok": True, "error": "", "url": result.get("url") or ""}
+
+    attempts = int(row["attempts"] or 0) + 1
+    status = "failed" if attempts >= NALOGO_MAX_ATTEMPTS else "pending"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE naloggo_receipts SET status=$2, error=$3 WHERE id=$1",
+            row_id, status, (result.get("error") or "")[:500],
+        )
+    return {"ok": False, "error": result.get("error") or "Не удалось пробить чек", "url": ""}
+
+
+async def naloggo_process_queue(limit: int = 20, include_failed: bool = False) -> tuple[int, int]:
+    """Дослать зависшие чеки. Возвращает (успешно, ошибок).
+
+    ``include_failed`` — ручной запуск из панели: тогда берём и чеки,
+    исчерпавшие попытки, и работаем даже с выключенной автофискализацией.
+    """
+    settings = await naloggo_settings()
+    if not (naloggo_configured(settings) if include_failed else naloggo_active(settings)):
+        return 0, 0
+    now = int(time.time())
+    statuses = ["pending", "failed"] if include_failed else ["pending"]
+    attempts_limit = 10 ** 9 if include_failed else NALOGO_MAX_ATTEMPTS
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id FROM naloggo_receipts WHERE (status = ANY($1::text[]) "
+            "AND COALESCE(attempts,0) < $2) OR (status='sending' AND COALESCE(attempted_at,0) < $3) "
+            "ORDER BY created_at LIMIT $4",
+            statuses, attempts_limit, now - NALOGO_STUCK_AFTER, limit,
+        )
+    ok = bad = 0
+    for r in rows:
+        if (await naloggo_send(r["id"])).get("ok"):
+            ok += 1
+        else:
+            bad += 1
+        if NALOGO_QUEUE_DELAY > 0:
+            await asyncio.sleep(NALOGO_QUEUE_DELAY)
+    return ok, bad
+
+
+# Фоновые задачи держим в множестве: без ссылки сборщик мусора может убить
+# ещё не завершившуюся задачу.
+_background_tasks: set = set()
+
+
+def spawn_background(coro):
+    """Запустить корутину в фоне, не заставляя пользователя ждать."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def fiscalize_payment(payment_id: str, user_id: int, amount,
+                            item_name: str, source: str = "bot") -> None:
+    """Поставить чек в очередь сразу после оплаты и попытаться пробить."""
+    try:
+        settings = await naloggo_settings()
+        if not naloggo_active(settings) or float(amount or 0) <= 0:
+            return
+        row_id = await naloggo_enqueue(payment_id, user_id, amount, item_name, source)
+        if row_id and settings.get("auto"):
+            await naloggo_send(row_id)
+    except Exception as e:
+        log.error("fiscalize %s: %s", payment_id, e)
+
+
+async def naloggo_queue_scheduler():
+    """Фоновая дослать-очередь: чеки, не ушедшие с первого раза."""
+    while True:
+        await asyncio.sleep(max(60, NALOGO_QUEUE_INTERVAL))
+        try:
+            ok, bad = await naloggo_process_queue()
+            if ok or bad:
+                log.info("[НалоGo] очередь: пробито %d, ошибок %d", ok, bad)
+        except Exception as e:
+            log.error("naloggo_queue_scheduler: %s", e)
+
+
+# ─────────────────────────────────────────────
 #  КЛАВИАТУРЫ
 # ─────────────────────────────────────────────
 def sub_required_kb():
@@ -1458,6 +2154,11 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         else:
             await conn.execute("UPDATE users SET username=$1 WHERE user_id=$2",
                                message.from_user.username, u_id)
+
+    # Приветственное медиа (настраивается в админ-панели бота или на сайте) —
+    # отдельным сообщением перед меню: так экраны бота по-прежнему
+    # перерисовываются редактированием текста.
+    await send_start_media(u_id, is_new_user=not exists)
 
     if not await is_subscribed(u_id):
         await message.answer(
@@ -1939,6 +2640,10 @@ async def check_payment_cb(cb: CallbackQuery):
             )
 
         await notify_admins_sale(u_id, uname, item_name, days, price, is_trial)
+
+        # 🧾 Чек самозанятого в «Мой налог» (если фискализация включена).
+        # В фоне: ответ ФНС не должен задерживать экран «Оплата прошла успешно».
+        spawn_background(fiscalize_payment(pay_id, u_id, price, item_name))
 
         if referrer_id and not is_trial:
             await credit_referral(referrer_id, u_id, uname, item_name, price)
@@ -2514,6 +3219,8 @@ def admin_panel_kb(is_main: bool = False):
         [InlineKeyboardButton(text="Промокоды", callback_data="admin_promos"),
          InlineKeyboardButton(text="Опрос", callback_data="admin_survey")],
         [InlineKeyboardButton(text="Тарифы и скидки", callback_data="admin_pricing")],
+        [InlineKeyboardButton(text="Медиа /start", callback_data="admin_media"),
+         InlineKeyboardButton(text="Фискализация", callback_data="admin_fiscal")],
         [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals"),
          InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast_start")],
         [InlineKeyboardButton(text="Настройки", callback_data="admin_settings")],
@@ -3950,6 +4657,457 @@ async def admin_toggle_sale_notify_cb(cb: CallbackQuery):
     ]))
 
 # ─────────────────────────────────────────────
+#  МЕДИА ДЛЯ /start (управление из панели)
+# ─────────────────────────────────────────────
+class StartMediaState(StatesGroup):
+    waiting_media = State()
+    waiting_caption = State()
+
+
+@router.message(Command("cancel"), StartMediaState.waiting_media)
+@router.message(Command("cancel"), StartMediaState.waiting_caption)
+async def admin_media_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
+
+
+async def _start_media_screen() -> tuple[str, InlineKeyboardMarkup]:
+    media = await get_start_media()
+    source = start_media_source(media)
+    lines = [hbold("Медиа для /start"), ""]
+    if source:
+        lines.append(f"Тип: {START_MEDIA_TYPES.get(media['type'], media['type'])}")
+        lines.append("Источник: " + ("загруженный файл" if media["file_id"] else "ссылка"))
+        lines.append("Подпись: " + (hcode(media["caption"]) if media["caption"] else "—"))
+    else:
+        lines.append("Медиа не задано — /start приходит без картинки.")
+    lines.append(f"Когда показывать: {START_MEDIA_MODES.get(media['mode'], media['mode'])}")
+    lines.append("Состояние: " + ("включено" if media["enabled"] and source else "выключено"))
+    lines += ["", "Медиа приходит отдельным сообщением перед меню профиля. "
+                  "Те же настройки есть в админ-панели на сайте."]
+
+    other_mode = "first" if media["mode"] == "always" else "always"
+    rows = [
+        [InlineKeyboardButton(text="Загрузить медиа", callback_data="admin_media_upload")],
+        [InlineKeyboardButton(text="Изменить подпись", callback_data="admin_media_caption")],
+        [InlineKeyboardButton(text=f"Показывать: {START_MEDIA_MODES[other_mode]}",
+                              callback_data=f"admin_media_mode_{other_mode}")],
+    ]
+    if source:
+        rows.append([InlineKeyboardButton(
+            text="Выключить показ" if media["enabled"] else "Включить показ",
+            callback_data="admin_media_toggle")])
+        rows.append([InlineKeyboardButton(text="Предпросмотр", callback_data="admin_media_preview")])
+        rows.append([InlineKeyboardButton(text="Удалить медиа", callback_data="admin_media_delete")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="admin_panel")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_start_media_screen(cb: CallbackQuery):
+    text, kb = await _start_media_screen()
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_media")
+async def admin_media_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    await _show_start_media_screen(cb)
+
+
+@router.callback_query(F.data == "admin_media_upload")
+async def admin_media_upload_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.set_state(StartMediaState.waiting_media)
+    await cb.message.answer(
+        "Пришлите фото, GIF или видео — оно будет показываться при /start.\n\n"
+        "Подпись к самому сообщению можно не писать: её задаёт отдельная кнопка.",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(StartMediaState.waiting_media)
+async def admin_media_upload_handler(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    kind, file_id = start_media_from_message(message)
+    if not file_id:
+        await message.answer("Это не медиа. Пришлите фото, GIF, видео или файл.",
+                             reply_markup=cancel_kb())
+        return
+    await state.clear()
+    # Храним только file_id: бот отправит медиа повторно мгновенно.
+    await save_bot_settings({
+        SM_KEY_TYPE: kind,
+        SM_KEY_FILE_ID: file_id,
+        SM_KEY_URL: "",
+        SM_KEY_FILE_NAME: "",
+        SM_KEY_ENABLED: "1",
+    }, message.from_user.id)
+    text, kb = await _start_media_screen()
+    await message.answer(f"Медиа сохранено ({START_MEDIA_TYPES.get(kind, kind)}) и включено.\n\n{text}",
+                         parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_media_caption")
+async def admin_media_caption_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.set_state(StartMediaState.waiting_caption)
+    await cb.message.answer(
+        f"Пришлите подпись под медиа (до {START_MEDIA_MAX_CAPTION} символов).\n"
+        "Можно использовать HTML: <b>жирный</b>, <i>курсив</i>, <a href=\"...\">ссылка</a>.\n\n"
+        "Отправьте «-», чтобы убрать подпись.",
+        parse_mode="HTML", reply_markup=cancel_kb(),
+    )
+
+
+@router.message(StartMediaState.waiting_caption)
+async def admin_media_caption_handler(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if not message.text:
+        await message.answer("Пришлите подпись текстом.", reply_markup=cancel_kb())
+        return
+    # html_text сохраняет форматирование, которое админ применил в Telegram.
+    caption = (message.html_text or "").strip()
+    if caption == "-":
+        caption = ""
+    if len(caption) > START_MEDIA_MAX_CAPTION:
+        await message.answer(f"Слишком длинно: максимум {START_MEDIA_MAX_CAPTION} символов.",
+                             reply_markup=cancel_kb())
+        return
+    await state.clear()
+    await save_bot_settings({SM_KEY_CAPTION: caption}, message.from_user.id)
+    text, kb = await _start_media_screen()
+    await message.answer(("Подпись обновлена.\n\n" if caption else "Подпись убрана.\n\n") + text,
+                         parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("admin_media_mode_"))
+async def admin_media_mode_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    mode = cb.data.removeprefix("admin_media_mode_")
+    if mode not in START_MEDIA_MODES:
+        return
+    await save_bot_settings({SM_KEY_MODE: mode}, cb.from_user.id)
+    await _show_start_media_screen(cb)
+
+
+@router.callback_query(F.data == "admin_media_toggle")
+async def admin_media_toggle_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    media = await get_start_media()
+    await save_bot_settings({SM_KEY_ENABLED: "0" if media["enabled"] else "1"}, cb.from_user.id)
+    await _show_start_media_screen(cb)
+
+
+@router.callback_query(F.data == "admin_media_preview")
+async def admin_media_preview_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await safe_answer(cb)
+        return
+    if await send_start_media(cb.from_user.id, force=True):
+        await safe_answer(cb, "Отправил — так медиа увидит пользователь.")
+    else:
+        await safe_answer(cb, "Не удалось отправить медиа — проверьте файл или ссылку.",
+                          show_alert=True)
+
+
+@router.callback_query(F.data == "admin_media_delete")
+async def admin_media_delete_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await save_bot_settings({
+        SM_KEY_ENABLED: "0", SM_KEY_FILE_ID: "", SM_KEY_URL: "", SM_KEY_FILE_NAME: "",
+    }, cb.from_user.id)
+    await _show_start_media_screen(cb)
+
+
+# ─────────────────────────────────────────────
+#  🧾 ФИСКАЛИЗАЦИЯ (управление из панели)
+# ─────────────────────────────────────────────
+class FiscalState(StatesGroup):
+    waiting_inn = State()
+    waiting_password = State()
+    waiting_service = State()
+
+
+@router.message(Command("cancel"), FiscalState.waiting_inn)
+@router.message(Command("cancel"), FiscalState.waiting_password)
+@router.message(Command("cancel"), FiscalState.waiting_service)
+async def admin_fiscal_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.")
+
+
+async def _fiscal_screen() -> tuple[str, InlineKeyboardMarkup]:
+    settings = await naloggo_settings()
+    state = await naloggo_state()
+    month_start = int(msk_now().replace(day=1, hour=0, minute=0, second=0,
+                                        microsecond=0).timestamp())
+    async with pool.acquire() as conn:
+        stats = await conn.fetchrow(
+            "SELECT COUNT(*) FILTER (WHERE status='sent') AS sent, "
+            "       COUNT(*) FILTER (WHERE status IN ('pending','sending')) AS pending, "
+            "       COUNT(*) FILTER (WHERE status='failed') AS failed, "
+            "       COALESCE(SUM(amount) FILTER (WHERE status='sent' AND created_at>=$1),0) AS month_sum "
+            "FROM naloggo_receipts",
+            month_start,
+        )
+    lines = [f"🧾 {hbold('Фискализация через НалоGo')}", ""]
+    lines.append("Состояние: " + ("включена" if naloggo_active(settings)
+                                  else ("не настроена" if not naloggo_configured(settings)
+                                        else "выключена")))
+    lines.append(f"ИНН: {settings['inn'] or '—'}")
+    lines.append("Пароль: " + ("сохранён" if settings["password"] else "не задан"))
+    lines.append("Услуга в чеке: " + hcode(settings["service_name"]))
+    expire = int(state.get("token_expire") or 0)
+    lines.append("Вход в НалоGo: " + (f"действует до {fmt_dt(expire)}" if expire else "не выполнялся"))
+    lines += ["",
+              f"Пробито чеков: {stats['sent']}",
+              f"В очереди: {stats['pending']}",
+              f"С ошибкой: {stats['failed']}",
+              f"Доход за месяц по чекам: {float(stats['month_sum'] or 0):.0f} ₽",
+              "",
+              "Чек уходит в «Мой налог» после каждой успешной оплаты. Если ФНС "
+              "недоступна, покупка всё равно активируется, а чек остаётся в "
+              "очереди и отправляется позже."]
+    rows = [
+        [InlineKeyboardButton(
+            text="Выключить фискализацию" if settings["enabled"] else "Включить фискализацию",
+            callback_data="admin_fiscal_toggle")],
+        [InlineKeyboardButton(text="Указать ИНН и пароль", callback_data="admin_fiscal_login")],
+        [InlineKeyboardButton(text="Название услуги", callback_data="admin_fiscal_service")],
+        [InlineKeyboardButton(text="Проверить связь с НалоGo", callback_data="admin_fiscal_check")],
+        [InlineKeyboardButton(text="Отправить очередь", callback_data="admin_fiscal_queue")],
+        [InlineKeyboardButton(text="Последние чеки", callback_data="admin_fiscal_list")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_fiscal_screen(cb: CallbackQuery):
+    text, kb = await _fiscal_screen()
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_fiscal")
+async def admin_fiscal_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    await _show_fiscal_screen(cb)
+
+
+@router.callback_query(F.data == "admin_fiscal_toggle")
+async def admin_fiscal_toggle_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await safe_answer(cb)
+        return
+    settings = await naloggo_settings()
+    if not settings["enabled"] and not naloggo_configured(settings):
+        await safe_answer(cb, "Сначала укажите ИНН и пароль от «Мой налог».", show_alert=True)
+        return
+    await safe_answer(cb)
+    await save_bot_settings({NG_KEY_ENABLED: "0" if settings["enabled"] else "1"}, cb.from_user.id)
+    await _show_fiscal_screen(cb)
+
+
+@router.callback_query(F.data == "admin_fiscal_login")
+async def admin_fiscal_login_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.set_state(FiscalState.waiting_inn)
+    await cb.message.answer(
+        "Введите ИНН самозанятого (12 цифр) — тот, что указан в приложении «Мой налог».",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(FiscalState.waiting_inn)
+async def admin_fiscal_inn_handler(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    inn = (message.text or "").strip()
+    if not (inn.isdigit() and len(inn) == 12):
+        await message.answer("ИНН — это ровно 12 цифр. Попробуйте ещё раз.",
+                             reply_markup=cancel_kb())
+        return
+    await state.update_data(inn=inn)
+    await state.set_state(FiscalState.waiting_password)
+    await message.answer(
+        "Теперь пришлите пароль от личного кабинета lknpd.nalog.ru.\n\n"
+        "Сообщение с паролем я удалю сразу после сохранения.",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(FiscalState.waiting_password)
+async def admin_fiscal_password_handler(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    password = (message.text or "").strip()
+    data = await state.get_data()
+    inn = data.get("inn", "")
+    await state.clear()
+    # Пароль не должен оставаться в переписке.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not password:
+        await message.answer("Пустой пароль — настройка отменена.")
+        return
+    settings = await naloggo_settings()
+    await save_bot_settings({
+        NG_KEY_INN: inn,
+        NG_KEY_PASSWORD: password,
+        NG_KEY_DEVICE_ID: settings["device_id"] or naloggo_gen_device_id(),
+        # Новые данные входа — старые токены больше не годятся.
+        NG_KEY_TOKEN: "", NG_KEY_TOKEN_EXPIRE: "0",
+        NG_KEY_REFRESH: "", NG_KEY_STATE_INN: "",
+    }, message.from_user.id)
+
+    settings = await naloggo_settings()
+    new_state, error = await naloggo_ensure_token(settings, await naloggo_state())
+    await naloggo_save_state(new_state)
+    if error:
+        await message.answer(f"Данные сохранены, но войти в НалоGo не удалось:\n{error}")
+    else:
+        await message.answer("Данные сохранены, вход в НалоGo выполнен.")
+    text, kb = await _fiscal_screen()
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_fiscal_service")
+async def admin_fiscal_service_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.set_state(FiscalState.waiting_service)
+    await cb.message.answer(
+        "Пришлите название услуги для чека.\n\n"
+        "Подстановка {item} заменяется названием покупки, например:\n"
+        f"{hcode(NALOGO_DEFAULT_SERVICE_NAME)}",
+        parse_mode="HTML", reply_markup=cancel_kb(),
+    )
+
+
+@router.message(FiscalState.waiting_service)
+async def admin_fiscal_service_handler(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Название не может быть пустым.", reply_markup=cancel_kb())
+        return
+    await state.clear()
+    await save_bot_settings({NG_KEY_SERVICE_NAME: name[:255]}, message.from_user.id)
+    text, kb = await _fiscal_screen()
+    await message.answer("Название услуги обновлено.\n\n" + text,
+                         parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_fiscal_check")
+async def admin_fiscal_check_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await safe_answer(cb)
+        return
+    settings = await naloggo_settings()
+    if not naloggo_configured(settings):
+        await safe_answer(cb, "Сначала укажите ИНН и пароль от «Мой налог».", show_alert=True)
+        return
+    await safe_answer(cb, "Проверяю связь с НалоGo...")
+    state, error = await naloggo_ensure_token(settings, await naloggo_state())
+    await naloggo_save_state(state)
+    if error:
+        await cb.message.answer(f"НалоGo недоступен:\n{error}")
+    else:
+        await cb.message.answer(
+            f"НалоGo на связи. ИНН {state.get('inn') or '—'}, "
+            f"токен до {fmt_dt(int(state.get('token_expire') or 0))}."
+        )
+    await _show_fiscal_screen(cb)
+
+
+async def _run_fiscal_queue(admin_id: int) -> None:
+    """Отправка очереди в фоне: ФНС может отвечать минутами."""
+    try:
+        ok, bad = await naloggo_process_queue(limit=30, include_failed=True)
+        await bot.send_message(
+            admin_id,
+            f"Очередь чеков: пробито {ok}, не удалось {bad}."
+            if (ok or bad) else "Очередь пуста — все чеки пробиты.",
+        )
+    except Exception as e:
+        log.error("fiscal queue run: %s", e)
+        try:
+            await bot.send_message(admin_id, f"Не удалось отправить очередь чеков: {e}")
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data == "admin_fiscal_queue")
+async def admin_fiscal_queue_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await safe_answer(cb)
+        return
+    await safe_answer(cb, "Отправляю очередь чеков — пришлю результат.")
+    spawn_background(_run_fiscal_queue(cb.from_user.id))
+
+
+@router.callback_query(F.data == "admin_fiscal_list")
+async def admin_fiscal_list_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT r.*, u.username FROM naloggo_receipts r "
+            "LEFT JOIN users u ON u.user_id = r.user_id "
+            "ORDER BY r.created_at DESC LIMIT 10"
+        )
+    labels = {"sent": "пробит", "pending": "в очереди", "sending": "отправляется",
+              "failed": "ошибка", "canceled": "аннулирован"}
+    lines = [hbold("Последние чеки"), ""]
+    for r in rows:
+        who = f"@{r['username']}" if r["username"] else (str(r["user_id"]) if r["user_id"] else "—")
+        line = (f"{fmt_dt(r['created_at'], '%d.%m %H:%M')} · {who} · "
+                f"{float(r['amount'] or 0):.0f} ₽ — {labels.get(r['status'], r['status'])}")
+        if r["receipt_url"]:
+            line += f'\n<a href="{r["receipt_url"]}">чек</a>'
+        elif r["error"]:
+            line += f"\n{hcode(r['error'][:120])}"
+        lines.append(line)
+    if not rows:
+        lines.append("Чеков пока нет.")
+    await cb.message.answer("\n".join(lines), parse_mode="HTML",
+                            disable_web_page_preview=True,
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="Назад", callback_data="admin_fiscal")],
+                            ]))
+
+
+# ─────────────────────────────────────────────
 #  ТАРИФЫ И СКИДКИ (редактирование цен из бота)
 # ─────────────────────────────────────────────
 async def _pricing_screen():
@@ -4727,6 +5885,7 @@ async def main():
     asyncio.create_task(daily_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
     asyncio.create_task(expiry_reminder_scheduler())
+    asyncio.create_task(naloggo_queue_scheduler())
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
