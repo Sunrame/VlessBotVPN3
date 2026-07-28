@@ -36,6 +36,8 @@ _PLAN_BY_CODE = {code: key for key, code in _PLAN_CODES.items()}
 
 # Замены в названии позиции. Порядок важен: сначала длинные фразы.
 _YK_ITEM_REPLACES = (
+    ("TrubaVPN",                    "Интернет-Сервис"),
+    ("Truba VPN",                   "Интернет-Сервис"),
     ("VPN с обходом белых списков", "«Расширенный»"),
     ("VPN с обходом",               "«Расширенный»"),
     ("обхода белых списков",        "расширенного доступа"),
@@ -1624,7 +1626,9 @@ NALOGO_SETTINGS_KEYS = (NG_KEY_ENABLED, NG_KEY_INN, NG_KEY_PASSWORD, NG_KEY_DEVI
 NALOGO_STATE_KEYS = (NG_KEY_TOKEN, NG_KEY_TOKEN_EXPIRE, NG_KEY_REFRESH,
                      NG_KEY_STATE_INN, NG_KEY_DEVICE_ID)
 
-NALOGO_DEFAULT_SERVICE_NAME = "Оплата услуг сервиса TrubaVPN — {item}"
+# Название услуги в чеке. {item} — то же, что видит ЮKassa:
+# «Интернет-Сервис. Пополнение баланса на N рублей».
+NALOGO_DEFAULT_SERVICE_NAME = "{item}"
 NALOGO_CANCEL_REASONS = {
     "refund": "Возврат средств",
     "mistake": "Чек сформирован ошибочно",
@@ -1694,15 +1698,20 @@ def naloggo_active(settings: dict) -> bool:
     return bool((settings or {}).get("enabled")) and naloggo_configured(settings)
 
 
-def naloggo_service_name(settings: dict, item_name: str) -> str:
-    """Название услуги в чеке: {item} — название покупки."""
+def naloggo_service_name(settings: dict, item_name: str, amount=0) -> str:
+    """Название услуги в чеке — то же, что уходит в ЮKassa.
+
+    {item} в шаблоне = «Интернет-Сервис. Пополнение баланса на N рублей».
+    Название позиции (item_name) в чек не попадает; итог всё равно
+    прогоняется через замены, чтобы в чеке не осталось VPN.
+    """
+    item = _yookassa_description(amount)
     template = ((settings or {}).get("service_name") or NALOGO_DEFAULT_SERVICE_NAME).strip()
-    item = (item_name or "Оплата услуг").strip()
     try:
         name = template.format(item=item) if "{item}" in template else template
     except Exception:
         name = template
-    return (name or item)[:255]
+    return _yookassa_item(name or item)[:255]
 
 
 def naloggo_receipt_url(inn: str, receipt_id: str) -> str:
@@ -1984,7 +1993,7 @@ async def naloggo_send(row_id: int) -> dict:
 
     result = await naloggo_register_income(
         settings, await naloggo_state(),
-        name=naloggo_service_name(settings, row["name"]),
+        name=naloggo_service_name(settings, row["name"], row["amount"] or 0),
         amount=row["amount"] or 0,
     )
     await naloggo_save_state(result.get("state") or {})
@@ -5156,8 +5165,9 @@ async def admin_fiscal_service_cb(cb: CallbackQuery, state: FSMContext):
     await state.set_state(FiscalState.waiting_service)
     await cb.message.answer(
         "Пришлите название услуги для чека.\n\n"
-        "Подстановка {item} заменяется названием покупки, например:\n"
-        f"{hcode(NALOGO_DEFAULT_SERVICE_NAME)}",
+        "Подстановка {item} заменяется тем же текстом, что видит ЮKassa "
+        "(«Интернет-Сервис. Пополнение баланса на 199 рублей»). "
+        f"По умолчанию:\n{hcode(NALOGO_DEFAULT_SERVICE_NAME)}",
         parse_mode="HTML", reply_markup=cancel_kb(),
     )
 
@@ -5850,9 +5860,11 @@ async def send_daily_report():
         async with pool.acquire() as conn:
             new_users  = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at>=$1", day_start) or 0
             pay_rows   = await conn.fetch("SELECT is_trial, amount FROM payments WHERE created_at>=$1", day_start)
+            # Триал — такая же покупка: попадает и в оплаты, и в поступления.
+            # Выдачи админом и промо идут с amount=0, поэтому продажей не считаются.
             new_trials = sum(1 for p in pay_rows if p["is_trial"])
-            new_paid   = sum(1 for p in pay_rows if not p["is_trial"])
-            revenue    = sum(float(p["amount"]) for p in pay_rows if not p["is_trial"])
+            new_paid   = sum(1 for p in pay_rows if float(p["amount"] or 0) > 0)
+            revenue    = sum(float(p["amount"] or 0) for p in pay_rows)
             total_paid = await conn.fetchval("SELECT COUNT(*) FROM users WHERE has_paid=1") or 0
         all_users = await remna_get_all_users()
         our    = [u for u in all_users if u.get("username", "").startswith("truba_")]
