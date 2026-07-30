@@ -255,14 +255,14 @@ EMOJI_INVITE        = premium_emoji("5264713049637409446", "\U0001f465")  # "П�
 # ─────────────────────────────────────────────
 TRIAL = {
     "name":         "Пробная подписка",
-    "price":        10,
+    "price":        0,
     "days":         1,
     "hwid":         1,
     "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
     "whitelist_gb": 3,
     "desc": (
-        "24 часа доступа ко всем серверам. Трафик VPN не ограничен, трафик "
-        "на обход белых списков ограничен 3 ГБ. Лимит устройств — 1."
+        "Бесплатно. 24 часа доступа ко всем серверам. Трафик VPN не ограничен, "
+        "трафик на обход белых списков ограничен 3 ГБ. Лимит устройств — 1."
     ),
 }
 
@@ -559,6 +559,10 @@ class AdminGiveState(StatesGroup):
 class AdminFindState(StatesGroup):
     waiting_query = State()
 
+class AdminRefPercentState(StatesGroup):
+    waiting_username = State()
+    waiting_percent  = State()
+
 class SurveyState(StatesGroup):
     waiting_comment = State()
 
@@ -629,7 +633,8 @@ async def init_db():
                 plan             TEXT DEFAULT NULL,
                 extra_devices    INTEGER DEFAULT 0,
                 trial_used       BOOLEAN DEFAULT FALSE,
-                referral_balance NUMERIC DEFAULT 0
+                referral_balance NUMERIC DEFAULT 0,
+                referral_percent INTEGER
             )
         """)
         await conn.execute("""
@@ -781,6 +786,7 @@ async def init_db():
             "remna_uuid TEXT", "created_at BIGINT DEFAULT 0",
             "plan TEXT DEFAULT NULL", "extra_devices INTEGER DEFAULT 0",
             "trial_used BOOLEAN DEFAULT FALSE", "referral_balance NUMERIC DEFAULT 0",
+            "referral_percent INTEGER",
         ]:
             try:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
@@ -1206,12 +1212,20 @@ async def notify_admins_sale(u_id: int, username: str | None, item_name: str,
 async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str | None,
                            item_name: str, price: float):
     """
-    Начисление рефереру REFERRAL_PERCENT% от суммы оплаты приглашённого друга.
+    Начисление рефереру процента от суммы оплаты приглашённого друга.
+    Процент — персональный (users.referral_percent, задаёт админ через
+    панель «Рефералы» → «Назначить % партнёру»), если не задан — стандартный
+    REFERRAL_PERCENT.
     ДОПУЩЕНИЕ (не было явно уточнено в ТЗ): начисление идёт с КАЖДОЙ оплаты
     приглашённого, а не только с первой. Если нужно только с первой покупки —
     легко поменять на условие has_paid==0, скажи и поправлю.
     """
-    earned = round(float(price) * REFERRAL_PERCENT / 100, 2)
+    async with pool.acquire() as conn:
+        custom = await conn.fetchval(
+            "SELECT referral_percent FROM users WHERE user_id=$1", referrer_id
+        )
+    percent = max(1, min(100, int(custom))) if custom else REFERRAL_PERCENT
+    earned = round(float(price) * percent / 100, 2)
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET referral_balance = referral_balance + $1 WHERE user_id=$2",
@@ -1225,9 +1239,28 @@ async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str |
         await bot.send_message(
             referrer_id,
             f"Ваш реферал {buyer_label} оплатил «{item_name}» на {price:.0f} руб.\n"
-            f"Начислено {REFERRAL_PERCENT}%: {earned:.2f} руб.\n"
+            f"Начислено {percent}%: {earned:.2f} руб.\n"
             f"Текущий баланс: {float(new_balance):.2f} руб.",
         )
+    except Exception:
+        pass
+
+async def send_channel_instructions(chat_id: int):
+    """Отправляется после активации подписки (триал или покупка тарифа):
+    инструкция по подключению лежит в закрепе канала, поэтому просим
+    подписаться именно здесь, а не на входе в бота."""
+    text = (
+        f"{hbold('Как подключиться')}\n\n"
+        f"Пошаговая инструкция по подключению VPN находится в закреплённом "
+        f"сообщении нашего Telegram-канала.\n\n"
+        f"Подпишитесь, чтобы не потерять инструкцию — там же публикуются "
+        f"новости о новых серверах, акции и технические уведомления."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Канал с инструкциями", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
+    ])
+    try:
+        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
 
@@ -2100,12 +2133,6 @@ async def naloggo_queue_scheduler():
 # ─────────────────────────────────────────────
 #  КЛАВИАТУРЫ
 # ─────────────────────────────────────────────
-def sub_required_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Подписаться на канал", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
-        [btn("Я подписался", emoji_id=BTN_ICON_CHECK_SUB, callback_data="check_sub")],
-    ])
-
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="back")]
@@ -2191,16 +2218,15 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         return True
 
     if head == "trial":
-        async with pool.acquire() as conn:
-            used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", u_id)
-        if used:
-            await message.answer("Пробная подписка уже использована.")
+        # Пробная теперь бесплатная — активируем сразу, без экрана оплаты.
+        error = await _activate_free_trial(u_id, message.from_user.username)
+        if error:
+            await message.answer(error)
             return True
-        await _create_payment_page_from_message(
-            message, kind="trial", item_name=TRIAL["name"], price=TRIAL["price"],
-            days=TRIAL["days"], hwid=TRIAL["hwid"], squad=TRIAL["squad"],
-            whitelist_gb=TRIAL["whitelist_gb"], is_trial=True,
-        )
+        text, kb = await _build_profile_view(u_id)
+        await message.answer(f"Пробная подписка активирована на 24 часа.\n\n{text}",
+                             parse_mode="HTML", reply_markup=kb)
+        await send_channel_instructions(u_id)
         return True
 
     if head in ("dev", "devices"):
@@ -2315,13 +2341,9 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     # сообщение. Дальше экраны перерисовываются правкой подписи (edit_screen).
     is_new_user = not exists
 
-    if not await is_subscribed(u_id):
-        await answer_start_screen(
-            message,
-            f"{EMOJI_TRUBAVPN} {hbold('TrubaVPN')}\n\nПодпишитесь на канал, чтобы пользоваться ботом.",
-            sub_required_kb(), is_new_user=is_new_user,
-        )
-        return
+    # Проверки подписки на канал при входе больше НЕТ: меню открывается сразу.
+    # Приглашение подписаться (инструкция по подключению — в закрепе канала)
+    # уходит после активации подписки, см. send_channel_instructions.
 
     # Переброс из личного кабинета в конкретный раздел оплаты.
     if section:
@@ -2331,15 +2353,6 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 
     text, kb = await _build_profile_view(u_id)
     await answer_start_screen(message, text, kb, is_new_user=is_new_user)
-
-@router.callback_query(F.data == "check_sub")
-async def check_sub_cb(cb: CallbackQuery):
-    await safe_answer(cb)
-    if not await is_subscribed(cb.from_user.id):
-        await safe_answer(cb, "Вы ещё не подписаны.", show_alert=True)
-        return
-    text, kb = await _build_profile_view(cb.from_user.id)
-    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
 
 def get_cabinet_webapp_url() -> str | None:
     """URL мини-приложения личного кабинета для кнопки-WebApp.
@@ -2366,11 +2379,13 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """
     async with pool.acquire() as conn:
         db_row = await conn.fetchrow(
-            "SELECT plan, extra_devices, trial_used, referral_balance FROM users WHERE user_id=$1",
+            "SELECT plan, extra_devices, trial_used, referral_balance, has_paid "
+            "FROM users WHERE user_id=$1",
             user_id,
         )
     plan          = db_row["plan"] if db_row else None
     trial_used    = db_row["trial_used"] if db_row else False
+    has_paid      = db_row["has_paid"] if db_row else 0
     remna = await remna_get_user(user_id)
     now   = int(time.time())
 
@@ -2450,17 +2465,16 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if user_is_admin:
             rows.append([btn("Админ-сайт", emoji_id=BTN_ICON_ADMIN, url=admin_site_url)])
 
-    # Кнопка «Пробная подписка» показывается только если подписка не активна
-    # и пробный период ещё не использован.
-    show_trial = (not subscription_active or plan not in PLANS) and not trial_used
+    # Кнопка «Пробная подписка» показывается только если:
+    #  • подписка сейчас не активна,
+    #  • пробный период ещё не использован,
+    #  • пользователь ни разу не платил (после любой активации/оплаты
+    #    возможность получить пробную пропадает навсегда).
+    show_trial = (not subscription_active) and (not trial_used) and (not has_paid)
 
     # Расположение кнопки «Личный кабинет»:
-    #     пробная подписка УЖЕ использована (trial_used) → ЛК стоит выше всех
-    #    остальных кнопок;
-    #  • пробная подписка ещё НЕ использована → ЛК стоит сразу под кнопкой
-    #    «Пробная подписка».
-    # «Личный кабинет» стоит выше всех кнопок, КРОМЕ случая, когда показывается
-    # кнопка «Пробная подписка» — тогда ЛК ставится сразу под ней (ниже).
+    #  • пробная подписка недоступна → ЛК стоит выше всех остальных кнопок;
+    #  • пробная подписка доступна → ЛК стоит сразу под кнопкой «Пробная».
     if not show_trial:
         _place_cabinet()
 
@@ -2470,13 +2484,11 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     # значение plan осталось в БД после отзыва подписки ("Забрать подписку") —
     # без этого кнопки "Добавить устройства"/"Улучшить тариф" продолжали бы
     # показываться, хотя подписки уже нет.
+    # Кнопки «Продлить подписку» в главном меню больше нет — продление идёт
+    # через покупку тарифа (оплата продлевает текущую подписку) и через
+    # напоминания об окончании (см. _renew_kb / renew_open).
     if not subscription_active or plan not in PLANS:
-        # Если платный тариф уже был выбран, его можно продлить даже после
-        # окончания срока — оплата снова активирует ту же подписку.
-        if plan in PLANS:
-            rows.append([btn("Продлить подписку", emoji_id=BTN_ICON_PAY,
-                             style="success", callback_data="renew_open")])
-        if not trial_used:
+        if show_trial:
             rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
                              callback_data="trial_buy")])
             # ЛК (и ссылка на админ-сайт для админов) — сразу под пробной подпиской
@@ -2484,8 +2496,6 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                          callback_data="buy_open")])
     else:
-        rows.append([btn("Продлить подписку", emoji_id=BTN_ICON_PAY,
-                         style="success", callback_data="renew_open")])
         rows.append([btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
                          callback_data="dev_add")])
         if plan == "vpn":
@@ -2810,23 +2820,58 @@ async def check_payment_cb(cb: CallbackQuery):
     await edit_screen(cb.message,
         f"Оплата прошла успешно.\n\n{text}", parse_mode="HTML", reply_markup=kb,
     )
+    # Инструкция по подключению — в закрепе канала: зовём подписаться именно
+    # после покупки тарифа (для докупки устройств/трафика — не нужно, у
+    # человека уже всё подключено).
+    if not already_processed and kind in ("trial", "plan"):
+        await send_channel_instructions(u_id)
 
 # ─────────────────────────────────────────────
-#  ПРОБНАЯ ПОДПИСКА
+#  ПРОБНАЯ ПОДПИСКА (бесплатная, активируется в один тап)
 # ─────────────────────────────────────────────
+async def _activate_free_trial(u_id: int, username: str | None) -> str | None:
+    """Активирует бесплатный триал. None — успех, иначе текст ошибки.
+    Атомарный UPDATE с условиями trial_used=FALSE и has_paid=0 защищает от
+    двойного тапа и от повторной выдачи после любой оплаты/активации."""
+    async with pool.acquire() as conn:
+        claimed = await conn.fetchval(
+            "UPDATE users SET trial_used=TRUE "
+            "WHERE user_id=$1 AND trial_used=FALSE AND has_paid=0 "
+            "RETURNING user_id", u_id,
+        )
+    if not claimed:
+        return "Пробная подписка недоступна."
+    user = await activate_subscription(u_id, TRIAL["days"], TRIAL["hwid"],
+                                       squad_uuid=TRIAL["squad"],
+                                       whitelist_gb=TRIAL["whitelist_gb"])
+    if not user:
+        # Откатываем флаг, чтобы человек мог попробовать ещё раз.
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE users SET trial_used=FALSE WHERE user_id=$1", u_id)
+        return "Ошибка активации. Попробуйте позже."
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE users SET plan='trial' WHERE user_id=$1", u_id)
+        await conn.execute(
+            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, created_at) "
+            "VALUES ($1,0,'trial',$2,TRUE,'trial',$3)",
+            u_id, TRIAL["days"], int(time.time()),
+        )
+    await notify_admins_sale(u_id, username, TRIAL["name"], TRIAL["days"], 0, True)
+    return None
+
 @router.callback_query(F.data == "trial_buy")
 async def trial_buy_cb(cb: CallbackQuery):
     await safe_answer(cb)
-    async with pool.acquire() as conn:
-        used = await conn.fetchval("SELECT trial_used FROM users WHERE user_id=$1", cb.from_user.id)
-    if used:
-        await safe_answer(cb, "Пробная подписка уже использована.", show_alert=True)
+    error = await _activate_free_trial(cb.from_user.id, cb.from_user.username)
+    if error:
+        await safe_answer(cb, error, show_alert=True)
         return
-    await _create_payment_page(
-        cb, kind="trial", item_name=TRIAL["name"], price=TRIAL["price"], days=TRIAL["days"],
-        hwid=TRIAL["hwid"], squad=TRIAL["squad"], whitelist_gb=TRIAL["whitelist_gb"], is_trial=True,
-        extra_desc=TRIAL["desc"],
+    text, kb = await _build_profile_view(cb.from_user.id)
+    await edit_screen(cb.message,
+        f"Пробная подписка активирована на 24 часа.\n\n{text}",
+        parse_mode="HTML", reply_markup=kb,
     )
+    await send_channel_instructions(cb.from_user.id)
 
 # ───────────   ─────────────────────────────────
 #  КУПИТЬ VPN — выбор тарифа, затем срока
@@ -3054,11 +3099,13 @@ async def earn_open_cb(cb: CallbackQuery):
     async with pool.acquire() as conn:
         balance = await conn.fetchval("SELECT referral_balance FROM users WHERE user_id=$1", u_id) or 0
         ref_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id=$1", u_id) or 0
+        custom_pct = await conn.fetchval("SELECT referral_percent FROM users WHERE user_id=$1", u_id)
     balance = float(balance)
+    my_percent = max(1, min(100, int(custom_pct))) if custom_pct else REFERRAL_PERCENT
 
     text = (
         f"{EMOJI_EARN} {hbold('Заработать')}\n\n"
-        f"{EMOJI_INVITE} Приглашайте друзей — получайте {REFERRAL_PERCENT}% с их оплат.\n\n"
+        f"{EMOJI_INVITE} Приглашайте друзей — получайте {my_percent}% с их оплат.\n\n"
         f"Ваша ссылка:\n{hcode(link)}\n\n"
         f"Приглашено: {ref_count}\n"
         f"Баланс: {balance:.2f} руб.\n"
@@ -3376,7 +3423,8 @@ def admin_panel_kb(is_main: bool = False):
          InlineKeyboardButton(text="Кто онлайн", callback_data="admin_online")],
         [InlineKeyboardButton(text="Промокоды", callback_data="admin_promos"),
          InlineKeyboardButton(text="Опрос", callback_data="admin_survey")],
-        [InlineKeyboardButton(text="Тарифы и скидки", callback_data="admin_pricing")],
+        [InlineKeyboardButton(text="Тарифы и скидки", callback_data="admin_pricing"),
+         InlineKeyboardButton(text="Трафик бел. списков", callback_data="admin_wl_traffic")],
         [InlineKeyboardButton(text="Медиа /start", callback_data="admin_media"),
          InlineKeyboardButton(text="Фискализация", callback_data="admin_fiscal")],
         [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals"),
@@ -3949,12 +3997,23 @@ async def ca_devices_show(cb: CallbackQuery):
     if not devices:
         await cb.message.answer(f"Устройства ID:{user_id}\n\nНет зарегистрированных устройств.")
         return
-    lines = [f"Устройства ID:{user_id} ({len(devices)} шт.)"]
+    lines = [f"Устройства ID:{user_id} ({len(devices)} шт.)", ""]
     for i, d in enumerate(devices, 1):
-        platform = d.get("platform", "?")
-        model    = d.get("deviceModel") or d.get("model") or "-"
-        hwid_val = d.get("hwid", "?")
-        lines.append(f"{i}. {platform} · {model} · {str(hwid_val)[:16]}")
+        platform = (d.get("platform") or "").strip()
+        os_ver   = (d.get("osVersion") or d.get("os") or "").strip()
+        model    = (d.get("deviceModel") or d.get("model") or "").strip()
+        agent    = (d.get("userAgent") or "").strip()
+        hwid_val = str(d.get("hwid") or "?")
+        created  = parse_dt(d.get("createdAt"))
+        name_parts = [p for p in (platform, os_ver, model) if p]
+        name = " · ".join(name_parts) or agent[:60] or "неизвестное устройство"
+        line = f"{i}. {name}"
+        if agent and name_parts:
+            line += f"\n    {agent[:70]}"
+        if created:
+            line += f"\n    добавлено: {fmt_dt(created, '%d.%m.%Y %H:%M')}"
+        line += f"\n    hwid: {hwid_val[:20]}"
+        lines.append(line)
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
@@ -4498,16 +4557,18 @@ async def admin_referrals_cb(cb: CallbackQuery):
         return
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT u.user_id, u.username, u.referral_balance, "
+            "SELECT u.user_id, u.username, u.referral_balance, u.referral_percent, "
             "(SELECT COUNT(*) FROM users r WHERE r.referrer_id = u.user_id) AS ref_count "
-            "FROM users u WHERE u.referral_balance > 0 OR EXISTS ("
-            "  SELECT 1 FROM users r WHERE r.referrer_id = u.user_id"
-            ") ORDER BY u.referral_balance DESC"
+            "FROM users u WHERE u.referral_balance > 0 OR u.referral_percent IS NOT NULL "
+            "OR EXISTS (SELECT 1 FROM users r WHERE r.referrer_id = u.user_id) "
+            "ORDER BY u.referral_balance DESC"
         )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назначить % партнёру", callback_data="admin_refpct_start")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ])
     if not rows:
-        await edit_screen(cb.message, "Рефералов пока нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
-        ]))
+        await edit_screen(cb.message, "Рефералов пока нет.", reply_markup=kb)
         return
     lines = ["Рефералы", ""]
     total_balance = 0.0
@@ -4515,15 +4576,110 @@ async def admin_referrals_cb(cb: CallbackQuery):
         uname = f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}"
         bal = float(r["referral_balance"] or 0)
         total_balance += bal
-        lines.append(f"{uname} — приглашено: {r['ref_count']}, баланс: {bal:.2f} руб.")
+        pct = f" · {r['referral_percent']}% (перс.)" if r["referral_percent"] else ""
+        lines.append(f"{uname} — приглашено: {r['ref_count']}, баланс: {bal:.2f} руб.{pct}")
     lines += ["", f"Итого на балансах: {total_balance:.2f} руб.",
-              "", "Для выплаты и обнуления баланса: /payout username"]
+              "", "Для выплаты и обнуления баланса: /payout username",
+              "Без пометки «перс.» действует стандартный "
+              f"{REFERRAL_PERCENT}%."]
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
-    await edit_screen(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
-    ]))
+    await edit_screen(cb.message, text, reply_markup=kb)
+
+# ─────────────────────────────────────────────
+#  ПАРТНЁРСКИЕ РЕФЕРАЛЬНЫЕ ССЫЛКИ (персональный % с продаж)
+#
+#  Ссылка у партнёра та же, что и у всех (t.me/<bot>?start=<его id>) — админ
+#  просто назначает человеку индивидуальный процент, и все оплаты его
+#  рефералов начисляются уже по нему (см. credit_referral).
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_refpct_start")
+async def admin_refpct_start_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.set_state(AdminRefPercentState.waiting_username)
+    await cb.message.answer(
+        "Партнёрская реферальная ссылка\n\n"
+        "Введите username (без @) или ID пользователя — ему будет назначен "
+        "индивидуальный процент с оплат приглашённых по его ссылке:",
+        reply_markup=cancel_kb(),
+    )
+
+@router.message(AdminRefPercentState.waiting_username)
+async def admin_refpct_username(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    target = (message.text or "").strip().lstrip("@")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, username, referral_percent FROM users WHERE user_id=$1"
+            if target.isdigit() else
+            "SELECT user_id, username, referral_percent FROM users WHERE username=$1",
+            int(target) if target.isdigit() else target,
+        )
+    if not row:
+        await message.answer(
+            f"{target} не найден — пользователь должен хотя бы раз нажать /start.",
+            reply_markup=cancel_kb(),
+        )
+        return
+    current = row["referral_percent"] or REFERRAL_PERCENT
+    label = f"@{row['username']}" if row["username"] else f"ID:{row['user_id']}"
+    await state.update_data(ref_target_id=row["user_id"], ref_target_username=row["username"])
+    await state.set_state(AdminRefPercentState.waiting_percent)
+    await message.answer(
+        f"Сейчас у {label}: {current}%"
+        f"{'' if row['referral_percent'] else ' (стандартный)'}.\n\n"
+        f"Введите новый процент с продаж (1–100).\n"
+        f"0 — сбросить к стандартным {REFERRAL_PERCENT}%.",
+        reply_markup=cancel_kb(),
+    )
+
+@router.message(AdminRefPercentState.waiting_percent)
+async def admin_refpct_percent(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or int(raw) > 100:
+        await message.answer("Введите целое число от 0 до 100.", reply_markup=cancel_kb())
+        return
+    percent = int(raw)
+    data = await state.get_data()
+    target_id    = data.get("ref_target_id")
+    target_uname = data.get("ref_target_username")
+    await state.clear()
+    if not target_id:
+        await message.answer("Сессия истекла, начните заново.")
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET referral_percent=$1 WHERE user_id=$2",
+            percent if percent > 0 else None, target_id,
+        )
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={target_id}"
+    label = f"@{target_uname}" if target_uname else f"ID:{target_id}"
+    if percent > 0:
+        await message.answer(
+            f"Готово. {label} теперь получает {percent}% с оплат своих рефералов.\n\n"
+            f"Партнёрская ссылка (все, кто впервые зайдёт по ней, закрепятся за ним):\n{link}"
+        )
+    else:
+        await message.answer(
+            f"Готово. {label} возвращён на стандартные {REFERRAL_PERCENT}%.\nСсылка: {link}"
+        )
+    try:
+        await bot.send_message(
+            target_id,
+            f"Вам назначен процент с оплат приглашённых: "
+            f"{percent if percent > 0 else REFERRAL_PERCENT}%.\nВаша ссылка: {link}",
+        )
+    except Exception:
+        pass
 
 @router.message(Command("payout"))
 async def admin_payout(message: types.Message, command: CommandObject):
@@ -5848,6 +6004,70 @@ async def admin_whitelist_status(message: types.Message):
     if len(text) > 4000:
         text = text[:4000] + "\n... обрезано"
     await message.answer(text)
+
+# ─────────────────────────────────────────────
+#  ТРАФИК БЕЛЫХ СПИСКОВ ПО ВСЕМ ЮЗЕРАМ (кнопка панели)
+#
+#  Показывает ВСЕХ, кто тратил трафик на ноде белых списков за последние
+#  30 дней (не только тех, у кого настроен лимит), отсортированных по
+#  расходу. Для отслеживаемых по лимиту дополнительно показан остаток.
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "admin_wl_traffic")
+async def admin_wl_traffic_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    back_kb_ = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обновить", callback_data="admin_wl_traffic")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ])
+    if not WHITELIST_NODE_UUID:
+        await edit_screen(cb.message, "WHITELIST_NODE_UUID не задан.", reply_markup=back_kb_)
+        return
+    await edit_screen(cb.message, "Считаю расход трафика на белых списках...")
+    records = await fetch_whitelist_daily_records(days_back=30)
+    totals: dict = {}
+    for r in records:
+        totals[r["username"]] = totals.get(r["username"], 0) + r["bytes"]
+    totals = {u: b for u, b in totals.items() if b > 0}
+    if not totals:
+        await edit_screen(cb.message,
+            "За последние 30 дней трафика на белых списках не было.",
+            reply_markup=back_kb_)
+        return
+    # truba_<id> -> tg-username из БД + лимиты, если отслеживаются.
+    uid_map = {}
+    for uname in totals:
+        raw = uname.replace("truba_", "")
+        if raw.isdigit():
+            uid_map[uname] = int(raw)
+    db_names, limits = {}, {}
+    ids = list(uid_map.values())
+    if ids:
+        async with pool.acquire() as conn:
+            name_rows = await conn.fetch(
+                "SELECT user_id, username FROM users WHERE user_id = ANY($1::bigint[])", ids)
+            wl_rows = await conn.fetch(
+                "SELECT user_id, gb_limit, period_start, cut_off FROM whitelist_limits "
+                "WHERE user_id = ANY($1::bigint[])", ids)
+        db_names = {r["user_id"]: r["username"] for r in name_rows}
+        limits   = {r["user_id"]: r for r in wl_rows}
+    lines = ["Расход трафика на белых списках (за 30 дней)", ""]
+    for uname, used in sorted(totals.items(), key=lambda x: x[1], reverse=True):
+        uid = uid_map.get(uname)
+        label = (f"@{db_names[uid]}" if uid and db_names.get(uid)
+                 else (f"ID:{uid}" if uid else uname))
+        line = f"{label} — {used / 1024 ** 3:.2f} ГБ"
+        wl = limits.get(uid)
+        if wl:
+            in_period = sum_whitelist_bytes_for_user(records, uid, wl["period_start"]) / 1024 ** 3
+            line += (f" · лимит: {in_period:.1f}/{wl['gb_limit']} ГБ"
+                     f"{' (отключён)' if wl['cut_off'] else ''}")
+        lines.append(line)
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n... обрезано"
+    await edit_screen(cb.message, text, reply_markup=back_kb_)
 
 # ─────────────────────────────────────────────
 #  ЕЖЕДНЕВНЫЙ ОТЧЁТ
