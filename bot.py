@@ -259,10 +259,10 @@ TRIAL = {
     "days":         1,
     "hwid":         1,
     "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
-    "whitelist_gb": 3,
+    "whitelist_gb": 1,
     "desc": (
         "Бесплатно. 24 часа доступа ко всем серверам. Трафик VPN не ограничен, "
-        "трафик на обход белых списков ограничен 3 ГБ. Лимит устройств — 1."
+        "трафик на обход белых списков ограничен 1 ГБ. Лимит устройств — 1."
     ),
 }
 
@@ -4779,14 +4779,14 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
         [InlineKeyboardButton(text="VPN", callback_data="giveplan_vpn")],
         [InlineKeyboardButton(text="VPN с обходом белых списков", callback_data="giveplan_vpn_bypass")],
-        [InlineKeyboardButton(text="Пробный доступ (белые списки, 3 ГБ)", callback_data="giveplan_trial")],
+        [InlineKeyboardButton(text="Пробный доступ (белые списки, 1 ГБ)", callback_data="giveplan_trial")],
     ])
     await message.answer(
         "Какой тариф/доступ выставить?\n\n"
         "«Не менять» — только продлить дни, сквад и вариант подписки остан  тся как есть.\n"
         "«VPN» / «VPN с обходом» — выставит соответствующий тариф и профиль пользователя "
         "переключится в купленное состояние (появятся кнопки «Добавить устройства» и т.д.).\n"
-        "«Пробный доступ» — доступ к белым спискам с лимитом 3 ГБ, но БЕЗ пометки как "
+        "«Пробный доступ» — доступ к белым спискам с лимитом 1 ГБ, но БЕЗ пометки как "
         "купленный тариф (кнопки покупки в профиле останутся).",
         reply_markup=kb,
     )
@@ -6275,5 +6275,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        
         log.info("Bot stopped.")
