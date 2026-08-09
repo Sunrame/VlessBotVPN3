@@ -133,6 +133,20 @@ def all_admin_ids() -> list[int]:
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/Truba_VPN")
 CHANNEL_ID   = os.environ.get("CHANNEL_ID", "@Truba_VPN")
 
+# Обязательная подписка на канал: без неё бот не работает (админов не
+# касается). Чтобы временно снять требование — REQUIRE_CHANNEL_SUB=0 в
+# переменных окружения, перевыкладывать код не нужно.
+# ВАЖНО: бот должен быть администратором канала CHANNEL_ID, иначе Telegram
+# не отдаёт статус участника (тогда проверка пропускает всех, см.
+# is_subscribed — закрывать бота из-за своей же ошибки настройки нельзя).
+REQUIRE_CHANNEL_SUB = os.environ.get("REQUIRE_CHANNEL_SUB", "1").strip().lower() \
+    not in ("0", "false", "no", "off", "")
+
+# Сколько секунд помним, что человек подписан, чтобы не дёргать getChatMember
+# на каждое нажатие кнопки (лимиты Telegram). Отписка ловится максимум через
+# это время. Кнопка «Я подписался» проверяет всегда заново, мимо кэша.
+SUB_CACHE_TTL = int(os.environ.get("SUB_CACHE_TTL", "300"))
+
 # Юзернейм поддержки — кнопка "Тех.Поддержка" ведёт в личку с этим аккаунтом
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
 SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
@@ -614,6 +628,43 @@ async def global_error_handler(event: ErrorEvent) -> None:
         "Необработанная ошибка при обработке апдейта %s: %r",
         getattr(event.update, "update_id", "?"), event.exception,
     )
+
+
+# ─────────────────────────────────────────────
+#  ГЕЙТ ПОДПИСКИ НА КАНАЛ (outer-middleware)
+#
+#  Outer-middleware срабатывает ДО фильтров и до всех хендлеров, поэтому
+#  одной точкой закрывает сразу весь бот — не нужно вставлять проверку в
+#  каждый из ~200 обработчиков, и новые хендлеры закрыты автоматически.
+#  Исключения (проходят всегда):
+#    • /start — там сначала сохраняется реферер из ссылки-приглашения,
+#      иначе привод друга терялся бы у неподписанных; экран подписки
+#      показывается сразу после записи в БД, см. cmd_start;
+#    • кнопка «Я подписался» (check_sub) — иначе её нечем было бы нажать;
+#    • админы и не-приватные чаты.
+# ─────────────────────────────────────────────
+SUB_GATE_SKIP_CALLBACKS = {"check_sub"}
+
+
+@dp.message.outer_middleware()
+async def channel_sub_message_middleware(handler, event: types.Message, data: dict):
+    if event.chat.type != "private" or event.from_user is None:
+        return await handler(event, data)
+    text = (event.text or "").strip()
+    if text == "/start" or text.startswith("/start ") or text.startswith("/start@"):
+        return await handler(event, data)
+    if await sub_gate_passed(event):
+        return await handler(event, data)
+    return None
+
+
+@dp.callback_query.outer_middleware()
+async def channel_sub_callback_middleware(handler, event: CallbackQuery, data: dict):
+    if (event.data or "") in SUB_GATE_SKIP_CALLBACKS:
+        return await handler(event, data)
+    if await sub_gate_passed(event):
+        return await handler(event, data)
+    return None
 
 # ─────────────────────────────────────────────
 #  DATABASE
@@ -1173,12 +1224,85 @@ def format_sub_url(user: dict) -> str:
         sub = f"{SUB_BASE_URL}/{short}" if short else ""
     return sub
 
-async def is_subscribed(user_id: int) -> bool:
+# ─────────────────────────────────────────────
+#  ОБЯЗАТЕЛЬНАЯ ПОДПИСКА НА КАНАЛ
+#
+#  Без подписки на CHANNEL_ID бот не отвечает ни на команды, ни на кнопки:
+#  вместо любого экрана показывается приглашение подписаться. Пропускаются
+#  только админы, сам /start (там сначала сохраняется реферал из ссылки, а
+#  экран подписки показывается уже после) и кнопка «Я подписался».
+#  Проверка живёт в outer-middleware, см. channel_sub_* ниже.
+# ─────────────────────────────────────────────
+_sub_cache: dict[int, float] = {}
+
+
+async def is_subscribed(user_id: int, *, use_cache: bool = True) -> bool:
+    """Подписан ли человек на канал.
+
+    Если Telegram ответил ошибкой (бот не админ канала, канал переименован,
+    сетевой сбой) — считаем, что подписан. Лучше пустить человека, чем
+    закрыть бота целиком из-за проблемы на нашей стороне; в лог при этом
+    уходит предупреждение."""
+    if not CHANNEL_ID:
+        return True
+    if use_cache and _sub_cache.get(user_id, 0.0) > time.monotonic():
+        return True
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status not in ("left", "kicked")
-    except Exception:
+    except Exception as e:
+        log.warning("Проверка подписки на %s для %s не удалась: %r (бот должен быть админом канала)",
+                    CHANNEL_ID, user_id, e)
         return True
+    ok = member.status not in ("left", "kicked")
+    if ok:
+        _sub_cache[user_id] = time.monotonic() + SUB_CACHE_TTL
+    else:
+        _sub_cache.pop(user_id, None)
+    return ok
+
+
+def sub_gate_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Экран «подпишитесь на канал» — единственное, что видит неподписанный."""
+    text = (
+        f"{hbold('Подпишитесь на канал')}\n\n"
+        f"Доступ к боту открыт подписчикам нашего канала. Там же лежит "
+        f"пошаговая инструкция по подключению, новости о новых серверах, "
+        f"акции и технические уведомления.\n\n"
+        f"Подпишитесь и нажмите «Я подписался»."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Подписаться на канал", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
+        [btn("Я подписался", emoji_id=BTN_ICON_CHECK_SUB, style="success",
+             callback_data="check_sub")],
+    ])
+    return text, kb
+
+
+async def sub_gate_passed(event) -> bool:
+    """Проверка перед любым действием: True — можно работать дальше,
+    False — человеку уже показан экран с приглашением подписаться.
+    event — types.Message или CallbackQuery."""
+    user = event.from_user
+    if not REQUIRE_CHANNEL_SUB or user is None or is_admin(user.id):
+        return True
+    if await is_subscribed(user.id):
+        return True
+    text, kb = sub_gate_view()
+    if isinstance(event, CallbackQuery):
+        await safe_answer(event, "Сначала подпишитесь на канал.", show_alert=True)
+        try:
+            await edit_screen(event.message, text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            try:
+                await bot.send_message(user.id, text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+    else:
+        try:
+            await event.answer(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+    return False
 
 async def is_admin_sale_notify(admin_id: int) -> bool:
     async with pool.acquire() as conn:
@@ -2341,9 +2465,14 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     # сообщение. Дальше экраны перерисовываются правкой подписи (edit_screen).
     is_new_user = not exists
 
-    # Проверки подписки на канал при входе больше НЕТ: меню открывается сразу.
-    # Приглашение подписаться (инструкция по подключению — в закрепе канала)
-    # уходит после активации подписки, см. send_channel_instructions.
+    # Обязательная подписка на канал. Проверяется здесь, а не в middleware,
+    # потому что выше уже записан referrer_id из ссылки-приглашения: даже
+    # если человек подпишется через час, привод друга ему зачтётся.
+    # Экран подписки показывается вместе с приветственным медиа.
+    if REQUIRE_CHANNEL_SUB and not is_admin(u_id) and not await is_subscribed(u_id):
+        gate_text, gate_kb = sub_gate_view()
+        await answer_start_screen(message, gate_text, gate_kb, is_new_user=is_new_user)
+        return
 
     # Переброс из личного кабинета в конкретный раздел оплаты.
     if section:
@@ -2579,6 +2708,17 @@ async def back_to_home(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "profile")
 async def profile_cb(cb: CallbackQuery):
     await safe_answer(cb)
+    await _show_home(cb)
+
+@router.callback_query(F.data == "check_sub")
+async def check_sub_cb(cb: CallbackQuery, state: FSMContext):
+    """Кнопка «Я подписался» — проверка всегда свежая, мимо кэша."""
+    if not await is_subscribed(cb.from_user.id, use_cache=False):
+        await safe_answer(cb, "Подписка не найдена. Подпишитесь на канал и нажмите кнопку ещё раз.",
+                          show_alert=True)
+        return
+    await safe_answer(cb, "Готово, доступ открыт.")
+    await state.clear()
     await _show_home(cb)
 
 # ─────────   ───────────────────────────────────
@@ -6268,6 +6408,8 @@ async def main():
     asyncio.create_task(whitelist_limit_scheduler())
     asyncio.create_task(expiry_reminder_scheduler())
     asyncio.create_task(naloggo_queue_scheduler())
+    log.info("Обязательная подписка на канал: %s (%s)",
+             "включена" if REQUIRE_CHANNEL_SUB else "выключена", CHANNEL_ID)
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
