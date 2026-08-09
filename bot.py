@@ -19,7 +19,14 @@ from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent
 from aiogram.exceptions import TelegramBadRequest
 
-from yookassa import Configuration, Payment
+# ЮKassa убрана из потока покупки (приём оплаты отключён, см.
+# PAYMENTS_ENABLED ниже). Импорт необязательный: библиотеку можно убрать
+# из requirements.txt — бот не упадёт, платёжные функции просто не вызовутся.
+try:
+    from yookassa import Configuration, Payment
+except ImportError:
+    Configuration = None
+    Payment = None
 
 
 # ─────────────────────────────────────────────
@@ -97,8 +104,10 @@ def _unpack_plan(code: str) -> str:
 #  КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────
 API_TOKEN    = os.environ["BOT_TOKEN"]
-SHOP_ID      = os.environ["SHOP_ID"]
-YOOKASSA_KEY = os.environ["YOOKASSA_KEY"]
+# Ключи ЮKassa больше не обязательны: пока приём оплаты отключён, их можно
+# вообще убрать из переменных окружения — бот стартует без них.
+SHOP_ID      = os.environ.get("SHOP_ID", "")
+YOOKASSA_KEY = os.environ.get("YOOKASSA_KEY", "")
 DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
 
 REMNAWAVE_URL    = os.environ["REMNAWAVE_URL"].rstrip("/")
@@ -163,7 +172,33 @@ LOGIN_CODE_TTL_MIN = int(os.environ.get("LOGIN_CODE_TTL_MIN", "5"))
 # "временно недоступен".
 MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") or (f"{SITE_URL}/tgapp" if SITE_URL else "")
 
-Configuration.configure(SHOP_ID, YOOKASSA_KEY)
+# ─────────────────────────────────────────────
+#  ПРИЁМ ОПЛАТЫ ОТКЛЮЧЁН
+#
+#  Вместо страницы оплаты человек видит «оплата временно недоступна».
+#  Продолжает работать всё остальное: пробная подписка, промокоды, выдача
+#  и продление подписки админом, рефералка, уже оплаченные подписки.
+#  Код платежей не удалён, а обойдён — когда появится новая платёжная
+#  система, включается обратно одной переменной PAYMENTS_ENABLED=1
+#  (для ЮKassa дополнительно нужны живые SHOP_ID и YOOKASSA_KEY).
+# ─────────────────────────────────────────────
+PAYMENTS_ENABLED = os.environ.get("PAYMENTS_ENABLED", "0").strip().lower() \
+    in ("1", "true", "yes", "on")
+
+# Текст экрана-заглушки. Можно переопределить переменной окружения, чтобы
+# менять формулировку без выкладки кода.
+PAYMENTS_OFF_TEXT = os.environ.get("PAYMENTS_OFF_TEXT", "").strip() or (
+    "Оплата временно недоступна.\n\n"
+    "Приём платежей приостановлен — мы меняем платёжную систему. "
+    "Как только всё заработает, сообщим в канале.\n\n"
+    "Уже оплаченные подписки продолжают работать в обычном режиме."
+)
+
+# Короткая версия — для всплывающих уведомлений на кнопках (лимит Telegram).
+PAYMENTS_OFF_SHORT = "Оплата временно недоступна"
+
+if PAYMENTS_ENABLED and Configuration is not None and SHOP_ID and YOOKASSA_KEY:
+    Configuration.configure(SHOP_ID, YOOKASSA_KEY)
 
 # Основной сквад (все сервера, кроме белых списков)
 SQUAD_UUID = os.environ.get("SQUAD_UUID_BASIC", "")
@@ -2579,6 +2614,10 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     else:
         lines += ["Подписка не активна."]
 
+    if not PAYMENTS_ENABLED:
+        # Короткая пометка прямо в профиле, чтобы человек видел это сразу,
+        # а не после захода в «Купить VPN».
+        lines += ["", f"{PAYMENTS_OFF_SHORT} — приём платежей приостановлен."]
     lines += ["", f"Поддержка: @{SUPPORT_USERNAME}"]
     text = "\n".join(lines)
 
@@ -2722,8 +2761,34 @@ async def check_sub_cb(cb: CallbackQuery, state: FSMContext):
     await _show_home(cb)
 
 # ─────────   ───────────────────────────────────
-#  ОБЩАЯ СТРАНИЦА ОПЛАТЫ (YooKassa)
+#  ОБЩАЯ СТРАНИЦА ОПЛАТЫ (приём оплаты сейчас отключён)
 # ─────────────────────────────────────────────
+def payments_off_kb() -> InlineKeyboardMarkup:
+    """Клавиатура экрана «оплата временно недоступна»."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Тех.Поддержка", emoji_id=BTN_ICON_SUPPORT, url=SUPPORT_URL)],
+        [InlineKeyboardButton(text="Назад", callback_data="back")],
+    ])
+
+
+async def payments_off_stop(cb: CallbackQuery) -> bool:
+    """Заслонка для кнопок, ведущих к оплате.
+
+    Возвращает True, если приём оплаты отключён — тогда человеку уже
+    показан экран-заглушка и хендлеру дальше идти не нужно. Стоит в начале
+    покупки, чтобы не гонять человека по выбору тарифа и вводу количества
+    ради упора в «оплата недоступна» на последнем шаге."""
+    if PAYMENTS_ENABLED:
+        return False
+    await safe_answer(cb, PAYMENTS_OFF_SHORT, show_alert=True)
+    try:
+        await edit_screen(cb.message, PAYMENTS_OFF_TEXT, parse_mode="HTML",
+                          reply_markup=payments_off_kb())
+    except Exception as e:
+        log.warning("payments_off_stop: %s", e)
+    return True
+
+
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | list[str] | None = None, whitelist_gb: int = 0,
@@ -2734,7 +2799,13 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
     qty — для kind="device": сколько устройств докупается; для kind="wl_topup"
     смотри whitelist_gb (сколько ГБ докупается) — там оно и так уже есть.
     Возвращает (payment, kb) либо (None, None) при ошибке создани   платежа.
+    Пока приём оплаты отключён (PAYMENTS_ENABLED=0) платёж не создаётся
+    вообще: наружу в ЮKassa ничего не уходит.
     """
+    if not PAYMENTS_ENABLED or Payment is None:
+        log.info("Оплата отключена: запрос %s (%s, %s руб.) от %s не создан",
+                 kind, item_name, price, user_id)
+        return None, None
     try:
         payment = Payment.create({
             "amount":       {"value": f"{price}.00", "currency": "RUB"},
@@ -2778,6 +2849,11 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
     ТОЛЬКО для заголовка в Telegram; в описание/метаданные ЮKassa не попадает.
     extra_desc — доп. текст-описание (например состав тарифа), показывается
     сразу на этом же экране, вместе с кнопками оплаты — тоже не уходит в ЮKassa."""
+    if not PAYMENTS_ENABLED:
+        await safe_answer(cb, PAYMENTS_OFF_SHORT, show_alert=True)
+        await edit_screen(cb.message, f"{hbold(item_name)}\n\n{PAYMENTS_OFF_TEXT}",
+                          parse_mode="HTML", reply_markup=payments_off_kb())
+        return
     payment, kb = await _create_payment_core(
         cb.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
@@ -2799,6 +2875,10 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
                                              qty: int = 0, display_prefix: str = ""):
     """То же самое, что _create_payment_page, но когда вызов идёт из ответа на
     текстовое сообщение (ввод количества), а не из нажатия кнопки."""
+    if not PAYMENTS_ENABLED:
+        await message.answer(f"{hbold(item_name)}\n\n{PAYMENTS_OFF_TEXT}",
+                             parse_mode="HTML", reply_markup=payments_off_kb())
+        return
     payment, kb = await _create_payment_core(
         message.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
@@ -2815,6 +2895,11 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
 @router.callback_query(F.data.startswith("paycheck_"))
 async def check_payment_cb(cb: CallbackQuery):
     await safe_answer(cb)
+    # Кнопки «Проверить оплату» из старых сообщений остаются висеть в
+    # переписках — пока приём оплаты отключён, проверять нечего.
+    if not PAYMENTS_ENABLED or Payment is None:
+        await safe_answer(cb, PAYMENTS_OFF_SHORT + ".", show_alert=True)
+        return
     pay_id = cb.data.removeprefix("paycheck_")
     try:
         payment = Payment.find_one(pay_id)
@@ -3020,6 +3105,8 @@ async def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
     """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесен
     отдельно, чтобы использовать как из нажатия кнопки, так и при перебросе
     из личного кабинета (диплинк)."""
+    if not PAYMENTS_ENABLED:
+        return PAYMENTS_OFF_TEXT, payments_off_kb()
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
     vpn_price    = await get_price_month("vpn")
@@ -3049,6 +3136,8 @@ async def buy_open_cb(cb: CallbackQuery):
 async def renew_open_cb(cb: CallbackQuery):
     """Открывает выбор срока продления прямо из главного экрана /start."""
     await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
     async with pool.acquire() as conn:
         plan_key = await conn.fetchval(
             "SELECT plan FROM users WHERE user_id=$1", cb.from_user.id
@@ -3071,6 +3160,8 @@ async def renew_open_cb(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("buyplan_"))
 async def buyplan_cb(cb: CallbackQuery):
     await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
     plan_key = cb.data.removeprefix("buyplan_")
     if plan_key not in PLANS:
         await safe_answer(cb, "Тариф не найден.", show_alert=True)
@@ -3118,6 +3209,8 @@ async def buymonths_cb(cb: CallbackQuery):
 @router.callback_query(F.data == "dev_add")
 async def dev_add_cb(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
     async with pool.acquire() as conn:
         plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
     if plan not in PLANS:
@@ -3167,6 +3260,8 @@ async def dev_add_count_handler(message: types.Message, state: FSMContext):
 @router.callback_query(F.data == "plan_upgrade")
 async def plan_upgrade_cb(cb: CallbackQuery):
     await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
     u_id = cb.from_user.id
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT plan, extra_devices FROM users WHERE user_id=$1", u_id)
@@ -3192,6 +3287,8 @@ async def plan_upgrade_cb(cb: CallbackQuery):
 @router.callback_query(F.data == "wl_topup")
 async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
     async with pool.acquire() as conn:
         plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
     if plan != "vpn_bypass":
@@ -6300,6 +6397,8 @@ async def _renew_kb(plan_key: str, include_back: bool = False) -> InlineKeyboard
 @router.callback_query(F.data.startswith("rnw_"))
 async def renew_cb(cb: CallbackQuery):
     await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
     plan_key, _, months_s = cb.data.removeprefix("rnw_").rpartition("_")
     if not plan_key or not months_s.isdigit():
         await safe_answer(cb, "Не удалось определить тариф.", show_alert=True)
@@ -6410,6 +6509,7 @@ async def main():
     asyncio.create_task(naloggo_queue_scheduler())
     log.info("Обязательная подписка на канал: %s (%s)",
              "включена" if REQUIRE_CHANNEL_SUB else "выключена", CHANNEL_ID)
+    log.info("Приём оплаты: %s", "включён" if PAYMENTS_ENABLED else "ОТКЛЮЧЁН (ЮKassa не используется)")
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
