@@ -144,15 +144,17 @@ CHANNEL_ID   = os.environ.get("CHANNEL_ID", "@Truba_VPN")
 # касается). Чтобы временно снять требование — REQUIRE_CHANNEL_SUB=0 в
 # переменных окружения, перевыкладывать код не нужно.
 # ВАЖНО: бот должен быть администратором канала CHANNEL_ID, иначе Telegram
-# не отдаёт статус участника (тогда проверка пропускает всех, см.
-# is_subscribed — закрывать бота из-за своей же ошибки настройки нельзя).
+# не отдаёт статус участника и строгая проверка не откроет доступ никому.
 REQUIRE_CHANNEL_SUB = os.environ.get("REQUIRE_CHANNEL_SUB", "1").strip().lower() \
     not in ("0", "false", "no", "off", "")
 
-# Сколько секунд помним, что человек подписан, чтобы не дёргать getChatMember
-# на каждое нажатие кнопки (лимиты Telegram). Отписка ловится максимум через
-# это время. Кнопка «Я подписался» проверяет всегда заново, мимо кэша.
-SUB_CACHE_TTL = int(os.environ.get("SUB_CACHE_TTL", "300"))
+# Сколько секунд помним, что человек подписан. Ноль означает свежую проверку
+# перед каждым сообщением и нажатием. Кнопка «Я подписался» в любом случае
+# проверяет членство заново, мимо кэша.
+# По умолчанию проверяем подписку перед каждым действием. Положительное
+# значение можно задать только осознанно, если позднее понадобится снизить
+# количество запросов к Telegram API.
+SUB_CACHE_TTL = max(0, int(os.environ.get("SUB_CACHE_TTL", "0")))
 
 # Юзернейм поддержки — кнопка "Тех.Поддержка" ведёт в личку с этим аккаунтом
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
@@ -1292,22 +1294,22 @@ _sub_cache: dict[int, float] = {}
 async def is_subscribed(user_id: int, *, use_cache: bool = True) -> bool:
     """Подписан ли человек на канал.
 
-    Если Telegram ответил ошибкой (бот не админ канала, канал переименован,
-    сетевой сбой) — считаем, что подписан. Лучше пустить человека, чем
-    закрыть бота целиком из-за проблемы на нашей стороне; в лог при этом
-    уходит предупреждение."""
+    Проверка строгая: если Telegram не подтвердил членство, доступ не
+    открывается. Для корректной работы бот обязан быть администратором
+    канала CHANNEL_ID."""
     if not CHANNEL_ID:
         return True
-    if use_cache and _sub_cache.get(user_id, 0.0) > time.monotonic():
+    if use_cache and SUB_CACHE_TTL > 0 and _sub_cache.get(user_id, 0.0) > time.monotonic():
         return True
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
     except Exception as e:
-        log.warning("Проверка подписки на %s для %s не удалась: %r (бот должен быть админом канала)",
-                    CHANNEL_ID, user_id, e)
-        return True
+        _sub_cache.pop(user_id, None)
+        log.error("Проверка подписки на %s для %s не удалась: %r (доступ закрыт; бот должен быть админом канала)",
+                  CHANNEL_ID, user_id, e)
+        return False
     ok = member.status not in ("left", "kicked")
-    if ok:
+    if ok and SUB_CACHE_TTL > 0:
         _sub_cache[user_id] = time.monotonic() + SUB_CACHE_TTL
     else:
         _sub_cache.pop(user_id, None)
@@ -1367,8 +1369,8 @@ async def terms_accepted(user_id: int) -> bool:
 def terms_gate_view() -> tuple[str, InlineKeyboardMarkup]:
     """Экран, который видит человек до принятия оферты."""
     text = (
-        f"{hbold('Перед началом работы')}\n\n"
-        f"Ознакомьтесь с документами сервиса и подтвердите согласие — "
+        f"{hbold('Перед началом работы с TrubaVPN')}\n\n"
+        f"Ознакомьтесь с документами TrubaVPN и подтвердите согласие — "
         f"без этого бот недоступен.\n\n"
         f"Нажимая «Принимаю», вы присоединяетесь к публичной оферте и даёте "
         f"согласие на обработку персональных данных."
@@ -1398,8 +1400,8 @@ async def pin_terms_message(chat_id: int) -> None:
     Ошибку закрепления глушим: без закрепа бот работать не перестаёт.
     """
     text = (
-        f"{hbold('Документы сервиса')}\n\n"
-        f"Публичная оферта и политика обработки персональных данных. "
+        f"{hbold('Документы TrubaVPN')}\n\n"
+        f"Пользовательское соглашение TrubaVPN и политика обработки персональных данных. "
         f"Сообщение закреплено, чтобы документы всегда были под рукой."
     )
     try:
