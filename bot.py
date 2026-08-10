@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import uuid
 import string
 import secrets
@@ -16,7 +17,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent
+from aiogram.types import (
+    InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent,
+    LabeledPrice, PreCheckoutQuery,
+)
 from aiogram.exceptions import TelegramBadRequest
 
 # ЮKassa убрана из потока покупки (приём оплаты отключён, см.
@@ -166,7 +170,7 @@ SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 TOS_URL     = os.environ.get("TOS_URL", "").strip() or \
     "https://telegra.ph/Polzovatelskoe-soglashenie-04-01-19"
 PRIVACY_URL = os.environ.get("PRIVACY_URL", "").strip() or \
-    "https://telegra.ph/Politika-konfidencialnosti-08-01-83"
+    "https://telegra.ph/Politika-konfidencialnosti-06-21-31"
 
 # Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
@@ -207,6 +211,49 @@ PAYMENTS_OFF_SHORT = "Оплата временно недоступна"
 
 if PAYMENTS_ENABLED and Configuration is not None and SHOP_ID and YOOKASSA_KEY:
     Configuration.configure(SHOP_ID, YOOKASSA_KEY)
+
+# ─────────────────────────────────────────────
+#  ОПЛАТА ЗВЁЗДАМИ TELEGRAM (валюта XTR)
+#
+#  Работает НЕЗАВИСИМО от ЮKassa: при PAYMENTS_ENABLED=0 покупка остаётся
+#  доступной, просто на экране оплаты будет одна кнопка — звёзды. Провайдер
+#  не нужен: счёт выставляет сам Telegram, provider_token пустой.
+#  Выключается переменной STARS_ENABLED=0 — тогда всё вернётся как было.
+#
+#  STARS_RUB_RATE — сколько рублей стоит одна звезда. Цены в боте заданы в
+#  рублях (и в рублях же считаются рефералка, отчёты и статистика), поэтому
+#  в XTR сумма пересчитывается на лету по этому курсу. Курс правится
+#  переменной окружения, выкладывать код заново не нужно.
+# ─────────────────────────────────────────────
+STARS_ENABLED = os.environ.get("STARS_ENABLED", "1").strip().lower() \
+    in ("1", "true", "yes", "on")
+
+try:
+    STARS_RUB_RATE = float(os.environ.get("STARS_RUB_RATE", "1.5").replace(",", "."))
+except ValueError:
+    STARS_RUB_RATE = 1.5
+if STARS_RUB_RATE <= 0:
+    STARS_RUB_RATE = 1.5
+
+# Границы суммы счёта в звёздах со стороны Telegram.
+STARS_MIN = 1
+STARS_MAX = 100_000
+
+
+def rub_to_stars(price_rub) -> int:
+    """Рублёвая цена → сумма счёта в звёздах (округление вверх)."""
+    try:
+        rub = float(price_rub or 0)
+    except (TypeError, ValueError):
+        rub = 0.0
+    return max(STARS_MIN, min(STARS_MAX, math.ceil(rub / STARS_RUB_RATE)))
+
+
+def payments_available() -> bool:
+    """Есть ли хоть один рабочий способ оплаты — карта или звёзды.
+    Пока доступен любой из них, экраны покупки открываются как обычно, а
+    заглушка «оплата временно недоступна» не показывается."""
+    return PAYMENTS_ENABLED or STARS_ENABLED
 
 # ВНИМАНИЕ: в интерфейсе у этой опции нет названия — только значок 📶.
 # Словесных формулировок быть не должно нигде в текстах бота: ни в тарифах,
@@ -253,6 +300,12 @@ def btn(text: str, *, emoji_id: str | None = None, style: str | None = None, **k
     """
     return InlineKeyboardButton(text=text, icon_custom_emoji_id=emoji_id, style=style, **kwargs)
 
+def pair_rows(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
+    """Раскладывает кнопки попарно — по две в ряд, а не столбиком.
+    Нечётная последняя кнопка занимает всю ширину. Порядок кнопок в списке
+    = порядок на экране, поэтому пару задаёт соседство в списке."""
+    return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
 # ─────────────────────────────────────────────
 #  ID КАСТОМНЫХ EMOJI ДЛЯ КНОПОК (icon_custom_emoji_id)
 # ─────────────────────────────────────────────
@@ -263,6 +316,7 @@ BTN_ICON_TOS             = "5197269100878907942"  # Пользовательск
 BTN_ICON_SUPPORT         = "5443038326535759644"  # Тех.Поддержка
 BTN_ICON_PRIVACY         = "5251203410396458957"  # Политика конфиденциальности
 BTN_ICON_PAY             = "5445353829304387411"  # Оплатить
+BTN_ICON_STARS           = None  # Оплата звёздами — своей premium-иконки нет, в тексте ⭐
 BTN_ICON_BUY_VPN         = "5312361253610475399"  # Купить VPN
 BTN_ICON_PROMO           = "5465169893580086142"  # Промокод
 BTN_ICON_INFO            = "5334544901428229844"  # О сервисе
@@ -699,6 +753,11 @@ SUB_GATE_SKIP_CALLBACKS = {"check_sub", "accept_terms"}
 async def channel_sub_message_middleware(handler, event: types.Message, data: dict):
     if event.chat.type != "private" or event.from_user is None:
         return await handler(event, data)
+    # Сообщение об успешной оплате звёздами присылает сам Telegram — его
+    # нельзя терять на гейте подписки, иначе звёзды списаны, а подписка не
+    # выдана (человек мог отписаться от канала между оплатой и зачислением).
+    if event.successful_payment is not None:
+        return await handler(event, data)
     text = (event.text or "").strip()
     if text == "/start" or text.startswith("/start ") or text.startswith("/start@"):
         return await handler(event, data)
@@ -816,6 +875,31 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS processed_payments (
                 payment_id   TEXT PRIMARY KEY,
                 processed_at BIGINT DEFAULT 0
+            )
+        """)
+        # Счета на оплату звёздами Telegram. В payload счёта помещается
+        # только короткий токен (лимит Telegram — 128 байт, UUID сквадов
+        # туда не влезают), а сам состав покупки лежит здесь. Заодно
+        # покупка переживает перезапуск бота: после оплаты состав берётся
+        # из этой таблицы, а не из памяти процесса.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS star_invoices (
+                token        TEXT PRIMARY KEY,
+                user_id      BIGINT NOT NULL,
+                kind         TEXT NOT NULL,
+                days         INTEGER DEFAULT 0,
+                hwid         INTEGER,
+                squad        TEXT,
+                whitelist_gb INTEGER DEFAULT 0,
+                plan_key     TEXT,
+                price        INTEGER DEFAULT 0,
+                stars        INTEGER DEFAULT 0,
+                is_trial     BOOLEAN DEFAULT FALSE,
+                item_name    TEXT,
+                qty          INTEGER DEFAULT 0,
+                created_at   BIGINT DEFAULT 0,
+                paid_at      BIGINT,
+                charge_id    TEXT
             )
         """)
         # Отправленные напоминания об окончании подписки (по срокам 3д/1д/1ч).
@@ -2769,24 +2853,30 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     else:
         lines += ["Подписка не активна."]
 
-    if not PAYMENTS_ENABLED:
+    if not payments_available():
         # Короткая пометка прямо в профиле, чтобы человек видел это сразу,
         # а не после захода в «Купить VPN».
         lines += ["", f"{PAYMENTS_OFF_SHORT} — приём платежей приостановлен."]
     lines += ["", f"Поддержка: @{SUPPORT_USERNAME}"]
     text = "\n".join(lines)
 
-    rows = []
+    # Кнопки складываются в один плоский список flow и раскладываются
+    # попарно — по две в ряд (pair_rows). Соседство в списке = пара на экране,
+    # поэтому порядок ниже задаёт и логику, и раскладку одновременно.
+    # Во всю ширину выносится только «Пробная подписка» — это главное
+    # действие экрана, делить его с чем-то пополам не нужно.
+    rows: list[list[InlineKeyboardButton]] = []
+    flow: list[InlineKeyboardButton] = []
     cabinet_row    = _cabinet_button_row()
     user_is_admin  = is_admin(user_id)
     admin_site_url = "https://accept-finances-cyber-itself.trycloudflare.com/"
 
     def _place_cabinet():
-        # Кнопка «Личный кабинет», а для админов — сразу под ней ссылка на
-        # админ-сайт.
-        rows.append(cabinet_row)
+        # Кнопка «Личный кабинет», а для админов — следом ссылка на админ-сайт,
+        # они и встанут в одну пару.
+        flow.extend(cabinet_row)
         if user_is_admin:
-            rows.append([btn("Админ-сайт", emoji_id=BTN_ICON_ADMIN, url=admin_site_url)])
+            flow.append(btn("Админ-сайт", emoji_id=BTN_ICON_ADMIN, url=admin_site_url))
 
     # Кнопка «Пробная подписка» показывается только если:
     #  • подписка сейчас не активна,
@@ -2796,8 +2886,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     show_trial = (not subscription_active) and (not trial_used) and (not has_paid)
 
     # Расположение кнопки «Личный кабинет»:
-    #  • пробная подписка недоступна → ЛК стоит выше всех остальных кнопок;
-    #  • пробная подписка доступна → ЛК стоит сразу под кнопкой «Пробная».
+    #  • пробная подписка недоступна → ЛК открывает попарный блок;
+    #  • пробная подписка доступна → ЛК идёт сразу под кнопкой «Пробная».
     if not show_trial:
         _place_cabinet()
 
@@ -2816,25 +2906,25 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                              callback_data="trial_buy")])
             # ЛК (и ссылка на админ-сайт для админов) — сразу под пробной подпиской
             _place_cabinet()
-        rows.append([btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
-                         callback_data="buy_open")])
+        flow.append(btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
+                        callback_data="buy_open"))
     else:
-        rows.append([btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
-                         callback_data="dev_add")])
+        flow.append(btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
+                        callback_data="dev_add"))
         if plan == "vpn":
-            rows.append([btn("Улучшить тариф", emoji_id=BTN_ICON_UPGRADE,
-                             callback_data="plan_upgrade")])
+            flow.append(btn("Улучшить тариф", emoji_id=BTN_ICON_UPGRADE,
+                            callback_data="plan_upgrade"))
         elif plan == "vpn_bypass":
-            # Без custom-emoji иконки: на части клиентов этот premium-эмодзи
-            # рендерился поверх текста и ломал надпись кнопки («Докупить»).
-            rows.append([btn("Докупить трафик (📶)", emoji_id=BTN_ICON_GB_TOPUP,
-                 callback_data="wl_topup")])
+            flow.append(btn("Докупить трафик (📶)", emoji_id=BTN_ICON_GB_TOPUP,
+                            callback_data="wl_topup"))
 
-    rows.append([btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open")])
-    rows.append([btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter")])
-    rows.append([btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab")])
-    if is_admin(user_id):
-        rows.append([btn("Панель", emoji_id=BTN_ICON_ADMIN, callback_data="admin_panel")])
+    flow.append(btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open"))
+    flow.append(btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter"))
+    flow.append(btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab"))
+    if user_is_admin:
+        flow.append(btn("Панель", emoji_id=BTN_ICON_ADMIN, callback_data="admin_panel"))
+
+    rows += pair_rows(flow)
 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
@@ -3002,7 +3092,7 @@ async def payments_off_stop(cb: CallbackQuery) -> bool:
     показан экран-заглушка и хендлеру дальше идти не нужно. Стоит в начале
     покупки, чтобы не гонять человека по выбору тарифа и вводу количества
     ради упора в «оплата недоступна» на последнем шаге."""
-    if PAYMENTS_ENABLED:
+    if payments_available():
         return False
     await safe_answer(cb, PAYMENTS_OFF_SHORT, show_alert=True)
     try:
@@ -3011,6 +3101,54 @@ async def payments_off_stop(cb: CallbackQuery) -> bool:
     except Exception as e:
         log.warning("payments_off_stop: %s", e)
     return True
+
+
+async def _stars_invoice_create(user_id: int, *, kind: str, item_name: str,
+                                price: int, stars: int, days: int = 0,
+                                hwid: int | None = None,
+                                squad: str | list[str] | None = None,
+                                whitelist_gb: int = 0, plan_key: str | None = None,
+                                is_trial: bool = False, qty: int = 0) -> str | None:
+    """Кладёт состав покупки в star_invoices и возвращает короткий токен.
+
+    В payload счёта Telegram помещается только этот токен: лимит payload —
+    128 байт, а UUID сквадов туда не влезают. Состав берётся из БД уже после
+    оплаты, поэтому перезапуск бота между «выставили счёт» и «человек оплатил»
+    ничего не ломает."""
+    token = secrets.token_urlsafe(12)[:24]
+    squad_str = ",".join(squad) if isinstance(squad, list) else (squad or "")
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO star_invoices (token, user_id, kind, days, hwid, squad, "
+                "whitelist_gb, plan_key, price, stars, is_trial, item_name, qty, created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                token, user_id, kind, int(days or 0), hwid, squad_str,
+                int(whitelist_gb or 0), plan_key or "", int(round(float(price or 0))),
+                int(stars), bool(is_trial), (item_name or "Покупка")[:128],
+                int(qty or 0), int(time.time()),
+            )
+    except Exception as e:
+        log.exception("star invoice create: %s", e)
+        return None
+    return token
+
+
+async def _stars_invoice_get(token: str):
+    """Строка счёта по токену (или None, если счёта нет)."""
+    if not token:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM star_invoices WHERE token=$1", token)
+    except Exception as e:
+        log.exception("star invoice get: %s", e)
+        return None
+
+
+def _stars_title(item_name: str) -> str:
+    """Заголовок счёта. Telegram жёстко ограничивает его 32 символами."""
+    return (item_name or "Покупка").strip()[:32] or "Покупка"
 
 
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
@@ -3022,47 +3160,81 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
     kind: "trial" | "plan" | "device" | "upgrade" | "wl_topup"
     qty — для kind="device": сколько устройств докупается; для kind="wl_topup"
     смотри whitelist_gb (сколько ГБ докупается) — там оно и так уже есть.
-    Возвращает (payment, kb) либо (None, None) при ошибке создания платежа.
-    Пока приём оплаты отключён (PAYMENTS_ENABLED=0) платёж не создаётся
-    вообще: наружу в ЮKassa ничего не уходит.
-    """
-    if not PAYMENTS_ENABLED or Payment is None:
-        log.info("Оплата отключена: запрос %s (%s, %s руб.) от %s не создан",
-                 kind, item_name, price, user_id)
-        return None, None
-    try:
-        payment = Payment.create({
-            "amount":       {"value": f"{price}.00", "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
-            "capture":      True,
-            # В ЮKassa уходит только сумма: «Интернет-Сервис. Пополнение
-            # баланса на N рублей». В metadata название позиции обезличено,
-            # ключ тарифа — кодом; тексты для пользователя не меняются.
-            "description":  _yookassa_description(price),
-            "metadata": {
-                "user_id":      str(user_id),
-                "kind":         kind,
-                "days":         str(days),
-                "hwid":         str(hwid) if hwid is not None else "",
-                "squad":        ",".join(squad) if isinstance(squad, list) else (squad or ""),
-                "whitelist_gb": str(whitelist_gb),
-                "plan_key":     _pack_plan(plan_key),
-                "price":        str(price),
-                "is_trial":     "1" if is_trial else "0",
-                "item_name":    _yookassa_item(item_name),
-                "qty":          str(qty),
-            },
-        }, str(uuid.uuid4()))
-    except Exception as e:
-        log.exception("Payment create error: %s", e)
-        return None, None
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Оплатить", emoji_id=BTN_ICON_PAY, style="success", url=payment.confirmation.confirmation_url)],
-        [btn("Проверить оплату", emoji_id=BTN_ICON_CHECK_SUB, callback_data=f"paycheck_{payment.id}")],
-        [InlineKeyboardButton(text="Назад", callback_data="back")],
-    ])
-    return payment, kb
+    Собирает экран оплаты сразу под два способа:
+      • карта (ЮKassa) — только при PAYMENTS_ENABLED=1 и если платёж создался;
+      • звёзды Telegram — при STARS_ENABLED=1, независимо от ЮKassa.
+    Наружу в ЮKassa при выключенной карте по-прежнему не уходит ничего.
+
+    Возвращает (клавиатура, строка_с_ценой, подсказка). Клавиатура None —
+    платить нечем вообще.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    price_parts: list[str] = []
+    hints: list[str] = []
+
+    payment = None
+    if PAYMENTS_ENABLED and Payment is not None:
+        try:
+            payment = Payment.create({
+                "amount":       {"value": f"{price}.00", "currency": "RUB"},
+                "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
+                "capture":      True,
+                # В ЮKassa уходит только сумма: «Интернет-Сервис. Пополнение
+                # баланса на N рублей». В metadata название позиции обезличено,
+                # ключ тарифа — кодом; тексты для пользователя не меняются.
+                "description":  _yookassa_description(price),
+                "metadata": {
+                    "user_id":      str(user_id),
+                    "kind":         kind,
+                    "days":         str(days),
+                    "hwid":         str(hwid) if hwid is not None else "",
+                    "squad":        ",".join(squad) if isinstance(squad, list) else (squad or ""),
+                    "whitelist_gb": str(whitelist_gb),
+                    "plan_key":     _pack_plan(plan_key),
+                    "price":        str(price),
+                    "is_trial":     "1" if is_trial else "0",
+                    "item_name":    _yookassa_item(item_name),
+                    "qty":          str(qty),
+                },
+            }, str(uuid.uuid4()))
+        except Exception as e:
+            log.exception("Payment create error: %s", e)
+            payment = None
+    else:
+        log.info("Карта отключена: %s (%s, %s руб.) от %s — остаются звёзды",
+                 kind, item_name, price, user_id)
+
+    if payment:
+        rows.append([btn("Оплатить картой", emoji_id=BTN_ICON_PAY, style="success",
+                         url=payment.confirmation.confirmation_url)])
+        price_parts.append(f"{price} руб.")
+        hints.append("После оплаты картой нажмите «Проверить оплату».")
+
+    if STARS_ENABLED:
+        stars = rub_to_stars(price)
+        token = await _stars_invoice_create(
+            user_id, kind=kind, item_name=item_name, price=price, stars=stars,
+            days=days, hwid=hwid, squad=squad, whitelist_gb=whitelist_gb,
+            plan_key=plan_key, is_trial=is_trial, qty=qty,
+        )
+        if token:
+            rows.append([btn(f"Оплатить звёздами — {stars} ⭐", emoji_id=BTN_ICON_STARS,
+                             style=None if payment else "success",
+                             callback_data=f"starspay_{token}")])
+            price_parts.append(f"{stars} ⭐" if payment else f"{stars} ⭐ (≈{price} руб.)")
+            hints.append("Звёзды спишутся сразу, подписка включится сама.")
+
+    if not rows:
+        return None, "", ""
+
+    if payment:
+        rows.append([btn("Проверить оплату", emoji_id=BTN_ICON_CHECK_SUB,
+                         callback_data=f"paycheck_{payment.id}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
+
+    price_line = "К оплате: " + " или ".join(price_parts)
+    return InlineKeyboardMarkup(inline_keyboard=rows), price_line, " ".join(hints)
 
 async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
@@ -3073,22 +3245,22 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
     ТОЛЬКО для заголовка в Telegram; в описание/метаданные ЮKassa не попадает.
     extra_desc — доп. текст-описание (например состав тарифа), показывается
     сразу на этом же экране, вместе с кнопками оплаты — тоже не уходит в ЮKassa."""
-    if not PAYMENTS_ENABLED:
+    if not payments_available():
         await safe_answer(cb, PAYMENTS_OFF_SHORT, show_alert=True)
         await edit_screen(cb.message, f"{hbold(item_name)}\n\n{PAYMENTS_OFF_TEXT}",
                           parse_mode="HTML", reply_markup=payments_off_kb())
         return
-    payment, kb = await _create_payment_core(
+    kb, price_line, hint = await _create_payment_core(
         cb.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
     )
-    if not payment:
+    if not kb:
         await safe_answer(cb, "Ошибка создания платежа.", show_alert=True)
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     desc_block = f"\n{extra_desc}\n" if extra_desc else ""
     await edit_screen(cb.message,
-        f"{prefix}{hbold(item_name)}\n{desc_block}\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
+        f"{prefix}{hbold(item_name)}\n{desc_block}\n{price_line}\n\n{hint}",
         parse_mode="HTML", reply_markup=kb,
     )
 
@@ -3099,28 +3271,174 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
                                              qty: int = 0, display_prefix: str = ""):
     """То же самое, что _create_payment_page, но когда вызов идёт из ответа на
     текстовое сообщение (ввод количества), а не из нажатия кнопки."""
-    if not PAYMENTS_ENABLED:
+    if not payments_available():
         await message.answer(f"{hbold(item_name)}\n\n{PAYMENTS_OFF_TEXT}",
                              parse_mode="HTML", reply_markup=payments_off_kb())
         return
-    payment, kb = await _create_payment_core(
+    kb, price_line, hint = await _create_payment_core(
         message.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
     )
-    if not payment:
+    if not kb:
         await message.answer("Ошибка создания платежа.")
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     await message.answer(
-        f"{prefix}{hbold(item_name)}\n\nК оплате: {price} руб.\n\nПосле оплаты нажмите «Проверить оплату».",
+        f"{prefix}{hbold(item_name)}\n\n{price_line}\n\n{hint}",
         parse_mode="HTML", reply_markup=kb,
     )
+
+# ─────────────────────────────────────────────
+#  ВЫДАЧА ОПЛАЧЕННОГО — одна точка на все способы оплаты
+#
+#  Раньше вся выдача лежала внутри хендлера «Проверить оплату» (ЮKassa).
+#  Теперь способов оплаты два, поэтому логика вынесена сюда: и карта, и
+#  звёзды зовут одну и ту же функцию и выдают ровно одно и то же.
+# ─────────────────────────────────────────────
+async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
+                            hwid: int | None = None,
+                            squad: str | list[str] | None = None, whitelist_gb: int = 0,
+                            plan_key: str | None = None, price: float = 0,
+                            is_trial: bool = False, item_name: str = "Покупка",
+                            qty: int = 0, source: str = "yookassa"):
+    """Выдаёт оплаченное: подписку / устройства / апгрейд / трафик.
+
+    Возвращает (успех, текст_ошибки, уже_обрабатывался).
+
+    Идемпотентность: атомарный INSERT в processed_payments по pay_id. Повтор
+    того же платежа (двойной тап «Проверить оплату», повторный апдейт от
+    Telegram) ничего не выдаёт второй раз. Если выдача сорвалась — отметка
+    снимается, чтобы повторная попытка сработала, а не молча съелась.
+    """
+    async with pool.acquire() as conn:
+        db_row = await conn.fetchrow(
+            "SELECT username, referrer_id FROM users WHERE user_id=$1", u_id
+        )
+    uname       = db_row["username"] if db_row else None
+    referrer_id = db_row["referrer_id"] if db_row else None
+
+    async with pool.acquire() as conn:
+        inserted = await conn.fetchrow(
+            "INSERT INTO processed_payments (payment_id, processed_at) VALUES ($1,$2) "
+            "ON CONFLICT (payment_id) DO NOTHING RETURNING payment_id",
+            pay_id, int(time.time()),
+        )
+    if inserted is None:
+        return True, None, True
+
+    async def _rollback(err: str):
+        """Снять отметку об обработке, чтобы платёж можно было провести ещё раз."""
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM processed_payments WHERE payment_id=$1", pay_id)
+        except Exception as e:
+            log.exception("rollback processed_payments %s: %s", pay_id, e)
+        log.error("Выдача не удалась (%s, %s): %s", pay_id, source, err)
+        return False, err, False
+
+    if kind in ("trial", "plan"):
+        result_user = await activate_subscription(u_id, days, hwid or 1,
+                                                  squad_uuid=squad, whitelist_gb=whitelist_gb)
+        if not result_user:
+            return await _rollback("не удалось активировать подписку.")
+        async with pool.acquire() as conn:
+            if kind == "trial":
+                await conn.execute(
+                    "UPDATE users SET trial_used=TRUE, plan='trial' WHERE user_id=$1", u_id
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET plan=$1, extra_devices=0, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
+                    plan_key, result_user.get("uuid"), u_id,
+                )
+
+    elif kind == "device":
+        remna = await remna_get_user(u_id)
+        if not remna:
+            return await _rollback("пользователь не найден в панели.")
+        add_count = qty if qty > 0 else 1
+        new_hwid = remna.get("hwidDeviceLimit", 1) + add_count
+        result_user = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
+        if not result_user:
+            return await _rollback("не удалось обновить лимит устройств.")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET extra_devices = extra_devices + $1 WHERE user_id=$2", add_count, u_id
+            )
+
+    elif kind == "upgrade":
+        remna = await remna_get_user(u_id)
+        if not remna:
+            return await _rollback("пользователь не найден в панели.")
+        result_user = await remna_update_user(
+            remna["uuid"], {"activeInternalSquads": [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]}
+        )
+        if not result_user:
+            return await _rollback("не удалось обновить тариф.")
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE users SET plan='vpn_bypass' WHERE user_id=$1", u_id)
+            wl_gb = PLANS["vpn_bypass"]["whitelist_gb"]
+            await conn.execute(
+                "INSERT INTO whitelist_limits (user_id, gb_limit, period_start, cut_off) "
+                "VALUES ($1,$2,$3,FALSE) "
+                "ON CONFLICT (user_id) DO UPDATE SET gb_limit=$2, period_start=$3, cut_off=FALSE",
+                u_id, wl_gb, int(time.time()),
+            )
+
+    elif kind == "wl_topup":
+        add_gb = whitelist_gb if whitelist_gb > 0 else 1
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT gb_limit FROM whitelist_limits WHERE user_id=$1", u_id)
+            if row:
+                await conn.execute(
+                    "UPDATE whitelist_limits SET gb_limit = gb_limit + $1, cut_off=FALSE WHERE user_id=$2",
+                    add_gb, u_id,
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO whitelist_limits (user_id, gb_limit, period_start, cut_off) "
+                    "VALUES ($1,$2,$3,FALSE)",
+                    u_id, add_gb, int(time.time()),
+                )
+        remna = await remna_get_user(u_id)
+        if remna:
+            current_squads = _squad_uuids(remna.get("activeInternalSquads"))
+            if SQUAD_UUID_WHITELIST not in current_squads:
+                current_squads.append(SQUAD_UUID_WHITELIST)
+                await remna_update_user(remna["uuid"], {"activeInternalSquads": current_squads})
+
+    # Сумма пишется в рублях независимо от способа оплаты — иначе отчёты,
+    # статистика и рефералка начали бы смешивать рубли со звёздами.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, created_at, payment_id) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            u_id, price, kind, days, is_trial,
+            "stars" if source == "stars" else "purchase",
+            int(time.time()), pay_id,
+        )
+
+    await notify_admins_sale(u_id, uname, item_name, days, price, is_trial)
+
+    # 🧾 Чек самозанятого в «Мой налог» (если фискализация включена).
+    # Только для рублёвых оплат: звёзды — это внутренняя валюта Telegram,
+    # выручка по ним приходит отдельной выплатой и чек по ней бьётся не в
+    # момент покупки. Если понадобится фискализировать и звёзды — убрать
+    # условие source != "stars".
+    if source != "stars":
+        spawn_background(fiscalize_payment(pay_id, u_id, price, item_name))
+
+    if referrer_id and not is_trial:
+        await credit_referral(referrer_id, u_id, uname, item_name, price)
+
+    return True, None, False
+
 
 @router.callback_query(F.data.startswith("paycheck_"))
 async def check_payment_cb(cb: CallbackQuery):
     await safe_answer(cb)
     # Кнопки «Проверить оплату» из старых сообщений остаются висеть в
-    # переписках — пока приём оплаты отключён, проверять нечего.
+    # переписках — пока приём оплаты картой отключён, проверять нечего.
     if not PAYMENTS_ENABLED or Payment is None:
         await safe_answer(cb, PAYMENTS_OFF_SHORT + ".", show_alert=True)
         return
@@ -3151,119 +3469,14 @@ async def check_payment_cb(cb: CallbackQuery):
     item_name   = md.get("item_name", "Покупка")
     qty         = int(md.get("qty", 0) or 0)
 
-    async with pool.acquire() as conn:
-        db_row = await conn.fetchrow(
-            "SELECT username, referrer_id, has_paid, extra_devices, plan FROM users WHERE user_id=$1", u_id
-        )
-    uname       = db_row["username"] if db_row else None
-    referrer_id = db_row["referrer_id"] if db_row else None
-    extra_devices_now = db_row["extra_devices"] if db_row else 0
-    current_plan_now  = db_row["plan"] if db_row else None
-
-    # Идемпотентность: если "Проверить оплату" нажали повторно уже ПОСЛЕ
-    # успешной обработки этого же платежа, всё что ниже (активация,
-    # начисление устройств/ГБ, уведомление админам, реферальный процент)
-    # не должно повториться второй раз. Атомарный INSERT с ON CONFLICT
-    # решает и гонку при почти одновременном двойном тапе.
-    async with pool.acquire() as conn:
-        inserted = await conn.fetchrow(
-            "INSERT INTO processed_payments (payment_id, processed_at) VALUES ($1,$2) "
-            "ON CONFLICT (payment_id) DO NOTHING RETURNING payment_id",
-            pay_id, int(time.time()),
-        )
-    already_processed = inserted is None
-
-    result_user = None
-
-    if not already_processed:
-        if kind in ("trial", "plan"):
-            result_user = await activate_subscription(u_id, days, hwid or 1, squad_uuid=squad, whitelist_gb=whitelist_gb)
-            if not result_user:
-                await safe_answer(cb, "Ошибка активации. Обратитесь в поддержку.", show_alert=True)
-                return
-            async with pool.acquire() as conn:
-                if kind == "trial":
-                    await conn.execute(
-                        "UPDATE users SET trial_used=TRUE, plan='trial' WHERE user_id=$1", u_id
-                    )
-                else:
-                    await conn.execute(
-                        "UPDATE users SET plan=$1, extra_devices=0, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
-                        plan_key, result_user.get("uuid"), u_id,
-                    )
-
-        elif kind == "device":
-            remna = await remna_get_user(u_id)
-            if not remna:
-                await safe_answer(cb, "Пользователь не найден в панели.", show_alert=True)
-                return
-            add_count = qty if qty > 0 else 1
-            new_hwid = remna.get("hwidDeviceLimit", 1) + add_count
-            result_user = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
-            if not result_user:
-                await safe_answer(cb, "Ошибка обновления устройств.", show_alert=True)
-                return
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE users SET extra_devices = extra_devices + $1 WHERE user_id=$2", add_count, u_id
-                )
-
-        elif kind == "upgrade":
-            remna = await remna_get_user(u_id)
-            if not remna:
-                await safe_answer(cb, "Пользователь не найден в панели.", show_alert=True)
-                return
-            result_user = await remna_update_user(remna["uuid"], {"activeInternalSquads": [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]})
-            if not result_user:
-                await safe_answer(cb, "Ошибка обновления тарифа.", show_alert=True)
-                return
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE users SET plan='vpn_bypass' WHERE user_id=$1", u_id)
-                wl_gb = PLANS["vpn_bypass"]["whitelist_gb"]
-                await conn.execute(
-                    "INSERT INTO whitelist_limits (user_id, gb_limit, period_start, cut_off) "
-                    "VALUES ($1,$2,$3,FALSE) "
-                    "ON CONFLICT (user_id) DO UPDATE SET gb_limit=$2, period_start=$3, cut_off=FALSE",
-                    u_id, wl_gb, int(time.time()),
-                )
-
-        elif kind == "wl_topup":
-            add_gb = whitelist_gb if whitelist_gb > 0 else 1
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT gb_limit FROM whitelist_limits WHERE user_id=$1", u_id)
-                if row:
-                    await conn.execute(
-                        "UPDATE whitelist_limits SET gb_limit = gb_limit + $1, cut_off=FALSE WHERE user_id=$2",
-                        add_gb, u_id,
-                    )
-                else:
-                    await conn.execute(
-                        "INSERT INTO whitelist_limits (user_id, gb_limit, period_start, cut_off) "
-                        "VALUES ($1,$2,$3,FALSE)",
-                        u_id, add_gb, int(time.time()),
-                    )
-            remna = await remna_get_user(u_id)
-            if remna:
-                current_squads = _squad_uuids(remna.get("activeInternalSquads"))
-                if SQUAD_UUID_WHITELIST not in current_squads:
-                    current_squads.append(SQUAD_UUID_WHITELIST)
-                    await remna_update_user(remna["uuid"], {"activeInternalSquads": current_squads})
-            result_user = remna or {}
-
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, created_at, payment_id) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-                u_id, price, kind, days, is_trial, int(time.time()), pay_id,
-            )
-
-        await notify_admins_sale(u_id, uname, item_name, days, price, is_trial)
-
-        # 🧾 Чек самозанятого в «Мой налог» (если фискализация включена).
-        # В фоне: ответ ФНС не должен задерживать экран «Оплата прошла успешно».
-        spawn_background(fiscalize_payment(pay_id, u_id, price, item_name))
-
-        if referrer_id and not is_trial:
-            await credit_referral(referrer_id, u_id, uname, item_name, price)
+    ok, err, already_processed = await _fulfill_purchase(
+        pay_id=pay_id, u_id=u_id, kind=kind, days=days, hwid=hwid, squad=squad,
+        whitelist_gb=whitelist_gb, plan_key=plan_key, price=price, is_trial=is_trial,
+        item_name=item_name, qty=qty, source="yookassa",
+    )
+    if not ok:
+        await safe_answer(cb, f"{err} Обратитесь в поддержку.", show_alert=True)
+        return
 
     text, kb = await _build_profile_view(u_id)
     await edit_screen(cb.message,
@@ -3272,6 +3485,140 @@ async def check_payment_cb(cb: CallbackQuery):
     # Инструкция по подключению — в закрепе канала: зовём подписаться именно
     # после покупки тарифа (для докупки устройств/трафика — не нужно, у
     # человека уже всё подключено).
+    if not already_processed and kind in ("trial", "plan"):
+        await send_channel_instructions(u_id)
+
+# ─────────────────────────────────────────────
+#  ОПЛАТА ЗВЁЗДАМИ TELEGRAM
+#
+#  Счёт выставляет сам Telegram (currency="XTR", provider_token пустой),
+#  внешний платёжный провайдер не участвует. Порядок такой:
+#    1) кнопка «Оплатить звёздами» → send_invoice со счётом на N ⭐;
+#    2) Telegram спрашивает подтверждение → pre_checkout_query (ответить
+#       нужно в течение 10 секунд, иначе оплата отваливается);
+#    3) после списания приходит message.successful_payment → выдаём
+#       купленное через общую _fulfill_purchase.
+#  Хендлеры стоят здесь, ДО всех FSM-хендлеров сообщений, чтобы сообщение об
+#  оплате не перехватил обработчик ввода количества устройств или ГБ.
+# ─────────────────────────────────────────────
+@router.callback_query(F.data.startswith("starspay_"))
+async def stars_pay_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not STARS_ENABLED:
+        await safe_answer(cb, "Оплата звёздами временно недоступна.", show_alert=True)
+        return
+    token = cb.data.removeprefix("starspay_")
+    row = await _stars_invoice_get(token)
+    if not row or row["user_id"] != cb.from_user.id:
+        await safe_answer(cb, "Счёт устарел. Откройте покупку заново.", show_alert=True)
+        return
+    if row["paid_at"]:
+        await safe_answer(cb, "Этот счёт уже оплачен.", show_alert=True)
+        return
+    title = _stars_title(row["item_name"])
+    try:
+        await bot.send_invoice(
+            chat_id=cb.from_user.id,
+            title=title,
+            description=f"{title} · {row['price']} руб. Оплата звёздами Telegram."[:255],
+            payload=f"stars:{token}",
+            provider_token="",          # для звёзд провайдер не нужен
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=int(row["stars"]))],
+        )
+    except Exception as e:
+        log.exception("send_invoice(XTR): %s", e)
+        await safe_answer(cb, "Не удалось выставить счёт. Попробуйте ещё раз.", show_alert=True)
+
+
+@router.pre_checkout_query()
+async def stars_pre_checkout(q: PreCheckoutQuery):
+    """Последняя проверка перед списанием звёзд. Ответить обязательно и
+    быстро — Telegram ждёт не дольше 10 секунд."""
+    ok, err = True, None
+    payload = q.invoice_payload or ""
+    if payload.startswith("stars:"):
+        row = await _stars_invoice_get(payload.removeprefix("stars:"))
+        if not row or row["user_id"] != q.from_user.id:
+            ok, err = False, "Счёт устарел. Откройте покупку в боте заново."
+        elif row["paid_at"]:
+            ok, err = False, "Этот счёт уже оплачен."
+    try:
+        await q.answer(ok=ok, error_message=err)
+    except Exception as e:
+        log.warning("pre_checkout answer: %s", e)
+
+
+@router.message(F.successful_payment)
+async def stars_successful_payment(message: types.Message):
+    sp = message.successful_payment
+    payload = sp.invoice_payload or ""
+    if not payload.startswith("stars:"):
+        return
+    token  = payload.removeprefix("stars:")
+    u_id   = message.from_user.id
+    charge = sp.telegram_payment_charge_id or ""
+    pay_id = f"stars_{charge or token}"
+
+    row = await _stars_invoice_get(token)
+    if not row:
+        log.error("Оплата звёздами: счёт %s не найден (charge %s, user %s)", token, charge, u_id)
+        await message.answer(
+            "Звёзды списаны, но счёт не найден. Напишите в поддержку: "
+            f"@{SUPPORT_USERNAME}"
+        )
+        return
+
+    # Отметку об оплате ставим сразу: даже если выдача ниже сорвётся, счёт
+    # уже не будет считаться свежим и его не выставят повторно.
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE star_invoices SET paid_at=$1, charge_id=$2 WHERE token=$3",
+                int(time.time()), charge, token,
+            )
+    except Exception as e:
+        log.exception("star invoice mark paid: %s", e)
+
+    squad_raw = row["squad"] or None
+    squad     = squad_raw.split(",") if squad_raw and "," in squad_raw else squad_raw
+    kind      = row["kind"]
+
+    ok, err, already_processed = await _fulfill_purchase(
+        pay_id=pay_id, u_id=u_id, kind=kind, days=row["days"] or 0, hwid=row["hwid"],
+        squad=squad, whitelist_gb=row["whitelist_gb"] or 0,
+        plan_key=(row["plan_key"] or None), price=float(row["price"] or 0),
+        is_trial=bool(row["is_trial"]), item_name=row["item_name"] or "Покупка",
+        qty=row["qty"] or 0, source="stars",
+    )
+    if not ok:
+        # Звёзды уже списаны — молчать нельзя: пишем человеку и зовём админов,
+        # чтобы выдать руками (или вернуть звёзды через refundStarPayment).
+        await message.answer(
+            f"Звёзды получены, но {err}\n"
+            f"Напишите в поддержку — выдадим вручную: @{SUPPORT_USERNAME}"
+        )
+        uname = f"@{message.from_user.username}" if message.from_user.username else f"ID:{u_id}"
+        for admin_id in all_admin_ids():
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"Оплата звёздами прошла, а выдача сорвалась.\n\n"
+                    f"Пользователь: {uname} (ID: {u_id})\n"
+                    f"Позиция: {row['item_name']}\n"
+                    f"Сумма: {row['stars']} ⭐ ({row['price']} руб.)\n"
+                    f"charge_id: {charge}\n"
+                    f"Причина: {err}"
+                )
+            except Exception:
+                pass
+        return
+
+    text, kb = await _build_profile_view(u_id)
+    await message.answer(
+        f"Оплата прошла успешно. Списано {row['stars']} ⭐\n\n{text}",
+        parse_mode="HTML", reply_markup=kb,
+    )
     if not already_processed and kind in ("trial", "plan"):
         await send_channel_instructions(u_id)
 
@@ -3329,7 +3676,7 @@ async def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
     """Текст и клавиатура экрана «Купить VPN» (выбор тарифа). Вынесен
     отдельно, чтобы использовать как из нажатия кнопки, так и при перебросе
     из личного кабинета (диплинк)."""
-    if not PAYMENTS_ENABLED:
+    if not payments_available():
         return PAYMENTS_OFF_TEXT, payments_off_kb()
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
@@ -3342,9 +3689,10 @@ async def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
         f"Дополнительные устройства и трафик 📶 "
         f"докупаются в главном меню после покупки тарифа."
     )
+    # Два тарифа стоят в одном ряду — как и остальные кнопки бота.
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn(vpn["name"], emoji_id=BTN_ICON_PLAN_VPN, callback_data="buyplan_vpn")],
-        [btn(bypass["name"], emoji_id=BTN_ICON_PLAN_BYPASS, callback_data="buyplan_vpn_bypass")],
+        [btn(vpn["name"], emoji_id=BTN_ICON_PLAN_VPN, callback_data="buyplan_vpn"),
+         btn(bypass["name"], emoji_id=BTN_ICON_PLAN_BYPASS, callback_data="buyplan_vpn_bypass")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
     ])
     return text, kb
@@ -6731,7 +7079,10 @@ async def main():
     asyncio.create_task(naloggo_queue_scheduler())
     log.info("Обязательная подписка на канал: %s (%s)",
              "включена" if REQUIRE_CHANNEL_SUB else "выключена", CHANNEL_ID)
-    log.info("Приём оплаты: %s", "включён" if PAYMENTS_ENABLED else "ОТКЛЮЧЁН (ЮKassa не используется)")
+    log.info("Оплата картой (ЮKassa): %s",
+             "включена" if PAYMENTS_ENABLED else "ОТКЛЮЧЕНА")
+    log.info("Оплата звёздами Telegram: %s",
+             f"включена, курс 1 ⭐ = {STARS_RUB_RATE} руб." if STARS_ENABLED else "ОТКЛЮЧЕНА")
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
