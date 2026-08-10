@@ -166,7 +166,7 @@ SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 TOS_URL     = os.environ.get("TOS_URL", "").strip() or \
     "https://telegra.ph/Polzovatelskoe-soglashenie-04-01-19"
 PRIVACY_URL = os.environ.get("PRIVACY_URL", "").strip() or \
-    "https://telegra.ph/Politika-konfidencialnosti-06-21-31"
+    "https://telegra.ph/Politika-konfidencialnosti-08-01-83"
 
 # Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
