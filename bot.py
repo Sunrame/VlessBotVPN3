@@ -220,20 +220,21 @@ if PAYMENTS_ENABLED and Configuration is not None and SHOP_ID and YOOKASSA_KEY:
 #  не нужен: счёт выставляет сам Telegram, provider_token пустой.
 #  Выключается переменной STARS_ENABLED=0 — тогда всё вернётся как было.
 #
-#  STARS_RUB_RATE — сколько рублей стоит одна звезда. Цены в боте заданы в
-#  рублях (и в рублях же считаются рефералка, отчёты и статистика), поэтому
-#  в XTR сумма пересчитывается на лету по этому курсу. Курс правится
-#  переменной окружения, выкладывать код заново не нужно.
+#  STARS_RUB_RATE — сколько рублей стоит одна звезда. По умолчанию 1: цена
+#  один в один, 199 руб. = 199 ⭐. Цены в боте заданы в рублях (и в рублях же
+#  считаются рефералка, отчёты и статистика), поэтому сумма счёта в XTR
+#  берётся из рублёвой по этому курсу. Курс правится переменной окружения —
+#  выкладывать код заново не нужно.
 # ─────────────────────────────────────────────
 STARS_ENABLED = os.environ.get("STARS_ENABLED", "1").strip().lower() \
     in ("1", "true", "yes", "on")
 
 try:
-    STARS_RUB_RATE = float(os.environ.get("STARS_RUB_RATE", "1.5").replace(",", "."))
+    STARS_RUB_RATE = float(os.environ.get("STARS_RUB_RATE", "1").replace(",", "."))
 except ValueError:
-    STARS_RUB_RATE = 1.5
+    STARS_RUB_RATE = 1.0
 if STARS_RUB_RATE <= 0:
-    STARS_RUB_RATE = 1.5
+    STARS_RUB_RATE = 1.0
 
 # Границы суммы счёта в звёздах со стороны Telegram.
 STARS_MIN = 1
@@ -3222,7 +3223,12 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
             rows.append([btn(f"Оплатить звёздами — {stars} ⭐", emoji_id=BTN_ICON_STARS,
                              style=None if payment else "success",
                              callback_data=f"starspay_{token}")])
-            price_parts.append(f"{stars} ⭐" if payment else f"{stars} ⭐ (≈{price} руб.)")
+            # При курсе 1:1 приписка «(≈199 руб.)» дублирует саму цифру —
+            # показываем её, только если суммы реально разошлись.
+            if payment or stars == int(price):
+                price_parts.append(f"{stars} ⭐")
+            else:
+                price_parts.append(f"{stars} ⭐ (≈{price} руб.)")
             hints.append("Звёзды спишутся сразу, подписка включится сама.")
 
     if not rows:
@@ -7082,7 +7088,7 @@ async def main():
     log.info("Оплата картой (ЮKassa): %s",
              "включена" if PAYMENTS_ENABLED else "ОТКЛЮЧЕНА")
     log.info("Оплата звёздами Telegram: %s",
-             f"включена, курс 1 ⭐ = {STARS_RUB_RATE} руб." if STARS_ENABLED else "ОТКЛЮЧЕНА")
+             f"включена, курс 1 ⭐ = {STARS_RUB_RATE:g} руб." if STARS_ENABLED else "ОТКЛЮЧЕНА")
     log.info("TrubaVPN Bot starting (Remnawave)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
