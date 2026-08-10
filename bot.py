@@ -1346,6 +1346,7 @@ def sub_gate_view() -> tuple[str, InlineKeyboardMarkup]:
 #  следующем действии. Это и нужно: согласие должно быть у всех.
 # ─────────────────────────────────────────────
 _terms_cache: set[int] = set()
+_terms_accept_locks: dict[int, asyncio.Lock] = {}
 
 
 async def terms_accepted(user_id: int) -> bool:
@@ -2896,30 +2897,59 @@ async def accept_terms_cb(cb: CallbackQuery, state: FSMContext):
     """Согласие с офертой: фиксируем отметку, закрепляем документы и
     только после этого пускаем в меню."""
     u_id = cb.from_user.id
-    now = int(time.time())
+    lock = _terms_accept_locks.setdefault(u_id, asyncio.Lock())
+    async with lock:
+        # Telegram может прислать несколько callback-запросов при повторных
+        # нажатиях. После первого успешного принятия больше не отправляем и не
+        # закрепляем копии документов.
+        if await terms_accepted(u_id):
+            await safe_answer(cb, "Условия уже приняты.")
+        else:
+            now = int(time.time())
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO users (user_id, username, created_at, terms_accepted_at) "
+                    "VALUES ($1,$2,$3,$4) ON CONFLICT (user_id) DO UPDATE "
+                    "SET username=EXCLUDED.username, terms_accepted_at=EXCLUDED.terms_accepted_at",
+                    u_id, cb.from_user.username, now, now,
+                )
+            _terms_cache.add(u_id)
+            await safe_answer(cb, "Спасибо, условия приняты.")
+            await state.clear()
+            await pin_terms_message(u_id)
+
+        # Дальше обычный порядок: подписка на канал, затем профиль.
+        if REQUIRE_CHANNEL_SUB and not is_admin(u_id) and not await is_subscribed(u_id):
+            text, kb = sub_gate_view()
+            try:
+                await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                await bot.send_message(u_id, text, parse_mode="HTML", reply_markup=kb)
+            return
+        await _show_home(cb)
+
+
+@router.my_chat_member()
+async def reset_terms_after_bot_block(event: types.ChatMemberUpdated):
+    """После блокировки бота забываем согласие пользователя.
+
+    При последующей разблокировке следующий /start снова покажет документы.
+    Telegram присылает my_chat_member со статусом `kicked`, когда пользователь
+    блокирует бота в личном чате.
+    """
+    if event.chat.type != "private":
+        return
+    user_id = event.chat.id
+    new_status = event.new_chat_member.status
+    if new_status != "kicked":
+        return
+    _terms_cache.discard(user_id)
+    _sub_cache.pop(user_id, None)
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO users (user_id, username, created_at, terms_accepted_at) "
-            "VALUES ($1,$2,$3,$4) ON CONFLICT (user_id) DO UPDATE "
-            "SET terms_accepted_at=$4 WHERE COALESCE(users.terms_accepted_at,0)=0",
-            u_id, cb.from_user.username, now, now,
+            "UPDATE users SET terms_accepted_at=0 WHERE user_id=$1",
+            user_id,
         )
-    _terms_cache.add(u_id)
-    await safe_answer(cb, "Спасибо, условия приняты.")
-    await state.clear()
-
-    # Отдельным сообщением — оно и уходит в закреп.
-    await pin_terms_message(u_id)
-
-    # Дальше обычный порядок: подписка на канал, затем профиль.
-    if REQUIRE_CHANNEL_SUB and not is_admin(u_id) and not await is_subscribed(u_id):
-        text, kb = sub_gate_view()
-        try:
-            await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            await bot.send_message(u_id, text, parse_mode="HTML", reply_markup=kb)
-        return
-    await _show_home(cb)
 
 
 @router.callback_query(F.data == "check_sub")
