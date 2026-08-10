@@ -2911,34 +2911,43 @@ async def accept_terms_cb(cb: CallbackQuery, state: FSMContext):
     u_id = cb.from_user.id
     lock = _terms_accept_locks.setdefault(u_id, asyncio.Lock())
     async with lock:
-        # Telegram может прислать несколько callback-запросов при повторных
-        # нажатиях. После первого успешного принятия больше не отправляем и не
-        # закрепляем копии документов.
-        if await terms_accepted(u_id):
-            await safe_answer(cb, "Условия уже приняты.")
-        else:
-            now = int(time.time())
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO users (user_id, username, created_at, terms_accepted_at) "
-                    "VALUES ($1,$2,$3,$4) ON CONFLICT (user_id) DO UPDATE "
-                    "SET username=EXCLUDED.username, terms_accepted_at=EXCLUDED.terms_accepted_at",
-                    u_id, cb.from_user.username, now, now,
-                )
-            _terms_cache.add(u_id)
-            await safe_answer(cb, "Спасибо, условия приняты.")
-            await state.clear()
-            await pin_terms_message(u_id)
+        # Фиксируем согласие атомарно. UPDATE вернёт значение ровно один раз;
+        # повторные/задвоенные callback-запросы не создадут новый закреп.
+        now = int(time.time())
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (user_id, username, created_at, terms_accepted_at) "
+                "VALUES ($1,$2,$3,0) ON CONFLICT (user_id) DO NOTHING",
+                u_id, cb.from_user.username, now,
+            )
+            accepted_now = await conn.fetchval(
+                "UPDATE users SET username=$2, terms_accepted_at=$3 "
+                "WHERE user_id=$1 AND COALESCE(terms_accepted_at,0)=0 "
+                "RETURNING terms_accepted_at",
+                u_id, cb.from_user.username, now,
+            )
+        _terms_cache.add(u_id)
+        await safe_answer(
+            cb,
+            "Спасибо, условия приняты." if accepted_now else "Условия уже приняты.",
+        )
+        await state.clear()
 
-        # Дальше обычный порядок: подписка на канал, затем профиль.
+        # Сначала навсегда убираем с исходного сообщения кнопку принятия.
+        # Даже если закрепление или Telegram API задержатся, повторно нажать её
+        # и снова попасть на экран документов уже нельзя.
         if REQUIRE_CHANNEL_SUB and not is_admin(u_id) and not await is_subscribed(u_id):
             text, kb = sub_gate_view()
             try:
                 await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
             except Exception:
                 await bot.send_message(u_id, text, parse_mode="HTML", reply_markup=kb)
-            return
-        await _show_home(cb)
+        else:
+            await _show_home(cb)
+
+        # Отдельный закреп отправляется только при первом успешном принятии.
+        if accepted_now:
+            await pin_terms_message(u_id)
 
 
 @router.my_chat_member()
