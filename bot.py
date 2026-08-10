@@ -886,13 +886,20 @@ async def init_db():
             await conn.execute("ALTER TABLE naloggo_receipts ADD COLUMN IF NOT EXISTS attempted_at BIGINT DEFAULT 0")
         except Exception:
             pass
-        # Миграции на случай старой БД
+        # Критическая миграция гейта документов. Её нельзя молча пропускать:
+        # без столбца бот не способен отличить принятое согласие от нового
+        # пользователя и раньше ошибочно сразу показывал подписку на канал.
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+            "terms_accepted_at BIGINT DEFAULT 0"
+        )
+
+        # Остальные миграции на случай старой БД
         for col in [
             "remna_uuid TEXT", "created_at BIGINT DEFAULT 0",
             "plan TEXT DEFAULT NULL", "extra_devices INTEGER DEFAULT 0",
             "trial_used BOOLEAN DEFAULT FALSE", "referral_balance NUMERIC DEFAULT 0",
             "referral_percent INTEGER",
-            "terms_accepted_at BIGINT DEFAULT 0",
         ]:
             try:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
@@ -1350,8 +1357,8 @@ _terms_accept_locks: dict[int, asyncio.Lock] = {}
 
 
 async def terms_accepted(user_id: int) -> bool:
-    """Принял ли человек оферту. Подтверждённые кэшируются в памяти —
-    отозвать согласие можно только через БД + перезапуск бота."""
+    """Принял ли человек документы. Подтверждённые кэшируются в памяти;
+    блокировка бота очищает и БД, и эту запись кэша."""
     if user_id in _terms_cache:
         return True
     try:
@@ -1359,8 +1366,13 @@ async def terms_accepted(user_id: int) -> bool:
             ts = await conn.fetchval(
                 "SELECT terms_accepted_at FROM users WHERE user_id=$1", user_id)
     except Exception as e:
-        log.warning("Проверка оферты для %s не удалась: %r", user_id, e)
-        return True  # проблема с БД не должна закрывать бота целиком
+        # Согласие нельзя подразумевать. Если БД не смогла подтвердить
+        # принятие документов, показываем документы повторно и пишем точную
+        # ошибку в лог вместо обхода гейта.
+        _terms_cache.discard(user_id)
+        log.error("Проверка принятия документов для %s не удалась: %r (доступ закрыт)",
+                  user_id, e)
+        return False
     if ts:
         _terms_cache.add(user_id)
         return True
@@ -2941,7 +2953,7 @@ async def reset_terms_after_bot_block(event: types.ChatMemberUpdated):
         return
     user_id = event.chat.id
     new_status = event.new_chat_member.status
-    if new_status != "kicked":
+    if new_status not in ("kicked", "left"):
         return
     _terms_cache.discard(user_id)
     _sub_cache.pop(user_id, None)
