@@ -158,6 +158,14 @@ SUB_CACHE_TTL = int(os.environ.get("SUB_CACHE_TTL", "300"))
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
 SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 
+# Документы сервиса. Вынесены в константы: используются и в разделе
+# «О сервисе», и на экране принятия оферты, и в закрепляемом сообщении —
+# при смене ссылки править нужно только здесь (или переменной окружения).
+TOS_URL     = os.environ.get("TOS_URL", "").strip() or \
+    "https://telegra.ph/Polzovatelskoe-soglashenie-04-01-19"
+PRIVACY_URL = os.environ.get("PRIVACY_URL", "").strip() or \
+    "https://telegra.ph/Politika-konfidencialnosti-06-21-31"
+
 # Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
 SITE_URL           = os.environ.get("SITE_URL", "").rstrip("/")
@@ -227,7 +235,7 @@ def msk_now() -> datetime:
 #
 #  Работают только в тексте сообщений (parse_mode="HTML"), НЕ в кнопках —
 #  кнопки Telegram принимают только простой текст без форматирования.
-#    ля непремиум-пользователей и старых клиентов показывается fallback-символ
+#  Для непремиум-пользователей и старых клиентов показывается fallback-символ
 #  вместо кастомного эмодзи. Расставлены по одному разу на смысловой момент,
 #  без перегруза одного и того же места несколькими штуками.
 # ─────────────────────────────────────────────
@@ -682,7 +690,7 @@ async def global_error_handler(event: ErrorEvent) -> None:
 #    • кнопка «Я подписался» (check_sub) — иначе её нечем было бы нажать;
 #    • админы и не-приватные чаты.
 # ─────────────────────────────────────────────
-SUB_GATE_SKIP_CALLBACKS = {"check_sub"}
+SUB_GATE_SKIP_CALLBACKS = {"check_sub", "accept_terms"}
 
 
 @dp.message.outer_middleware()
@@ -692,6 +700,8 @@ async def channel_sub_message_middleware(handler, event: types.Message, data: di
     text = (event.text or "").strip()
     if text == "/start" or text.startswith("/start ") or text.startswith("/start@"):
         return await handler(event, data)
+    if not await terms_gate_passed(event):
+        return None
     if await sub_gate_passed(event):
         return await handler(event, data)
     return None
@@ -701,6 +711,8 @@ async def channel_sub_message_middleware(handler, event: types.Message, data: di
 async def channel_sub_callback_middleware(handler, event: CallbackQuery, data: dict):
     if (event.data or "") in SUB_GATE_SKIP_CALLBACKS:
         return await handler(event, data)
+    if not await terms_gate_passed(event):
+        return None
     if await sub_gate_passed(event):
         return await handler(event, data)
     return None
@@ -724,7 +736,8 @@ async def init_db():
                 extra_devices    INTEGER DEFAULT 0,
                 trial_used       BOOLEAN DEFAULT FALSE,
                 referral_balance NUMERIC DEFAULT 0,
-                referral_percent INTEGER
+                referral_percent INTEGER,
+                terms_accepted_at BIGINT DEFAULT 0
             )
         """)
         await conn.execute("""
@@ -877,6 +890,7 @@ async def init_db():
             "plan TEXT DEFAULT NULL", "extra_devices INTEGER DEFAULT 0",
             "trial_used BOOLEAN DEFAULT FALSE", "referral_balance NUMERIC DEFAULT 0",
             "referral_percent INTEGER",
+            "terms_accepted_at BIGINT DEFAULT 0",
         ]:
             try:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
@@ -1017,7 +1031,7 @@ async def remna_get_user(user_id: int) -> dict | None:
 
 def _normalize_squads(squad_uuid) -> list[str]:
     """squad_uuid может быть одной строкой (старый формат) или списком строк
-    (нужно для vpn_bypass/trial — им нужен доступ сразу к 2 скваdам). Всегда
+    (нужно для vpn_bypass/trial — им нужен доступ сразу к 2 сквадам). Всегда
     возвращает список для activeInternalSquads."""
     if isinstance(squad_uuid, list):
         return squad_uuid
@@ -1168,7 +1182,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
     """
     Трафик по каждому юзеру на конкретной ноде, по дням.
     GET /api/bandwidth-stats/nodes/{uuid}/users/legacy?start=...&end=...
-    Формат д  т: ISO с миллисекундами.
+    Формат дат: ISO с миллисекундами.
     """
     if not node_uuid:
         return []
@@ -1189,7 +1203,7 @@ async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: d
         return []
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юз                    в на ноде 📶."""
+    """Сырые дневные записи трафика для ВСЕХ юзеров на ноде 📶."""
     if not WHITELIST_NODE_UUID:
         return []
     end_dt   = datetime.now(timezone.utc)
@@ -1315,6 +1329,120 @@ def sub_gate_view() -> tuple[str, InlineKeyboardMarkup]:
              callback_data="check_sub")],
     ])
     return text, kb
+
+
+# ─────────────────────────────────────────────
+#  ПРИНЯТИЕ ОФЕРТЫ ПРИ ПЕРВОМ ЗАПУСКЕ
+#
+#  Порядок для нового человека: /start → экран с документами → «Принимаю»
+#  → бот отправляет и закрепляет сообщение с документами → и только после
+#  этого открываются остальные экраны. До принятия бот не отвечает ни на
+#  что, кроме /start и самой кнопки «Принимаю» (см. middleware ниже).
+#
+#  Отметка хранится в users.terms_accepted_at (0 = не принято). У тех, кто
+#  начал пользоваться ботом раньше, отметки нет — они увидят экран при
+#  следующем действии. Это и нужно: согласие должно быть у всех.
+# ─────────────────────────────────────────────
+_terms_cache: set[int] = set()
+
+
+async def terms_accepted(user_id: int) -> bool:
+    """Принял ли человек оферту. Подтверждённые кэшируются в памяти —
+    отозвать согласие можно только через БД + перезапуск бота."""
+    if user_id in _terms_cache:
+        return True
+    try:
+        async with pool.acquire() as conn:
+            ts = await conn.fetchval(
+                "SELECT terms_accepted_at FROM users WHERE user_id=$1", user_id)
+    except Exception as e:
+        log.warning("Проверка оферты для %s не удалась: %r", user_id, e)
+        return True  # проблема с БД не должна закрывать бота целиком
+    if ts:
+        _terms_cache.add(user_id)
+        return True
+    return False
+
+
+def terms_gate_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Экран, который видит человек до принятия оферты."""
+    text = (
+        f"{hbold('Перед началом работы')}\n\n"
+        f"Ознакомьтесь с документами сервиса и подтвердите согласие — "
+        f"без этого бот недоступен.\n\n"
+        f"Нажимая «Принимаю», вы присоединяетесь к публичной оферте и даёте "
+        f"согласие на обработку персональных данных."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Пользовательское соглашение", emoji_id=BTN_ICON_TOS, url=TOS_URL)],
+        [btn("Политика конфиденциальности", emoji_id=BTN_ICON_PRIVACY, url=PRIVACY_URL)],
+        [btn("Принимаю", emoji_id=BTN_ICON_CHECK_SUB, style="success",
+             callback_data="accept_terms")],
+    ])
+    return text, kb
+
+
+def terms_docs_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Пользовательское соглашение", emoji_id=BTN_ICON_TOS, url=TOS_URL)],
+        [btn("Политика конфиденциальности", emoji_id=BTN_ICON_PRIVACY, url=PRIVACY_URL)],
+    ])
+
+
+async def pin_terms_message(chat_id: int) -> None:
+    """Отправляет сообщение с документами и закрепляет его в личке.
+
+    Ссылки живут в кнопках, а не в тексте: так Telegram не подставляет
+    превью страницы и закреп выглядит компактно. Старый закреп снимается,
+    чтобы в чате всегда висело ровно одно сообщение с документами.
+    Ошибку закрепления глушим: без закрепа бот работать не перестаёт.
+    """
+    text = (
+        f"{hbold('Документы сервиса')}\n\n"
+        f"Публичная оферта и политика обработки персональных данных. "
+        f"Сообщение закреплено, чтобы документы всегда были под рукой."
+    )
+    try:
+        msg = await bot.send_message(chat_id, text, parse_mode="HTML",
+                                     reply_markup=terms_docs_kb())
+    except Exception as e:
+        log.warning("Не удалось отправить документы %s: %r", chat_id, e)
+        return
+    try:
+        await bot.unpin_all_chat_messages(chat_id)
+    except Exception:
+        pass
+    try:
+        await bot.pin_chat_message(chat_id, msg.message_id,
+                                   disable_notification=True)
+    except Exception as e:
+        log.warning("Не удалось закрепить документы %s: %r", chat_id, e)
+
+
+async def terms_gate_passed(event) -> bool:
+    """True — оферта принята, можно работать дальше. False — человеку уже
+    показан экран с документами."""
+    user = event.from_user
+    if user is None or is_admin(user.id):
+        return True
+    if await terms_accepted(user.id):
+        return True
+    text, kb = terms_gate_view()
+    if isinstance(event, CallbackQuery):
+        await safe_answer(event, "Сначала примите условия.", show_alert=True)
+        try:
+            await edit_screen(event.message, text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            try:
+                await bot.send_message(user.id, text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+    else:
+        try:
+            await event.answer(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+    return False
 
 
 async def sub_gate_passed(event) -> bool:
@@ -1527,8 +1655,8 @@ async def calc_upgrade_price(extra_devices: int) -> int:
     """
     Доплата за апгрейд VPN -> VPN + 📶.
 
-    Дн   подписки при   пгрейде не пересчитываются и не трогаются — остаются
-    ровно те же, что были. Поэтом   доплата — просто фиксированная разница
+    Дни подписки при апгрейде не пересчитываются и не трогаются — остаются
+    ровно те же, что были. Поэтому доплата — просто фиксированная разница
     между тарифами:
       1) Разница цены тарифов за месяц: price_month_bypass - price_month_vpn
       2) Плюс разница в цене устройства, умноженная на кол-во уже купленных
@@ -2504,6 +2632,14 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     # сообщение. Дальше экраны перерисовываются правкой подписи (edit_screen).
     is_new_user = not exists
 
+    # Принятие оферты — самый первый экран для нового человека. Реферер из
+    # ссылки-приглашения уже записан выше, поэтому даже если человек примет
+    # условия позже, привод друга ему зачтётся.
+    if not is_admin(u_id) and not await terms_accepted(u_id):
+        terms_text, terms_kb = terms_gate_view()
+        await answer_start_screen(message, terms_text, terms_kb, is_new_user=is_new_user)
+        return
+
     # Обязательная подписка на канал. Проверяется здесь, а не в middleware,
     # потому что выше уже записан referrer_id из ссылки-приглашения: даже
     # если человек подпишется через час, привод друга ему зачтётся.
@@ -2591,7 +2727,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         plan = live_plan
 
         # Остаток трафика 📶 — только если реально отслеживается
-        # (есть строка в whitelist_limits с лимит  м > 0). Своя отдельная строка,
+        # (есть строка в whitelist_limits с лимитом > 0). Своя отдельная строка,
         # не смешивается с тарифом/устройствами.
         gb_line = ""
         if has_whitelist:
@@ -2675,7 +2811,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                              callback_data="plan_upgrade")])
         elif plan == "vpn_bypass":
             # Без custom-emoji иконки: на части клиентов этот premium-эмодзи
-            # рендерился поверх текста и ломал надпись кнопки («Доку  ить»).
+            # рендерился поверх текста и ломал надпись кнопки («Докупить»).
             rows.append([btn("Докупить трафик (📶)", emoji_id=BTN_ICON_GB_TOPUP,
                  callback_data="wl_topup")])
 
@@ -2696,7 +2832,7 @@ _CAB_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
 async def get_cabinet_url(user_id: int) -> str | None:
     """Ссылка на страницу входа в личный кабинет на сайте.
     Вход только по 9-значному коду (без UID). Если SITE_URL не задан —
-    возвращает None (кнопка покажет 'времен  о недоступен')."""
+    возвращает None (кнопка покажет 'временно недоступен')."""
     if not SITE_URL:
         return None
     return f"{SITE_URL}/cab"
@@ -2717,9 +2853,9 @@ def _gen_login_code() -> str:
 
 # Кнопка «Личный кабинет» теперь — это WebApp-кнопка (Telegram Mini App),
 # которая открывает мини-приложение прямо в Telegram. Вход в аккаунт
-# происходит автоматическ   — ми  и-приложение получает подписанные
+# происходит автоматически — мини-приложение получает подписанные
 # Telegram initData с данными пользователя, поэтому никакие коды входа не
-# требуются. От  ельный callback-хендлер на открытие больше не нужен;
+# требуются. Отдельный callback-хендлер на открытие больше не нужен;
 # остаётся только заглушка на случай, когда URL мини-приложения не задан.
 @router.callback_query(F.data == "cabinet_unavailable")
 async def cabinet_unavailable_cb(cb: CallbackQuery):
@@ -2752,6 +2888,37 @@ async def back_to_home(cb: CallbackQuery, state: FSMContext):
 async def profile_cb(cb: CallbackQuery):
     await safe_answer(cb)
     await _show_home(cb)
+
+@router.callback_query(F.data == "accept_terms")
+async def accept_terms_cb(cb: CallbackQuery, state: FSMContext):
+    """Согласие с офертой: фиксируем отметку, закрепляем документы и
+    только после этого пускаем в меню."""
+    u_id = cb.from_user.id
+    now = int(time.time())
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, username, created_at, terms_accepted_at) "
+            "VALUES ($1,$2,$3,$4) ON CONFLICT (user_id) DO UPDATE "
+            "SET terms_accepted_at=$4 WHERE COALESCE(users.terms_accepted_at,0)=0",
+            u_id, cb.from_user.username, now, now,
+        )
+    _terms_cache.add(u_id)
+    await safe_answer(cb, "Спасибо, условия приняты.")
+    await state.clear()
+
+    # Отдельным сообщением — оно и уходит в закреп.
+    await pin_terms_message(u_id)
+
+    # Дальше обычный порядок: подписка на канал, затем профиль.
+    if REQUIRE_CHANNEL_SUB and not is_admin(u_id) and not await is_subscribed(u_id):
+        text, kb = sub_gate_view()
+        try:
+            await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await bot.send_message(u_id, text, parse_mode="HTML", reply_markup=kb)
+        return
+    await _show_home(cb)
+
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_cb(cb: CallbackQuery, state: FSMContext):
@@ -2802,7 +2969,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
     kind: "trial" | "plan" | "device" | "upgrade" | "wl_topup"
     qty — для kind="device": сколько устройств докупается; для kind="wl_topup"
     смотри whitelist_gb (сколько ГБ докупается) — там оно и так уже есть.
-    Возвращает (payment, kb) либо (None, None) при ошибке создани   платежа.
+    Возвращает (payment, kb) либо (None, None) при ошибке создания платежа.
     Пока приём оплаты отключён (PAYMENTS_ENABLED=0) платёж не создаётся
     вообще: наружу в ЮKassa ничего не уходит.
     """
@@ -2888,7 +3055,7 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
     )
     if not payment:
-        await message.answer("Ошибка создания плат  жа.")
+        await message.answer("Ошибка создания платежа.")
         return
     prefix = f"{display_prefix} " if display_prefix else ""
     await message.answer(
@@ -2942,7 +3109,7 @@ async def check_payment_cb(cb: CallbackQuery):
 
     # Идемпотентность: если "Проверить оплату" нажали повторно уже ПОСЛЕ
     # успешной обработки этого же платежа, всё что ниже (активация,
-    # начисление устройств/ГБ, уведомление админам,   еферальный процент)
+    # начисление устройств/ГБ, уведомление админам, реферальный процент)
     # не должно повториться второй раз. Атомарный INSERT с ON CONFLICT
     # решает и гонку при почти одновременном двойном тапе.
     async with pool.acquire() as conn:
@@ -2959,7 +3126,7 @@ async def check_payment_cb(cb: CallbackQuery):
         if kind in ("trial", "plan"):
             result_user = await activate_subscription(u_id, days, hwid or 1, squad_uuid=squad, whitelist_gb=whitelist_gb)
             if not result_user:
-                await safe_answer(cb, "Ошибка активации. Обратитесь в по  держку.", show_alert=True)
+                await safe_answer(cb, "Ошибка активации. Обратитесь в поддержку.", show_alert=True)
                 return
             async with pool.acquire() as conn:
                 if kind == "trial":
@@ -3350,12 +3517,12 @@ async def earn_open_cb(cb: CallbackQuery):
         f"Ваша ссылка:\n{hcode(link)}\n\n"
         f"Приглашено: {ref_count}\n"
         f"Баланс: {balance:.2f} руб.\n"
-        f"Вывод   оступен от {REFERRAL_MIN_WITHDRAW} руб."
+        f"Вывод доступен от {REFERRAL_MIN_WITHDRAW} руб."
     )
     rows = []
     if balance >= REFERRAL_MIN_WITHDRAW:
         text += f"\n\nПорог вывода достигнут!"
-        withdraw_text = f"Хочу вывес  и реферальный баланс ({balance:.2f} руб.)"
+        withdraw_text = f"Хочу вывести реферальный баланс ({balance:.2f} руб.)"
         withdraw_url  = f"{SUPPORT_URL}?text={withdraw_text.replace(' ', '%20')}"
         rows.append([InlineKeyboardButton(text="Написать для вывода", url=withdraw_url)])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
@@ -3641,11 +3808,9 @@ async def info_tab(cb: CallbackQuery):
         f"{EMOJI_INFO} О сервисе",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [btn("Канал с инструкция  и", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
-            [btn("Пользовательское соглашение", emoji_id=BTN_ICON_TOS,
-                url="https://telegra.ph/Soglashenie-ob-ispolzovanii-materialov-i-servisov-internet-sajta-04-27")],
-            [btn("Политика конфиденциальности", emoji_id=BTN_ICON_PRIVACY,
-                url="https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-servisa-TrubaVPN-04-27")],
+            [btn("Канал с инструкциями", emoji_id=BTN_ICON_CHANNEL_SUB, url=CHANNEL_LINK)],
+            [btn("Пользовательское соглашение", emoji_id=BTN_ICON_TOS, url=TOS_URL)],
+            [btn("Политика конфиденциальности", emoji_id=BTN_ICON_PRIVACY, url=PRIVACY_URL)],
             [btn("Тех.Поддержка", emoji_id=BTN_ICON_SUPPORT, url=SUPPORT_URL)],
             [InlineKeyboardButton(text="Назад", callback_data="back")],
         ]),
@@ -3733,7 +3898,7 @@ async def admin_admins_cb(cb: CallbackQuery):
 async def admin_add_start_cb(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
     if not is_main_admin(cb.from_user.id):
-        await safe_answer(cb, "Дост  пно только главным админам.", show_alert=True)
+        await safe_answer(cb, "Доступно только главным админам.", show_alert=True)
         return
     await state.set_state(AdminManageState.waiting_username)
     await cb.message.answer(
@@ -3779,7 +3944,7 @@ async def admin_add_username_handler(message: types.Message, state: FSMContext):
 async def admin_del_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_main_admin(cb.from_user.id):
-        await safe_answer(cb, "Доступно только   лавным админам.", show_alert=True)
+        await safe_answer(cb, "Доступно только главным админам.", show_alert=True)
         return
     target_id = int(cb.data.removeprefix("admin_del_"))
     async with pool.acquire() as conn:
@@ -3953,7 +4118,7 @@ async def _render_check(target_send, user_id: int):
         f"@{username} (ID: {user_id})",
         f"Тариф: {plan_name}",
         f"Платил: {'да' if db_row['has_paid'] else 'нет'}",
-        f"Рефералов: {ref_count}   Реф. баланс: {float(db_row['referral_balance'] or 0):.2f} руб.",
+        f"Рефералов: {ref_count} · Реф. баланс: {float(db_row['referral_balance'] or 0):.2f} руб.",
     ]
     hwid = 1
     has_whitelist_squad = False
@@ -4050,7 +4215,7 @@ async def set_hwid_limit(cb: CallbackQuery):
         pass
 
 # ─────────────────────────────────────────────
-#  ДНИ: добавить / убрать / ус  ановить дату
+#  ДНИ: добавить / убрать / установить дату
 # ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("ca_adddays_"))
 async def ca_adddays_start(cb: CallbackQuery, state: FSMContext):
@@ -4203,7 +4368,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
     await state.clear()
     remna = await remna_get_user(user_id)
     if not remna:
-        await message.answer("Пользователь н   найден в Remnawave.")
+        await message.answer("Пользователь не найден в Remnawave.")
         return
     result = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": hwid})
     if not result:
@@ -4508,7 +4673,7 @@ async def admin_promos_cb(cb: CallbackQuery):
 #  своё число) → код (текстом, либо 0 для автогенерации) → готово.
 #  Тип "скидка" не предлагается — в текущей версии бота скидочные промокоды
 #  нигде не обрабатываются при активации, создавать их значит создавать
-#  не  абочую функциональность.
+#  нерабочую функциональность.
 # ─────────────────────────────────────────────
 async def _create_promo(code: str, days: int, uses: int, promo_type: str,
                         tariff_key: str | None = None, min_account_age_days: int = 0):
@@ -4720,7 +4885,7 @@ async def broadcast_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.set_state(BroadcastState.waiting_text)
-    await message.answer("Рассылка\n\nВв  дите текст.", reply_markup=cancel_kb())
+    await message.answer("Рассылка\n\nВведите текст.", reply_markup=cancel_kb())
 
 @router.message(Command("cancel"), BroadcastState.waiting_text)
 async def broadcast_cancel(message: types.Message, state: FSMContext):
@@ -5024,7 +5189,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
     ])
     await message.answer(
         "Какой тариф/доступ выставить?\n\n"
-        "«Не менять» — только продлить дни, сквад и вариант подписки остан  тся как есть.\n"
+        "«Не менять» — только продлить дни, сквад и вариант подписки останутся как есть.\n"
         "«VPN» / «VPN + 📶» — выставит соответствующий тариф и профиль пользователя "
         "переключится в купленное состояние (появятся кнопки «Добавить устройства» и т.д.).\n"
         "«Пробный доступ» — 📶 с лимитом 1 ГБ, но БЕЗ пометки как "
@@ -5066,7 +5231,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         squad_uuid   = [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]
         whitelist_gb = TRIAL["whitelist_gb"]
         new_plan     = "trial"
-    # choice == "none":   ставляем squad_uuid=None, new_plan=None (ничего не трогаем)
+    # choice == "none": оставляем squad_uuid=None, new_plan=None (ничего не трогаем)
 
     user = await activate_subscription(
         target_id, days, hwid or 1, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
@@ -5684,7 +5849,7 @@ async def _pricing_screen():
     for m in DISCOUNT_MONTHS:
         pct = pricing_discount_for(settings, m)
         example = pricing_plan_total(settings, "vpn", m, PLANS["vpn"].get("price_month"))
-        lines.append(f"  • {m} мес.: {pct}%  (например, VPN за {m} мес. = {example} ₽)")
+        lines.append(f"  • {m} мес.: {pct}% (например, VPN за {m} мес. = {example} ₽)")
         rows.append([InlineKeyboardButton(
             text=f"Изменить скидку: {m} мес.",
             callback_data=f"admin_disc_{m}",
@@ -6048,7 +6213,7 @@ async def admin_survey_results_cb(cb: CallbackQuery):
             "WHERE comment IS NOT NULL ORDER BY created_at DESC LIMIT 10"
         )
     avg_r = round(float(avg), 2)
-    lines = [f"Результаты опроса", "", f"Всего ответов: {total}", f"Ср  дняя оценка: {avg_r}/10", "", "Распределение:"]
+    lines = [f"Результаты опроса", "", f"Всего ответов: {total}", f"Средняя оценка: {avg_r}/10", "", "Распределение:"]
     for r in dist:
         bar = "#" * min(r["cnt"], 20)
         lines.append(f"  {r['rating']:2d}/10 · {r['cnt']:3d} чел.  {bar}")
@@ -6145,7 +6310,7 @@ async def admin_help(message: types.Message):
     await message.answer(
         "Команды администратора:\n\n"
         "/give username дни [уст.] — быстро выдать дни (тариф/сквад не меняет; "
-        "для выбора тарифа использу  те кнопку «Выдать» в панели)\n"
+        "для выбора тарифа используйте кнопку «Выдать» в панели)\n"
         "/check username|id — карточка подписчика\n"
         "/add_promo, /genpromo, /list_promos — промокоды\n"
         "/broadcast — рассылка\n"
