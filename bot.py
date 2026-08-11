@@ -317,7 +317,7 @@ BTN_ICON_TOS             = "5197269100878907942"  # Пользовательск
 BTN_ICON_SUPPORT         = "5443038326535759644"  # Тех.Поддержка
 BTN_ICON_PRIVACY         = "5251203410396458957"  # Политика конфиденциальности
 BTN_ICON_PAY             = "5445353829304387411"  # Оплатить
-BTN_ICON_STARS           = None  # Оплата звёздами — своей premium-иконки нет, в тексте ⭐
+BTN_ICON_STARS           = "5267500801240092311"  # Оплатить звёздами
 BTN_ICON_BUY_VPN         = "5312361253610475399"  # Купить VPN
 BTN_ICON_PROMO           = "5465169893580086142"  # Промокод
 BTN_ICON_INFO            = "5334544901428229844"  # О сервисе
@@ -344,6 +344,7 @@ EMOJI_DEV_TOPUP     = premium_emoji("5407025283456835913", "\U0001f4f1")  # за
 EMOJI_GB_TOPUP      = premium_emoji("5283080528818360566", "\U0001f4ca")  # заголовок "Докупить трафик"
 EMOJI_UPGRADE       = premium_emoji("5449683594425410231", "\u2b06\ufe0f")  # "Улучшение тарифа" (оплата)
 EMOJI_INVITE        = premium_emoji("5264713049637409446", "\U0001f465")  # "Приглашайте друзей.."
+EMOJI_STARS         = premium_emoji("5267500801240092311", "\u2b50")   # сумма в звёздах
 
 # ─────────────────────────────────────────────
 #  Технически невозможно вставить (кнопки Telegram не поддерживают формати-
@@ -3220,15 +3221,18 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
             plan_key=plan_key, is_trial=is_trial, qty=qty,
         )
         if token:
-            rows.append([btn(f"Оплатить звёздами — {stars} ⭐", emoji_id=BTN_ICON_STARS,
+            # Значок звезды — иконка кнопки (icon_custom_emoji_id): внутрь
+            # текста кнопки Telegram кастомные эмодзи не пускает, только
+            # обычный текст. Поэтому в подписи остаётся одно число.
+            rows.append([btn(f"Оплатить звёздами — {stars}", emoji_id=BTN_ICON_STARS,
                              style=None if payment else "success",
                              callback_data=f"starspay_{token}")])
             # При курсе 1:1 приписка «(≈199 руб.)» дублирует саму цифру —
             # показываем её, только если суммы реально разошлись.
             if payment or stars == int(price):
-                price_parts.append(f"{stars} ⭐")
+                price_parts.append(f"{stars} {EMOJI_STARS}")
             else:
-                price_parts.append(f"{stars} ⭐ (≈{price} руб.)")
+                price_parts.append(f"{stars} {EMOJI_STARS} (≈{price} руб.)")
             hints.append("Звёзды спишутся сразу, подписка включится сама.")
 
     if not rows:
@@ -3607,14 +3611,18 @@ async def stars_successful_payment(message: types.Message):
         uname = f"@{message.from_user.username}" if message.from_user.username else f"ID:{u_id}"
         for admin_id in all_admin_ids():
             try:
+                # parse_mode="HTML" — ради значка звезды. Подставляются только
+                # свои строки и числа (юзернейм, название позиции, charge_id),
+                # угловых скобок и амперсандов в них не бывает.
                 await bot.send_message(
                     admin_id,
                     f"Оплата звёздами прошла, а выдача сорвалась.\n\n"
                     f"Пользователь: {uname} (ID: {u_id})\n"
                     f"Позиция: {row['item_name']}\n"
-                    f"Сумма: {row['stars']} ⭐ ({row['price']} руб.)\n"
+                    f"Сумма: {row['stars']} {EMOJI_STARS} ({row['price']} руб.)\n"
                     f"charge_id: {charge}\n"
-                    f"Причина: {err}"
+                    f"Причина: {err}",
+                    parse_mode="HTML",
                 )
             except Exception:
                 pass
@@ -3622,7 +3630,7 @@ async def stars_successful_payment(message: types.Message):
 
     text, kb = await _build_profile_view(u_id)
     await message.answer(
-        f"Оплата прошла успешно. Списано {row['stars']} ⭐\n\n{text}",
+        f"Оплата прошла успешно. Списано {row['stars']} {EMOJI_STARS}\n\n{text}",
         parse_mode="HTML", reply_markup=kb,
     )
     if not already_processed and kind in ("trial", "plan"):
