@@ -168,9 +168,9 @@ SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 # «О сервисе», и на экране принятия оферты, и в закрепляемом сообщении —
 # при смене ссылки править нужно только здесь (или переменной окружения).
 TOS_URL     = os.environ.get("TOS_URL", "").strip() or \
-    "https://telegra.ph/Polzovatelskoe-soglashenie-04-01-19"
+    "https://telegra.ph/Polzovatelskoe-soglashenie-08-12-55"
 PRIVACY_URL = os.environ.get("PRIVACY_URL", "").strip() or \
-    "https://telegra.ph/Politika-konfidencialnosti-06-21-31"
+    "https://telegra.ph/Politika-konfidencialnosti-08-12-109"
 
 # Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
