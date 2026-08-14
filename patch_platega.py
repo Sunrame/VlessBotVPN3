@@ -11,7 +11,7 @@
 import os
 import sys
 
-PATH = "megamozg.py"
+PATH = "bot.py"
 BLOCK = "block_platega.txt"
 
 if not os.path.exists(PATH):
