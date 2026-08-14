@@ -258,14 +258,22 @@ def rub_to_stars(price_rub) -> int:
 #  Пока их нет — ведёт себя так, будто агрегатора не существует, и на
 #  экране оплаты остаются только звёзды.
 #
-#  PLATEGA_METHOD — код способа оплаты: 2 — СБП (QR), 11 — карты,
-#  12 — международные карты, 13 — криптовалюта, 14 — SberPay, 3 — ЕРИП.
-#  Если оставить пустым, метод не передаётся и человек выбирает его сам
-#  на платёжной форме. Ставить конкретный код стоит только если у
-#  магазина подключён именно он: на неподключённый метод Platega
-#  отвечает ошибкой, и кнопка оплаты просто не появится (причина будет
-#  видна в логе).
+#  Способ оплаты (paymentMethod) обязателен: без него Platega отвечает
+#  400 «Wrong input parameters». Какие способы реально подключены
+#  магазину — знает только менеджер Platega, поэтому бот пробует их по
+#  очереди из PLATEGA_METHODS и запоминает тот, что сработал: дальше
+#  лишних запросов не будет. Если способ известен точно, его можно
+#  зафиксировать через PLATEGA_METHOD — тогда перебора не будет вовсе.
+#  Проверить, что подключено, можно кнопкой «Platega» в админ-панели.
 # ─────────────────────────────────────────────
+PLATEGA_METHOD_NAMES = {
+    2:  "СБП (QR)",
+    3:  "ЕРИП",
+    11: "Карты",
+    12: "Международные карты",
+    13: "Криптовалюта",
+    14: "SberPay",
+}
 PLATEGA_API_URL     = os.environ.get("PLATEGA_API_URL", "https://app.platega.io").rstrip("/")
 PLATEGA_MERCHANT_ID = os.environ.get("PLATEGA_MERCHANT_ID", "").strip()
 PLATEGA_SECRET      = os.environ.get("PLATEGA_SECRET", "").strip()
@@ -274,9 +282,18 @@ PLATEGA_SECRET      = os.environ.get("PLATEGA_SECRET", "").strip()
 PLATEGA_RETURN_URL  = os.environ.get("PLATEGA_RETURN_URL", "").strip() \
     or "https://t.me/trubavpnbot"
 
+# Жёстко заданный способ (если известен) — тогда перебора не будет.
 _platega_method = os.environ.get("PLATEGA_METHOD", "").strip()
 PLATEGA_METHOD  = int(_platega_method) if _platega_method.isdigit() \
     and int(_platega_method) > 0 else None
+
+# Порядок перебора, если конкретный способ не задан.
+_platega_methods = os.environ.get("PLATEGA_METHODS", "").replace(" ", "").strip()
+PLATEGA_METHODS = [int(p) for p in _platega_methods.split(",")
+                   if p.isdigit() and int(p) > 0] or [2, 11, 14]
+
+# Сумма тестового платежа из админ-панели, в рублях.
+PLATEGA_TEST_AMOUNT = max(1, int(os.environ.get("PLATEGA_TEST_AMOUNT", "10")))
 
 # Как часто фоновый наблюдатель спрашивает статус неоплаченных счетов и
 # сколько секунд после создания счёт вообще стоит проверять.
@@ -3260,14 +3277,33 @@ def _platega_pay_url(data: dict) -> str:
     return ""
 
 
-async def platega_create_transaction(user_id: int, username: str | None,
-                                     price) -> tuple[str, str]:
-    """Создаёт транзакцию и возвращает (transactionId, ссылка на оплату).
+# Последняя ошибка создания платежа и способ, который в прошлый раз
+# сработал. Нужны для экрана «Platega» в админ-панели и чтобы не долбить
+# агрегатор перебором на каждой покупке.
+_platega_last_error = ""
+_platega_ok_method: int | None = None
 
-    Наружу уходит только сумма и обезличенное описание — то же самое, что
-    раньше видела ЮKassa (см. _yookassa_description). Ни названия тарифа, ни
-    слова VPN в запросе нет."""
+
+def _platega_method_order() -> list[int]:
+    """Порядок попыток: сначала тот способ, что сработал в прошлый раз."""
+    if PLATEGA_METHOD:
+        return [PLATEGA_METHOD]
+    order = list(PLATEGA_METHODS)
+    if _platega_ok_method in order:
+        order.remove(_platega_ok_method)
+        order.insert(0, _platega_ok_method)
+    return order
+
+
+async def _platega_try_create(user_id: int, username: str | None, price,
+                              method: int) -> tuple[str, str, str]:
+    """Одна попытка создать транзакцию конкретным способом оплаты.
+
+    Возвращает (transactionId, ссылка, текст ошибки). Наружу уходит только
+    сумма и обезличенное описание — то же самое, что раньше видела ЮKassa
+    (см. _yookassa_description). Ни названия тарифа, ни слова VPN там нет."""
     payload = {
+        "paymentMethod":  int(method),
         "paymentDetails": {"amount": float(price), "currency": "RUB"},
         "description":    _yookassa_description(price),
         "return":         PLATEGA_RETURN_URL,
@@ -3281,31 +3317,45 @@ async def platega_create_transaction(user_id: int, username: str | None,
             "userName": f"@{username}" if username else str(user_id),
         },
     }
-    if PLATEGA_METHOD:
-        payload["paymentMethod"] = PLATEGA_METHOD
     try:
         async with httpx.AsyncClient(verify=True) as client:
             r = await client.post(f"{PLATEGA_API_URL}/transaction/process",
                                   json=payload, headers=_platega_headers(), timeout=20)
     except Exception as e:
-        log.error("[Platega] создание транзакции: %r", e)
-        return "", ""
+        return "", "", f"нет связи: {e!r}"
     if r.status_code >= 400:
         # Тело ответа — единственный способ понять, что именно не нравится
-        # агрегатору (нет каскада под метод, не тот ключ, лимиты магазина).
-        log.error("[Platega] создание транзакции HTTP %s: %s", r.status_code, r.text[:500])
-        return "", ""
+        # агрегатору (способ не подключён, не тот ключ, лимиты магазина).
+        return "", "", f"HTTP {r.status_code}: {r.text[:300]}"
     try:
         data = r.json()
     except Exception:
-        log.error("[Platega] ответ не JSON: %s", r.text[:300])
-        return "", ""
+        return "", "", f"ответ не JSON: {r.text[:200]}"
     tx_id = str(data.get("transactionId") or data.get("id") or "").strip()
     pay_url = _platega_pay_url(data)
     if not tx_id or not pay_url:
-        log.error("[Platega] в ответе нет ссылки или id: %s", str(data)[:400])
-        return "", ""
-    return tx_id, pay_url
+        return "", "", f"в ответе нет ссылки или id: {str(data)[:250]}"
+    return tx_id, pay_url, ""
+
+
+async def platega_create_transaction(user_id: int, username: str | None,
+                                     price) -> tuple[str, str]:
+    """Создаёт транзакцию, перебирая способы оплаты до первого рабочего."""
+    global _platega_last_error, _platega_ok_method
+    errors = []
+    for method in _platega_method_order():
+        tx_id, pay_url, err = await _platega_try_create(user_id, username, price, method)
+        if tx_id:
+            if _platega_ok_method != method:
+                log.info("[Platega] рабочий способ оплаты: %s — %s", method,
+                         PLATEGA_METHOD_NAMES.get(method, "неизвестный"))
+                _platega_ok_method = method
+            _platega_last_error = ""
+            return tx_id, pay_url
+        errors.append(f"{method} ({PLATEGA_METHOD_NAMES.get(method, "?")}): {err}")
+    _platega_last_error = " | ".join(errors)[:900]
+    log.error("[Platega] ни один способ оплаты не принят: %s", _platega_last_error)
+    return "", ""
 
 
 async def platega_get_status(tx_id: str) -> str:
@@ -3459,6 +3509,103 @@ async def platega_check_cb(cb: CallbackQuery):
                       parse_mode="HTML", reply_markup=kb)
     if not already and row["kind"] in ("trial", "plan"):
         await send_channel_instructions(cb.from_user.id)
+
+
+def _platega_mask(value: str) -> str:
+    """Показываем только хвост ключа — в переписке ему не место."""
+    value = (value or "").strip()
+    if not value:
+        return "не задан"
+    return "…" + value[-6:] if len(value) > 6 else "задан"
+
+
+async def _platega_screen() -> tuple[str, InlineKeyboardMarkup]:
+    if PLATEGA_METHOD:
+        order = f"{PLATEGA_METHOD} — {PLATEGA_METHOD_NAMES.get(PLATEGA_METHOD, 'неизвестный')} (задан жёстко)"
+    else:
+        order = ", ".join(f"{m} — {PLATEGA_METHOD_NAMES.get(m, chr(63))}"
+                          for m in PLATEGA_METHODS)
+    lines = [
+        "Platega", "",
+        "Состояние: " + ("включена" if platega_available() else
+                         ("выключена (PLATEGA_ENABLED=0)" if PLATEGA_ENABLED is False else
+                          "не настроена — нет MERCHANT_ID или SECRET")),
+        f"Адрес: {PLATEGA_API_URL}",
+        f"MerchantId: {_platega_mask(PLATEGA_MERCHANT_ID)}",
+        f"Secret: {_platega_mask(PLATEGA_SECRET)}",
+        f"Порядок способов: {order}",
+        "Рабочий способ: " + (f"{_platega_ok_method} — "
+                              f"{PLATEGA_METHOD_NAMES.get(_platega_ok_method, 'неизвестный')}"
+                              if _platega_ok_method else "ещё не определён"),
+    ]
+    if _platega_last_error:
+        lines += ["", "Последняя ошибка:", _platega_last_error[:900]]
+    async with pool.acquire() as conn:
+        stats = await conn.fetchrow(
+            "SELECT COUNT(*) FILTER (WHERE status='CONFIRMED') AS paid, "
+            "       COUNT(*) FILTER (WHERE status='PENDING') AS pending, "
+            "       COALESCE(SUM(price) FILTER (WHERE status='CONFIRMED'),0) AS total "
+            "FROM platega_invoices"
+        )
+    lines += ["", f"Оплачено счетов: {stats['paid']} на {int(stats['total'] or 0)} руб.",
+              f"Ждут оплаты: {stats['pending']}"]
+    lines += ["", f"«Тестовый платёж» создаёт настоящие транзакции на "
+              f"{PLATEGA_TEST_AMOUNT} руб. и показывает, какие способы принял "
+              f"агрегатор. Платить по ним не нужно — они истекут сами."]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Тестовый платёж", callback_data="admin_platega_test")],
+        [InlineKeyboardButton(text="Обновить", callback_data="admin_platega")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ])
+    return "\n".join(lines), kb
+
+
+@router.callback_query(F.data == "admin_platega")
+async def admin_platega_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    text, kb = await _platega_screen()
+    await edit_screen(cb.message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_platega_test")
+async def admin_platega_test_cb(cb: CallbackQuery):
+    """Пробует создать платёж каждым известным способом и показывает,
+    что ответила Platega. Так видно, что реально подключено магазину."""
+    if not is_admin(cb.from_user.id):
+        await safe_answer(cb)
+        return
+    if not platega_available():
+        await safe_answer(cb, "Сначала задайте PLATEGA_MERCHANT_ID и PLATEGA_SECRET.",
+                          show_alert=True)
+        return
+    await safe_answer(cb, "Проверяю способы оплаты — это займёт секунд десять.")
+    lines = [f"Тестовый платёж на {PLATEGA_TEST_AMOUNT} руб.", ""]
+    working = []
+    for method in (2, 11, 14, 12, 13, 3):
+        tx_id, _url, err = await _platega_try_create(
+            cb.from_user.id, cb.from_user.username, PLATEGA_TEST_AMOUNT, method)
+        name = PLATEGA_METHOD_NAMES.get(method, "неизвестный")
+        if tx_id:
+            working.append(method)
+            lines.append(f"{method} {name}: работает")
+        else:
+            lines.append(f"{method} {name}: {err[:180]}")
+    if working:
+        lines += ["", "Подключены: " + ", ".join(str(m) for m in working),
+                  f"Чтобы не перебирать их на каждой покупке, поставьте "
+                  f"PLATEGA_METHODS={','.join(str(m) for m in working)}"]
+    else:
+        lines += ["", "Ни один способ не принят. Скорее всего дело в ключах "
+                  "или магазину не подключён ни один каскад — это вопрос к "
+                  "менеджеру Platega."]
+    text = "\n".join(lines)
+    await cb.message.answer(text[:4000],
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="Назад",
+                                                      callback_data="admin_platega")],
+                            ]))
 
 
 async def platega_check_pending() -> None:
@@ -4637,7 +4784,8 @@ def admin_panel_kb(is_main: bool = False):
          InlineKeyboardButton(text="Фискализация", callback_data="admin_fiscal")],
         [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals"),
          InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast_start")],
-        [InlineKeyboardButton(text="Настройки", callback_data="admin_settings")],
+        [InlineKeyboardButton(text="Настройки", callback_data="admin_settings"),
+         InlineKeyboardButton(text="Platega", callback_data="admin_platega")],
     ]
     if is_main:
         rows.append([InlineKeyboardButton(text="Админы", callback_data="admin_admins")])
@@ -7483,7 +7631,7 @@ async def main():
     log.info("Обязательная подписка на канал: %s (%s)",
              "включена" if REQUIRE_CHANNEL_SUB else "выключена", CHANNEL_ID)
     log.info("Оплата через Platega: %s",
-             ("включена, метод " + (str(PLATEGA_METHOD) if PLATEGA_METHOD else "выбирает плательщик"))
+             ("включена, способы: " + ", ".join(str(m) for m in _platega_method_order()))
              if platega_available() else "ОТКЛЮЧЕНА (не заданы PLATEGA_MERCHANT_ID/PLATEGA_SECRET)")
     log.info("Оплата картой (ЮKassa): %s",
              "включена" if PAYMENTS_ENABLED else "ОТКЛЮЧЕНА")
