@@ -250,11 +250,53 @@ def rub_to_stars(price_rub) -> int:
     return max(STARS_MIN, min(STARS_MAX, math.ceil(rub / STARS_RUB_RATE)))
 
 
+# ─────────────────────────────────────────────
+#  ОПЛАТА КАРТОЙ И СБП ЧЕРЕЗ PLATEGA (platega.io)
+#
+#  Включается сама, как только заданы PLATEGA_MERCHANT_ID и
+#  PLATEGA_SECRET (выдаются менеджером и лежат в ЛК → «Настройки»).
+#  Пока их нет — ведёт себя так, будто агрегатора не существует, и на
+#  экране оплаты остаются только звёзды.
+#
+#  PLATEGA_METHOD — код способа оплаты: 2 — СБП (QR), 11 — карты,
+#  12 — международные карты, 13 — криптовалюта, 14 — SberPay, 3 — ЕРИП.
+#  Если оставить пустым, метод не передаётся и человек выбирает его сам
+#  на платёжной форме. Ставить конкретный код стоит только если у
+#  магазина подключён именно он: на неподключённый метод Platega
+#  отвечает ошибкой, и кнопка оплаты просто не появится (причина будет
+#  видна в логе).
+# ─────────────────────────────────────────────
+PLATEGA_API_URL     = os.environ.get("PLATEGA_API_URL", "https://app.platega.io").rstrip("/")
+PLATEGA_MERCHANT_ID = os.environ.get("PLATEGA_MERCHANT_ID", "").strip()
+PLATEGA_SECRET      = os.environ.get("PLATEGA_SECRET", "").strip()
+
+# Куда платёжная форма вернёт человека после оплаты — обратно в бот.
+PLATEGA_RETURN_URL  = os.environ.get("PLATEGA_RETURN_URL", "").strip() \
+    or "https://t.me/trubavpnbot"
+
+_platega_method = os.environ.get("PLATEGA_METHOD", "").strip()
+PLATEGA_METHOD  = int(_platega_method) if _platega_method.isdigit() \
+    and int(_platega_method) > 0 else None
+
+# Как часто фоновый наблюдатель спрашивает статус неоплаченных счетов и
+# сколько секунд после создания счёт вообще стоит проверять.
+PLATEGA_POLL_INTERVAL = int(os.environ.get("PLATEGA_POLL_INTERVAL", "10"))
+PLATEGA_POLL_WINDOW   = int(os.environ.get("PLATEGA_POLL_WINDOW", "3600"))
+
+PLATEGA_ENABLED = os.environ.get("PLATEGA_ENABLED", "1").strip().lower() \
+    in ("1", "true", "yes", "on")
+
+
+def platega_available() -> bool:
+    """Готова ли Platega принимать оплату: включена и ключи заданы."""
+    return PLATEGA_ENABLED and bool(PLATEGA_MERCHANT_ID and PLATEGA_SECRET)
+
+
 def payments_available() -> bool:
-    """Есть ли хоть один рабочий способ оплаты — карта или звёзды.
+    """Есть ли хоть один рабочий способ оплаты — карта, СБП или звёзды.
     Пока доступен любой из них, экраны покупки открываются как обычно, а
     заглушка «оплата временно недоступна» не показывается."""
-    return PAYMENTS_ENABLED or STARS_ENABLED
+    return PAYMENTS_ENABLED or STARS_ENABLED or platega_available()
 
 # ВНИМАНИЕ: в интерфейсе у этой опции нет названия — только значок 📶.
 # Словесных формулировок быть не должно нигде в текстах бота: ни в тарифах,
@@ -902,6 +944,28 @@ async def init_db():
                 created_at   BIGINT DEFAULT 0,
                 paid_at      BIGINT,
                 charge_id    TEXT
+            )
+        """)
+        # Счета Platega. Устроены так же, как счета на звёзды: наружу в
+        # платёж уходит только сумма, а состав покупки лежит здесь и
+        # достаётся по transactionId уже после подтверждения оплаты.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS platega_invoices (
+                tx_id        TEXT PRIMARY KEY,
+                user_id      BIGINT NOT NULL,
+                kind         TEXT NOT NULL,
+                days         INTEGER DEFAULT 0,
+                hwid         INTEGER,
+                squad        TEXT,
+                whitelist_gb INTEGER DEFAULT 0,
+                plan_key     TEXT,
+                price        INTEGER DEFAULT 0,
+                is_trial     BOOLEAN DEFAULT FALSE,
+                item_name    TEXT,
+                qty          INTEGER DEFAULT 0,
+                status       TEXT DEFAULT 'PENDING',
+                created_at   BIGINT DEFAULT 0,
+                paid_at      BIGINT
             )
         """)
         # Отправленные напоминания об окончании подписки (по срокам 3д/1д/1ч).
@@ -3153,6 +3217,303 @@ def _stars_title(item_name: str) -> str:
     return (item_name or "Покупка").strip()[:32] or "Покупка"
 
 
+# ─────────────────────────────────────────────
+#  PLATEGA — ПРИЁМ ОПЛАТЫ КАРТОЙ И СБП
+#
+#  Агрегатор platega.io. Работает независимо от ЮKassa и от звёзд: включается
+#  сам, как только заданы PLATEGA_MERCHANT_ID и PLATEGA_SECRET, и тогда на
+#  экране оплаты появляется кнопка «Оплатить».
+#
+#  Порядок такой:
+#    1) POST /transaction/process — создаём транзакцию, получаем ссылку на
+#       платёжную форму и transactionId;
+#    2) состав покупки кладём в platega_invoices под этим же transactionId —
+#       в сам платёж он не уходит (и не должен: наружу уходит только сумма);
+#    3) статус забираем GET /transaction/{id}. Делает это фоновый наблюдатель
+#       раз в PLATEGA_POLL_INTERVAL секунд, поэтому подписка включается сама,
+#       без нажатий. Кнопка «Проверить оплату» остаётся как ручной дубль.
+#
+#  Callback (вебхук) из личного кабинета Platega здесь НЕ используется: бот
+#  живёт на long polling и своего HTTP-эндпоинта не имеет. Если позже
+#  захочется мгновенного зачисления — вебхук принимает админ-сайт и пишет в
+#  ту же таблицу; наблюдатель ниже этому не мешает (выдача идемпотентна).
+# ─────────────────────────────────────────────
+def _platega_headers() -> dict:
+    return {
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret":     PLATEGA_SECRET,
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+    }
+
+
+def _platega_pay_url(data: dict) -> str:
+    """Ссылка на платёжную форму из ответа Platega.
+
+    В старом API поле называется redirect, в v2 — url. Проверяем оба, чтобы
+    смена версии на стороне агрегатора не превращалась в «ошибка создания
+    платежа» без единой строчки в логе."""
+    for key in ("redirect", "url", "paymentUrl", "payform", "payformUrl"):
+        value = (data or {}).get(key)
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+    return ""
+
+
+async def platega_create_transaction(user_id: int, username: str | None,
+                                     price) -> tuple[str, str]:
+    """Создаёт транзакцию и возвращает (transactionId, ссылка на оплату).
+
+    Наружу уходит только сумма и обезличенное описание — то же самое, что
+    раньше видела ЮKassa (см. _yookassa_description). Ни названия тарифа, ни
+    слова VPN в запросе нет."""
+    payload = {
+        "paymentDetails": {"amount": float(price), "currency": "RUB"},
+        "description":    _yookassa_description(price),
+        "return":         PLATEGA_RETURN_URL,
+        "failedUrl":      PLATEGA_RETURN_URL,
+        "payload":        f"tg{user_id}",
+        # Идентификатор плательщика нужен антифроду Platega. Для части
+        # категорий магазинов он обязателен, и без него магазин могут
+        # отключить, поэтому передаём всегда.
+        "metadata": {
+            "userId":   str(user_id),
+            "userName": f"@{username}" if username else str(user_id),
+        },
+    }
+    if PLATEGA_METHOD:
+        payload["paymentMethod"] = PLATEGA_METHOD
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            r = await client.post(f"{PLATEGA_API_URL}/transaction/process",
+                                  json=payload, headers=_platega_headers(), timeout=20)
+    except Exception as e:
+        log.error("[Platega] создание транзакции: %r", e)
+        return "", ""
+    if r.status_code >= 400:
+        # Тело ответа — единственный способ понять, что именно не нравится
+        # агрегатору (нет каскада под метод, не тот ключ, лимиты магазина).
+        log.error("[Platega] создание транзакции HTTP %s: %s", r.status_code, r.text[:500])
+        return "", ""
+    try:
+        data = r.json()
+    except Exception:
+        log.error("[Platega] ответ не JSON: %s", r.text[:300])
+        return "", ""
+    tx_id = str(data.get("transactionId") or data.get("id") or "").strip()
+    pay_url = _platega_pay_url(data)
+    if not tx_id or not pay_url:
+        log.error("[Platega] в ответе нет ссылки или id: %s", str(data)[:400])
+        return "", ""
+    return tx_id, pay_url
+
+
+async def platega_get_status(tx_id: str) -> str:
+    """Статус транзакции: PENDING / CONFIRMED / CANCELED / CHARGEBACKED.
+
+    Пустая строка означает «не удалось спросить» (сеть, 5xx). Это НЕ то же
+    самое, что «не оплачено»: по пустому ответу наблюдатель ничего не решает
+    и попробует ещё раз."""
+    if not tx_id:
+        return ""
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            r = await client.get(f"{PLATEGA_API_URL}/transaction/{tx_id}",
+                                 headers=_platega_headers(), timeout=20)
+    except Exception as e:
+        log.error("[Platega] статус %s: %r", tx_id, e)
+        return ""
+    if r.status_code >= 400:
+        log.error("[Platega] статус %s HTTP %s: %s", tx_id, r.status_code, r.text[:300])
+        return ""
+    try:
+        return str((r.json() or {}).get("status") or "").upper()
+    except Exception:
+        return ""
+
+
+async def _platega_invoice_create(user_id: int, username: str | None, *, kind: str,
+                                  item_name: str, price: int, days: int = 0,
+                                  hwid: int | None = None,
+                                  squad: str | list[str] | None = None,
+                                  whitelist_gb: int = 0, plan_key: str | None = None,
+                                  is_trial: bool = False, qty: int = 0) -> tuple[str, str]:
+    """Создаёт транзакцию и запоминает состав покупки. (tx_id, ссылка)."""
+    if username is None:
+        # Юзернейм нужен антифроду Platega, а на экран оплаты он не приходит —
+        # достаём из своей же базы.
+        try:
+            async with pool.acquire() as conn:
+                username = await conn.fetchval(
+                    "SELECT username FROM users WHERE user_id=$1", user_id)
+        except Exception:
+            username = None
+    tx_id, pay_url = await platega_create_transaction(user_id, username, price)
+    if not tx_id:
+        return "", ""
+    squad_str = ",".join(squad) if isinstance(squad, list) else (squad or "")
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO platega_invoices (tx_id, user_id, kind, days, hwid, squad, "
+                "whitelist_gb, plan_key, price, is_trial, item_name, qty, status, created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'PENDING',$13)",
+                tx_id, user_id, kind, int(days or 0), hwid, squad_str,
+                int(whitelist_gb or 0), plan_key or "", int(round(float(price or 0))),
+                bool(is_trial), (item_name or "Покупка")[:128], int(qty or 0),
+                int(time.time()),
+            )
+    except Exception as e:
+        # Ссылка на оплату уже есть, но без записи в БД зачислить будет нечего —
+        # честнее не показывать кнопку вообще.
+        log.exception("[Platega] сохранение счёта %s: %s", tx_id, e)
+        return "", ""
+    return tx_id, pay_url
+
+
+async def _platega_invoice_get(tx_id: str):
+    if not tx_id:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM platega_invoices WHERE tx_id=$1", tx_id)
+    except Exception as e:
+        log.exception("[Platega] чтение счёта: %s", e)
+        return None
+
+
+async def _platega_fulfill(row, *, notify_chat: bool = False) -> tuple[bool, str | None, bool]:
+    """Выдаёт оплаченное по строке счёта и помечает счёт оплаченным."""
+    squad_raw = row["squad"] or None
+    squad     = squad_raw.split(",") if squad_raw and "," in squad_raw else squad_raw
+    kind      = row["kind"]
+    u_id      = row["user_id"]
+
+    ok, err, already = await _fulfill_purchase(
+        pay_id=f"platega_{row['tx_id']}", u_id=u_id, kind=kind,
+        days=row["days"] or 0, hwid=row["hwid"], squad=squad,
+        whitelist_gb=row["whitelist_gb"] or 0, plan_key=(row["plan_key"] or None),
+        price=float(row["price"] or 0), is_trial=bool(row["is_trial"]),
+        item_name=row["item_name"] or "Покупка", qty=row["qty"] or 0,
+        source="platega",
+    )
+    if not ok:
+        return ok, err, already
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE platega_invoices SET status='CONFIRMED', paid_at=$2 WHERE tx_id=$1",
+                row["tx_id"], int(time.time()),
+            )
+    except Exception as e:
+        log.exception("[Platega] отметка об оплате %s: %s", row["tx_id"], e)
+
+    if notify_chat:
+        text, kb = await _build_profile_view(u_id)
+        try:
+            await bot.send_message(u_id, f"Оплата прошла успешно.\n\n{text}",
+                                   parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+        if not already and kind in ("trial", "plan"):
+            await send_channel_instructions(u_id)
+    return ok, err, already
+
+
+@router.callback_query(F.data.startswith("plcheck_"))
+async def platega_check_cb(cb: CallbackQuery):
+    """Ручная проверка оплаты. Обычно не нужна — счёт подхватывает фоновый
+    наблюдатель, — но человек нажимает кнопку раньше, чем тот успевает."""
+    await safe_answer(cb)
+    tx_id = cb.data.removeprefix("plcheck_")
+    row = await _platega_invoice_get(tx_id)
+    if not row:
+        await safe_answer(cb, "Счёт не найден. Откройте покупку заново.", show_alert=True)
+        return
+    if row["user_id"] != cb.from_user.id:
+        await safe_answer(cb, "Это чужой счёт.", show_alert=True)
+        return
+
+    status = row["status"] if row["paid_at"] else await platega_get_status(tx_id)
+    if not status:
+        await safe_answer(cb, "Платёжная система не отвечает. Попробуйте через минуту.",
+                          show_alert=True)
+        return
+    if status in ("CANCELED", "CHARGEBACKED"):
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE platega_invoices SET status=$2 WHERE tx_id=$1",
+                               tx_id, status)
+        await safe_answer(cb, "Платёж не прошёл. Попробуйте оплатить заново.", show_alert=True)
+        return
+    if status != "CONFIRMED":
+        await safe_answer(cb, "Платёж ещё не подтверждён. Попробуйте через минуту.",
+                          show_alert=True)
+        return
+
+    ok, err, already = await _platega_fulfill(row)
+    if not ok:
+        await safe_answer(cb, f"{err} Обратитесь в поддержку.", show_alert=True)
+        return
+    text, kb = await _build_profile_view(cb.from_user.id)
+    await edit_screen(cb.message, f"Оплата прошла успешно.\n\n{text}",
+                      parse_mode="HTML", reply_markup=kb)
+    if not already and row["kind"] in ("trial", "plan"):
+        await send_channel_instructions(cb.from_user.id)
+
+
+async def platega_check_pending() -> None:
+    """Один проход наблюдателя по неоплаченным счетам.
+
+    Смотрим только свежие (моложе PLATEGA_POLL_WINDOW): старые всё равно
+    протухли на стороне агрегатора, а если человек оплатит позже — сработает
+    кнопка «Проверить оплату»."""
+    now = int(time.time())
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM platega_invoices WHERE status='PENDING' AND paid_at IS NULL "
+            "AND created_at >= $1 ORDER BY created_at LIMIT 40",
+            now - PLATEGA_POLL_WINDOW,
+        )
+    for row in rows:
+        status = await platega_get_status(row["tx_id"])
+        if not status or status == "PENDING":
+            continue
+        if status == "CONFIRMED":
+            ok, err, _ = await _platega_fulfill(row, notify_chat=True)
+            if not ok:
+                # Деньги списаны, а выдать не вышло — зовём админов вручную.
+                log.error("[Platega] оплата %s прошла, выдача сорвалась: %s",
+                          row["tx_id"], err)
+                for admin_id in all_admin_ids():
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"Оплата через Platega прошла, а выдача сорвалась.\n\n"
+                            f"Пользователь: ID {row['user_id']}\n"
+                            f"Позиция: {row['item_name']}\n"
+                            f"Сумма: {row['price']} руб.\n"
+                            f"Транзакция: {row['tx_id']}\n"
+                            f"Причина: {err}",
+                        )
+                    except Exception:
+                        pass
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE platega_invoices SET status=$2 WHERE tx_id=$1",
+                                   row["tx_id"], status)
+        await asyncio.sleep(0.05)
+
+
+async def platega_watcher():
+    """Фоновая проверка оплат Platega — благодаря ей подписка включается сама,
+    как у звёзд, без нажатия «Проверить оплату»."""
+    while True:
+        await asyncio.sleep(max(5, PLATEGA_POLL_INTERVAL))
+        try:
+            await platega_check_pending()
+        except Exception as e:
+            log.error("platega_watcher: %s", e)
+
 async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | list[str] | None = None, whitelist_gb: int = 0,
@@ -3174,6 +3535,22 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
     rows: list[list[InlineKeyboardButton]] = []
     price_parts: list[str] = []
     hints: list[str] = []
+
+    # Platega — основной способ оплаты картой и СБП.
+    platega_tx = ""
+    if platega_available():
+        platega_tx, platega_url = await _platega_invoice_create(
+            user_id, None, kind=kind, item_name=item_name, price=price, days=days,
+            hwid=hwid, squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key,
+            is_trial=is_trial, qty=qty,
+        )
+        if platega_url:
+            rows.append([btn("Оплатить", emoji_id=BTN_ICON_PAY, style="success",
+                             url=platega_url)])
+            price_parts.append(f"{price} руб.")
+            hints.append("Оплата зачислится автоматически, обычно за несколько секунд.")
+        else:
+            platega_tx = ""
 
     payment = None
     if PAYMENTS_ENABLED and Payment is not None:
@@ -3208,10 +3585,15 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                  kind, item_name, price, user_id)
 
     if payment:
-        rows.append([btn("Оплатить картой", emoji_id=BTN_ICON_PAY, style="success",
+        # ЮKassa (если её всё-таки включат рядом с Platega) идёт вторым
+        # способом: рублёвая цена в строке «К оплате» уже есть, повторять
+        # её не нужно.
+        rows.append([btn("Оплатить картой (ЮKassa)", emoji_id=BTN_ICON_PAY,
+                         style=None if price_parts else "success",
                          url=payment.confirmation.confirmation_url)])
-        price_parts.append(f"{price} руб.")
-        hints.append("После оплаты картой нажмите «Проверить оплату».")
+        if not price_parts:
+            price_parts.append(f"{price} руб.")
+        hints.append("После оплаты через ЮKassa нажмите «Проверить оплату».")
 
     if STARS_ENABLED:
         stars = rub_to_stars(price)
@@ -3225,11 +3607,11 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
             # текста кнопки Telegram кастомные эмодзи не пускает, только
             # обычный текст. Поэтому в подписи остаётся одно число.
             rows.append([btn(f"Оплатить звёздами — {stars}", emoji_id=BTN_ICON_STARS,
-                             style=None if payment else "success",
+                             style=None if rows else "success",
                              callback_data=f"starspay_{token}")])
             # При курсе 1:1 приписка «(≈199 руб.)» дублирует саму цифру —
             # показываем её, только если суммы реально разошлись.
-            if payment or stars == int(price):
+            if price_parts or stars == int(price):
                 price_parts.append(f"{stars} {EMOJI_STARS}")
             else:
                 price_parts.append(f"{stars} {EMOJI_STARS} (≈{price} руб.)")
@@ -3238,8 +3620,13 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
     if not rows:
         return None, "", ""
 
-    if payment:
+    # Ручная проверка — на случай, если человек не хочет ждать пары секунд
+    # до автоматического зачисления.
+    if platega_tx:
         rows.append([btn("Проверить оплату", emoji_id=BTN_ICON_CHECK_SUB,
+                         callback_data=f"plcheck_{platega_tx}")])
+    if payment:
+        rows.append([btn("Проверить оплату (ЮKassa)", emoji_id=BTN_ICON_CHECK_SUB,
                          callback_data=f"paycheck_{payment.id}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
 
@@ -7091,8 +7478,13 @@ async def main():
     asyncio.create_task(whitelist_limit_scheduler())
     asyncio.create_task(expiry_reminder_scheduler())
     asyncio.create_task(naloggo_queue_scheduler())
+    if platega_available():
+        asyncio.create_task(platega_watcher())
     log.info("Обязательная подписка на канал: %s (%s)",
              "включена" if REQUIRE_CHANNEL_SUB else "выключена", CHANNEL_ID)
+    log.info("Оплата через Platega: %s",
+             ("включена, метод " + (str(PLATEGA_METHOD) if PLATEGA_METHOD else "выбирает плательщик"))
+             if platega_available() else "ОТКЛЮЧЕНА (не заданы PLATEGA_MERCHANT_ID/PLATEGA_SECRET)")
     log.info("Оплата картой (ЮKassa): %s",
              "включена" if PAYMENTS_ENABLED else "ОТКЛЮЧЕНА")
     log.info("Оплата звёздами Telegram: %s",
