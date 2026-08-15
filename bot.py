@@ -170,7 +170,7 @@ SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 TOS_URL     = os.environ.get("TOS_URL", "").strip() or \
     "https://telegra.ph/Polzovatelskoe-soglashenie-08-12-55"
 PRIVACY_URL = os.environ.get("PRIVACY_URL", "").strip() or \
-    "https://telegra.ph/Politika-konfidencialnosti-08-12-109"
+    "https://telegra.ph/Politika-obrabotki-personalnyh-dannyh-TrubaVPN-08-10"
 
 # Личный кабинет на сайте (отдельный от бота веб-проект). Если SITE_URL не
 # задан, кнопка всё равно показывается, но при нажатии скажет "недоступен".
@@ -960,7 +960,8 @@ async def init_db():
                 qty          INTEGER DEFAULT 0,
                 created_at   BIGINT DEFAULT 0,
                 paid_at      BIGINT,
-                charge_id    TEXT
+                charge_id    TEXT,
+                promo_code   TEXT
             )
         """)
         # Счета Platega. Устроены так же, как счета на звёзды: наружу в
@@ -982,7 +983,8 @@ async def init_db():
                 qty          INTEGER DEFAULT 0,
                 status       TEXT DEFAULT 'PENDING',
                 created_at   BIGINT DEFAULT 0,
-                paid_at      BIGINT
+                paid_at      BIGINT,
+                promo_code   TEXT
             )
         """)
         # Отправленные напоминания об окончании подписки (по срокам 3д/1д/1ч).
@@ -1092,6 +1094,13 @@ async def init_db():
             await conn.execute("ALTER TABLE payments ADD COLUMN payment_id TEXT")
         except Exception:
             pass
+        # Промокод-скидка, применённый к заказу: чтобы списать его при
+        # подтверждении оплаты (для старых БД, где счета уже существовали).
+        for _tbl in ("star_invoices", "platega_invoices"):
+            try:
+                await conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN promo_code TEXT")
+            except Exception:
+                pass
         try:
             await conn.execute("""
                 INSERT INTO promo_redemptions (user_id, code, redeemed_at, source)
@@ -3191,7 +3200,8 @@ async def _stars_invoice_create(user_id: int, *, kind: str, item_name: str,
                                 hwid: int | None = None,
                                 squad: str | list[str] | None = None,
                                 whitelist_gb: int = 0, plan_key: str | None = None,
-                                is_trial: bool = False, qty: int = 0) -> str | None:
+                                is_trial: bool = False, qty: int = 0,
+                                promo_code: str | None = None) -> str | None:
     """Кладёт состав покупки в star_invoices и возвращает короткий токен.
 
     В payload счёта Telegram помещается только этот токен: лимит payload —
@@ -3204,12 +3214,12 @@ async def _stars_invoice_create(user_id: int, *, kind: str, item_name: str,
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO star_invoices (token, user_id, kind, days, hwid, squad, "
-                "whitelist_gb, plan_key, price, stars, is_trial, item_name, qty, created_at) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                "whitelist_gb, plan_key, price, stars, is_trial, item_name, qty, created_at, promo_code) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
                 token, user_id, kind, int(days or 0), hwid, squad_str,
                 int(whitelist_gb or 0), plan_key or "", int(round(float(price or 0))),
                 int(stars), bool(is_trial), (item_name or "Покупка")[:128],
-                int(qty or 0), int(time.time()),
+                int(qty or 0), int(time.time()), (promo_code or None),
             )
     except Exception as e:
         log.exception("star invoice create: %s", e)
@@ -3387,7 +3397,8 @@ async def _platega_invoice_create(user_id: int, username: str | None, *, kind: s
                                   hwid: int | None = None,
                                   squad: str | list[str] | None = None,
                                   whitelist_gb: int = 0, plan_key: str | None = None,
-                                  is_trial: bool = False, qty: int = 0) -> tuple[str, str]:
+                                  is_trial: bool = False, qty: int = 0,
+                                  promo_code: str | None = None) -> tuple[str, str]:
     """Создаёт транзакцию и запоминает состав покупки. (tx_id, ссылка)."""
     if username is None:
         # Юзернейм нужен антифроду Platega, а на экран оплаты он не приходит —
@@ -3406,12 +3417,12 @@ async def _platega_invoice_create(user_id: int, username: str | None, *, kind: s
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO platega_invoices (tx_id, user_id, kind, days, hwid, squad, "
-                "whitelist_gb, plan_key, price, is_trial, item_name, qty, status, created_at) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'PENDING',$13)",
+                "whitelist_gb, plan_key, price, is_trial, item_name, qty, status, created_at, promo_code) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'PENDING',$13,$14)",
                 tx_id, user_id, kind, int(days or 0), hwid, squad_str,
                 int(whitelist_gb or 0), plan_key or "", int(round(float(price or 0))),
                 bool(is_trial), (item_name or "Покупка")[:128], int(qty or 0),
-                int(time.time()),
+                int(time.time()), (promo_code or None),
             )
     except Exception as e:
         # Ссылка на оплату уже есть, но без записи в БД зачислить будет нечего —
@@ -3445,7 +3456,7 @@ async def _platega_fulfill(row, *, notify_chat: bool = False) -> tuple[bool, str
         whitelist_gb=row["whitelist_gb"] or 0, plan_key=(row["plan_key"] or None),
         price=float(row["price"] or 0), is_trial=bool(row["is_trial"]),
         item_name=row["item_name"] or "Покупка", qty=row["qty"] or 0,
-        source="platega",
+        source="platega", promo_code=dict(row).get("promo_code"),
     )
     if not ok:
         return ok, err, already
@@ -3665,7 +3676,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
-                                qty: int = 0):
+                                qty: int = 0, promo_code: str | None = None):
     """
     kind: "trial" | "plan" | "device" | "upgrade" | "wl_topup"
     qty — для kind="device": сколько устройств докупается; для kind="wl_topup"
@@ -3689,7 +3700,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
         platega_tx, platega_url = await _platega_invoice_create(
             user_id, None, kind=kind, item_name=item_name, price=price, days=days,
             hwid=hwid, squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key,
-            is_trial=is_trial, qty=qty,
+            is_trial=is_trial, qty=qty, promo_code=promo_code,
         )
         if platega_url:
             rows.append([btn("Оплатить", emoji_id=BTN_ICON_PAY, style="success",
@@ -3722,6 +3733,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
                     "is_trial":     "1" if is_trial else "0",
                     "item_name":    _yookassa_item(item_name),
                     "qty":          str(qty),
+                    "promo_code":   promo_code or "",
                 },
             }, str(uuid.uuid4()))
         except Exception as e:
@@ -3747,7 +3759,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
         token = await _stars_invoice_create(
             user_id, kind=kind, item_name=item_name, price=price, stars=stars,
             days=days, hwid=hwid, squad=squad, whitelist_gb=whitelist_gb,
-            plan_key=plan_key, is_trial=is_trial, qty=qty,
+            plan_key=plan_key, is_trial=is_trial, qty=qty, promo_code=promo_code,
         )
         if token:
             # Значок звезды — иконка кнопки (icon_custom_emoji_id): внутрь
@@ -3784,11 +3796,14 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
                                 price: int, days: int = 0, hwid: int | None = None,
                                 squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                 plan_key: str | None = None, is_trial: bool = False,
-                                qty: int = 0, display_prefix: str = "", extra_desc: str = ""):
+                                qty: int = 0, display_prefix: str = "", extra_desc: str = "",
+                                promo_code: str | None = None):
     """display_prefix — необязательный HTML-префикс (например premium-эмодзи)
     ТОЛЬКО для заголовка в Telegram; в описание/метаданные ЮKassa не попадает.
     extra_desc — доп. текст-описание (например состав тарифа), показывается
-    сразу на этом же экране, вместе с кнопками оплаты — тоже не уходит в ЮKassa."""
+    сразу на этом же экране, вместе с кнопками оплаты — тоже не уходит в ЮKassa.
+    promo_code — применённый скидочный промокод: цена уже пересчитана, здесь он
+    только запоминается в счёте, чтобы списаться при подтверждении оплаты."""
     if not payments_available():
         await safe_answer(cb, PAYMENTS_OFF_SHORT, show_alert=True)
         await edit_screen(cb.message, f"{hbold(item_name)}\n\n{PAYMENTS_OFF_TEXT}",
@@ -3797,6 +3812,7 @@ async def _create_payment_page(cb: CallbackQuery, *, kind: str, item_name: str,
     kb, price_line, hint = await _create_payment_core(
         cb.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
+        promo_code=promo_code,
     )
     if not kb:
         await safe_answer(cb, "Ошибка создания платежа.", show_alert=True)
@@ -3844,7 +3860,8 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
                             squad: str | list[str] | None = None, whitelist_gb: int = 0,
                             plan_key: str | None = None, price: float = 0,
                             is_trial: bool = False, item_name: str = "Покупка",
-                            qty: int = 0, source: str = "yookassa"):
+                            qty: int = 0, source: str = "yookassa",
+                            promo_code: str | None = None):
     """Выдаёт оплаченное: подписку / устройства / апгрейд / трафик.
 
     Возвращает (успех, текст_ошибки, уже_обрабатывался).
@@ -3951,15 +3968,23 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
                 current_squads.append(SQUAD_UUID_WHITELIST)
                 await remna_update_user(remna["uuid"], {"activeInternalSquads": current_squads})
 
+    # Скидочный промокод, применённый к заказу, списываем только сейчас —
+    # после фактической оплаты и успешной выдачи. Списание идемпотентно
+    # (redemption с уникальным (user_id, code)), поэтому повторов не будет.
+    promo_note = None
+    if promo_code:
+        if await _consume_discount_promo(u_id, promo_code):
+            promo_note = promo_code
+
     # Сумма пишется в рублях независимо от способа оплаты — иначе отчёты,
     # статистика и рефералка начали бы смешивать рубли со звёздами.
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, created_at, payment_id) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, created_at, payment_id, note) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             u_id, price, kind, days, is_trial,
             "stars" if source == "stars" else "purchase",
-            int(time.time()), pay_id,
+            int(time.time()), pay_id, promo_note,
         )
 
     await notify_admins_sale(u_id, uname, item_name, days, price, is_trial)
@@ -4012,11 +4037,12 @@ async def check_payment_cb(cb: CallbackQuery):
     is_trial    = md.get("is_trial", "0") == "1"
     item_name   = md.get("item_name", "Покупка")
     qty         = int(md.get("qty", 0) or 0)
+    promo_code  = md.get("promo_code") or None
 
     ok, err, already_processed = await _fulfill_purchase(
         pay_id=pay_id, u_id=u_id, kind=kind, days=days, hwid=hwid, squad=squad,
         whitelist_gb=whitelist_gb, plan_key=plan_key, price=price, is_trial=is_trial,
-        item_name=item_name, qty=qty, source="yookassa",
+        item_name=item_name, qty=qty, source="yookassa", promo_code=promo_code,
     )
     if not ok:
         await safe_answer(cb, f"{err} Обратитесь в поддержку.", show_alert=True)
@@ -4133,7 +4159,7 @@ async def stars_successful_payment(message: types.Message):
         squad=squad, whitelist_gb=row["whitelist_gb"] or 0,
         plan_key=(row["plan_key"] or None), price=float(row["price"] or 0),
         is_trial=bool(row["is_trial"]), item_name=row["item_name"] or "Покупка",
-        qty=row["qty"] or 0, source="stars",
+        qty=row["qty"] or 0, source="stars", promo_code=dict(row).get("promo_code"),
     )
     if not ok:
         # Звёзды уже списаны — молчать нельзя: пишем человеку и зовём админов,
@@ -4306,21 +4332,225 @@ async def buyplan_cb(cb: CallbackQuery):
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
+# ─────────────────────────────────────────────
+#  ЭКРАН ЗАКАЗА ТАРИФА + СКИДОЧНЫЙ ПРОМОКОД
+#
+#  После выбора срока показываем экран заказа с ценой и кнопкой «Ввести
+#  промокод». Скидочный промокод пересчитывает цену прямо здесь, а сам код
+#  запоминается и списывается только при подтверждении оплаты. Реальные счета
+#  (Platega/ЮKassa/звёзды) создаются лишь по кнопке «Оплатить» — по уже
+#  итоговой цене, поэтому лишних платёжных транзакций не появляется.
+#  Контекст заказа (тариф/срок/продление) едет прямо в callback_data, а
+#  применённый промокод хранится в FSM (order_promo).
+# ─────────────────────────────────────────────
+def _apply_pct(base: int, percent: int) -> int:
+    """Цена со скидкой, округление до рубля, минимум 1 ₽."""
+    if percent and percent > 0:
+        return max(1, int(round(int(base) * (100 - percent) / 100)))
+    return int(base)
+
+
+def _parse_order_cb(data: str, prefix: str):
+    """`prefix` + "{r|n}_{months}_{plan_key}" → (renew, months, plan_key) | None.
+    plan_key последний, поэтому спокойно содержит подчёркивания (vpn_bypass)."""
+    try:
+        flag, months_s, plan_key = data.removeprefix(prefix).split("_", 2)
+    except ValueError:
+        return None
+    if not months_s.isdigit() or plan_key not in PLANS:
+        return None
+    return (flag == "r"), int(months_s), plan_key
+
+
+def _discount_error_text(err: str) -> str:
+    if err == "already":
+        return "Вы уже использовали этот промокод."
+    if err == "ended":
+        return "Промокод закончился."
+    if err and err.startswith("age:"):
+        try:
+            _, need, left = err.split(":")
+            return (f"Промокод доступен аккаунтам старше {need} дн. "
+                    f"Осталось подождать: {left} дн.")
+        except Exception:
+            return "Промокод пока недоступен для вашего аккаунта."
+    return "Промокод не найден или не является скидочным."
+
+
+async def _order_promo_state(state: FSMContext, plan_key: str, months: int, renew: bool):
+    """Применённый к текущему заказу промокод (code, percent) или (None, 0).
+    Хранимая скидка учитывается, только если она относится ровно к этому
+    заказу — тарифу, сроку и признаку продления."""
+    data = await state.get_data()
+    op = data.get("order_promo") or {}
+    if (op.get("plan") == plan_key and int(op.get("months", 0)) == months
+            and bool(op.get("renew")) == renew):
+        return op.get("code"), int(op.get("percent", 0))
+    return None, 0
+
+
+async def _plan_order_view(user_id: int, plan_key: str, months: int, *,
+                           renew: bool, state: FSMContext):
+    plan = PLANS[plan_key]
+    base = await calc_plan_price(plan_key, months)
+    code, percent = await _order_promo_state(state, plan_key, months, renew)
+    final = _apply_pct(base, percent)
+    flag = "r" if renew else "n"
+    suffix = f"_{flag}_{months}_{plan_key}"
+    title = f"Продление {plan['name']}" if renew else plan["name"]
+    lines = [f"{hbold(title)} · {months} мес.", ""]
+    if code and percent > 0:
+        lines.append(f"Цена: <s>{base} руб.</s>")
+        lines.append(f"Промокод {code}: −{percent}%")
+        lines.append(f"{hbold(f'К оплате: {final} руб.')}")
+    else:
+        lines.append(f"К оплате: {base} руб.")
+    rows = [[btn("Оплатить", emoji_id=BTN_ICON_PAY, style="success",
+                 callback_data=f"order_pay{suffix}")]]
+    if code and percent > 0:
+        rows.append([InlineKeyboardButton(text="Убрать промокод",
+                                          callback_data=f"order_clear{suffix}")])
+    else:
+        rows.append([InlineKeyboardButton(text="Ввести промокод",
+                                          callback_data=f"order_promo{suffix}")])
+    back_cb = "back" if renew else f"buyplan_{plan_key}"
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=back_cb)])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_plan_order(cb: CallbackQuery, plan_key: str, months: int, *,
+                           renew: bool, state: FSMContext):
+    text, kb = await _plan_order_view(cb.from_user.id, plan_key, months,
+                                      renew=renew, state=state)
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+
+
 @router.callback_query(F.data.startswith("buymonths_"))
-async def buymonths_cb(cb: CallbackQuery):
+async def buymonths_cb(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
     rest = cb.data.removeprefix("buymonths_")
     plan_key, months_str = rest.rsplit("_", 1)
-    months = int(months_str)
-    if plan_key not in PLANS:
+    if not months_str.isdigit() or plan_key not in PLANS:
         await safe_answer(cb, "Тариф не найден.", show_alert=True)
         return
-    plan  = PLANS[plan_key]
-    price = await calc_plan_price(plan_key, months)
-    days  = months * 30
+    await _show_plan_order(cb, plan_key, int(months_str), renew=False, state=state)
+
+
+@router.callback_query(F.data.startswith("order_promo_"))
+async def order_promo_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
+    parsed = _parse_order_cb(cb.data, "order_promo_")
+    if not parsed:
+        await safe_answer(cb, "Заказ не найден.", show_alert=True)
+        return
+    renew, months, plan_key = parsed
+    flag = "r" if renew else "n"
+    await state.set_state(OrderPromoState.waiting_code)
+    await state.update_data(order_ctx={"plan": plan_key, "months": months, "renew": renew})
+    await edit_screen(cb.message,
+        f"{hbold('Промокод на скидку')}\n\nВведите промокод одним сообщением:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Назад",
+                                  callback_data=f"order_show_{flag}_{months}_{plan_key}")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("order_show_"))
+async def order_show_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    parsed = _parse_order_cb(cb.data, "order_show_")
+    if not parsed:
+        await safe_answer(cb, "Заказ не найден.", show_alert=True)
+        return
+    renew, months, plan_key = parsed
+    await state.set_state(None)
+    await _show_plan_order(cb, plan_key, months, renew=renew, state=state)
+
+
+@router.callback_query(F.data.startswith("order_clear_"))
+async def order_clear_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb, "Промокод убран.")
+    parsed = _parse_order_cb(cb.data, "order_clear_")
+    if not parsed:
+        return
+    renew, months, plan_key = parsed
+    await state.update_data(order_promo=None)
+    await _show_plan_order(cb, plan_key, months, renew=renew, state=state)
+
+
+@router.message(OrderPromoState.waiting_code)
+async def order_promo_input(message: types.Message, state: FSMContext):
+    code = (message.text or "").upper().strip()
+    data = await state.get_data()
+    ctx = data.get("order_ctx") or {}
+    plan_key = ctx.get("plan")
+    months = int(ctx.get("months", 0) or 0)
+    renew = bool(ctx.get("renew"))
+    if plan_key not in PLANS or months <= 0:
+        await state.clear()
+        await message.answer("Заказ не найден. Начните покупку заново.")
+        return
+    if not code:
+        await message.answer("Пустой промокод. Введите код одним сообщением.")
+        return
+    percent, err = await _discount_promo_check(message.from_user.id, code)
+    if err or percent <= 0:
+        flag = "r" if renew else "n"
+        await message.answer(
+            _discount_error_text(err or "not_found") + "\n\nВведите другой код или вернитесь назад.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Назад",
+                                      callback_data=f"order_show_{flag}_{months}_{plan_key}")],
+            ]),
+        )
+        return
+    await state.set_state(None)
+    await state.update_data(
+        order_promo={"code": code, "percent": percent, "plan": plan_key,
+                     "months": months, "renew": renew},
+        order_ctx=None,
+    )
+    text, kb = await _plan_order_view(message.from_user.id, plan_key, months,
+                                      renew=renew, state=state)
+    await message.answer(f"Промокод {code} применён: −{percent}%.\n\n{text}",
+                         parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("order_pay_"))
+async def order_pay_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if await payments_off_stop(cb):
+        return
+    parsed = _parse_order_cb(cb.data, "order_pay_")
+    if not parsed:
+        await safe_answer(cb, "Заказ не найден.", show_alert=True)
+        return
+    renew, months, plan_key = parsed
+    plan = PLANS[plan_key]
+    base = await calc_plan_price(plan_key, months)
+    code, percent = await _order_promo_state(state, plan_key, months, renew)
+    # Перепроверяем промокод на самом шаге оплаты: за время выбора он мог
+    # закончиться или быть уже использован в другой покупке.
+    if code:
+        percent, err = await _discount_promo_check(cb.from_user.id, code)
+        if err or percent <= 0:
+            code = None
+            percent = 0
+            await state.update_data(order_promo=None)
+            await safe_answer(cb, "Промокод больше недействителен — оформляю без скидки.",
+                              show_alert=True)
+    final = _apply_pct(base, percent)
+    name = f"Продление {plan['name']}" if renew else plan["name"]
     await _create_payment_page(
-        cb, kind="plan", item_name=f"{plan['name']} · {months} мес.", price=price, days=days,
-        hwid=1, squad=plan["squad"], whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
+        cb, kind="plan", item_name=f"{name} · {months} мес.", price=final,
+        days=months * 30, hwid=1, squad=plan["squad"],
+        whitelist_gb=plan["whitelist_gb"], plan_key=plan_key, promo_code=code,
     )
 
 # ─────────────────────────────────────────────
@@ -4536,6 +4766,73 @@ async def _claim_promo_once(user_id: int, code: str, selected_plan: str | None =
             return row, None
 
 
+async def _discount_promo_check(user_id: int, code: str):
+    """Проверка скидочного промокода на шаге оплаты (без списания).
+
+    Возвращает (percent, None) если код можно применить, либо (0, error) с
+    ключом ошибки: not_found / ended / already / age:<нужно>:<осталось>.
+    Сам код списывается позже, при подтверждении оплаты (_consume_discount_promo).
+    """
+    async with pool.acquire() as conn:
+        promo = await conn.fetchrow(
+            "SELECT uses, promo_type, discount_percent, min_account_age_days "
+            "FROM promos WHERE code=$1", code,
+        )
+    if not promo or (promo["promo_type"] or "") != "discount":
+        return 0, "not_found"
+    percent = int(promo["discount_percent"] or 0)
+    if percent <= 0:
+        return 0, "not_found"
+    if int(promo["uses"] or 0) <= 0:
+        return 0, "ended"
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT created_at FROM users WHERE user_id=$1", user_id)
+        used = await conn.fetchval(
+            "SELECT 1 FROM promo_redemptions WHERE user_id=$1 AND code=$2", user_id, code,
+        )
+    if used:
+        return 0, "already"
+    min_age = int(promo["min_account_age_days"] or 0)
+    registered_at = int(user["created_at"] or 0) if user else 0
+    if min_age > 0:
+        age_seconds = max(0, int(time.time()) - registered_at) if registered_at else 0
+        if not registered_at or age_seconds < min_age * 86400:
+            left = max(1, (min_age * 86400 - age_seconds + 86399) // 86400)
+            return 0, f"age:{min_age}:{left}"
+    return clamp_discount(percent), None
+
+
+async def _consume_discount_promo(user_id: int, code: str) -> bool:
+    """Списывает скидочный промокод при подтверждении оплаты.
+
+    Идемпотентно: уникальность (user_id, code) в promo_redemptions гарантирует,
+    что одно и то же списание не повторится. Возвращает True, если списан
+    именно сейчас. Ошибки глушим: сорванное списание не должно мешать выдаче
+    уже оплаченной подписки.
+    """
+    if not code:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                inserted = await conn.fetchval(
+                    "INSERT INTO promo_redemptions (user_id, code, redeemed_at, source) "
+                    "VALUES ($1,$2,$3,'bot-discount') "
+                    "ON CONFLICT (user_id, code) DO NOTHING RETURNING code",
+                    user_id, code, int(time.time()),
+                )
+                if not inserted:
+                    return False
+                await conn.execute(
+                    "UPDATE promos SET uses=uses-1 WHERE code=$1 AND uses>0", code,
+                )
+        await _finish_promo_claim(code)
+        return True
+    except Exception as e:
+        log.exception("Списание скидочного промокода %s (user %s): %s", code, user_id, e)
+        return False
+
+
 async def _release_promo_claim(user_id: int, code: str):
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -4625,8 +4922,9 @@ async def handle_promo(message: types.Message, state: FSMContext):
     if promo_type == "discount":
         await state.clear()
         await message.answer(
-            "Это промокод на скидку. Введите его на шаге оплаты при покупке "
-            "тарифа — здесь он не активируется."
+            "Это промокод на скидку. Он применяется при покупке тарифа: "
+            "откройте «Купить», выберите тариф и срок, затем нажмите "
+            "«Ввести промокод»."
         )
         text, kb = await _build_profile_view(message.from_user.id)
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -7514,7 +7812,7 @@ async def _renew_kb(plan_key: str, include_back: bool = False) -> InlineKeyboard
 
 
 @router.callback_query(F.data.startswith("rnw_"))
-async def renew_cb(cb: CallbackQuery):
+async def renew_cb(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
     if await payments_off_stop(cb):
         return
@@ -7526,14 +7824,7 @@ async def renew_cb(cb: CallbackQuery):
     if plan_key not in PLANS or months <= 0:
         await safe_answer(cb, "Тариф недоступен.", show_alert=True)
         return
-    plan  = PLANS[plan_key]
-    price = await calc_plan_price(plan_key, months)
-    await _create_payment_page(
-        cb, kind="plan",
-        item_name=f"Продление {plan['name']} · {months} мес.",
-        price=price, days=months * 30, hwid=1, squad=plan["squad"],
-        whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
-    )
+    await _show_plan_order(cb, plan_key, months, renew=True, state=state)
 
 
 async def _send_expiry_reminder(user_id: int, plan_key: str, expire_ts: int, kind: str):
