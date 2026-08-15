@@ -987,6 +987,18 @@ async def init_db():
                 promo_code   TEXT
             )
         """)
+        # Скидочный промокод, применённый пользователем в личном кабинете на
+        # сайте, но ещё не оплаченный. Общая с сайтом таблица: код вводится в
+        # кабинете, а применяется и списывается здесь — кабинет открывает бота
+        # для оплаты. Одна активная скидка на пользователя.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cabinet_discounts (
+                user_id    BIGINT PRIMARY KEY,
+                code       TEXT NOT NULL,
+                percent    INTEGER NOT NULL DEFAULT 0,
+                created_at BIGINT DEFAULT 0
+            )
+        """)
         # Отправленные напоминания об окончании подписки (по срокам 3д/1д/1ч).
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS expiry_reminders (
@@ -2640,6 +2652,47 @@ def back_kb():
 #   wl_<ГБ>                   — докупить трафик (напр. wl_10) → сразу оплата
 #   upgrade                   — улучшить тариф до VPN + 📶
 # Если количество не передано, бот открывает соответствующий экран/ввод.
+async def _apply_cabinet_discount(u_id: int, price: int):
+    """Применяет к цене тарифа скидочный промокод, введённый в личном кабинете
+    (таблица cabinet_discounts). Возвращает (итоговая_цена, код|None).
+
+    Скидка закреплена за пользователем: процент хранится в самой строке,
+    поэтому она НЕ слетает, даже если у промокода закончились использования
+    или он удалён. Убираем только если пользователь уже применил этот код.
+    Списывается код позже — при подтверждении оплаты."""
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT code, percent FROM cabinet_discounts WHERE user_id=$1", u_id)
+    except Exception:
+        return price, None
+    if not row:
+        return price, None
+    code = (row["code"] or "").strip().upper()
+    percent = clamp_discount(int(row["percent"] or 0))
+
+    async def _drop():
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM cabinet_discounts WHERE user_id=$1", u_id)
+        except Exception:
+            pass
+
+    if not code or percent <= 0:
+        await _drop()
+        return price, None
+    try:
+        async with pool.acquire() as conn:
+            used = await conn.fetchval(
+                "SELECT 1 FROM promo_redemptions WHERE user_id=$1 AND code=$2", u_id, code)
+    except Exception:
+        used = None
+    if used:
+        await _drop()
+        return price, None
+    return _apply_pct(price, percent), code
+
+
 async def _open_paysection_from_message(message: types.Message, state: FSMContext,
                                         section: str) -> bool:
     """Открывает раздел оплаты по ключу из диплинка. Возвращает True, если
@@ -2667,10 +2720,12 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         if plan_key in PLANS and months and months > 0:
             plan  = PLANS[plan_key]
             price = await calc_plan_price(plan_key, months)
+            price, promo_code = await _apply_cabinet_discount(u_id, price)
             await _create_payment_page_from_message(
                 message, kind="plan", item_name=f"{plan['name']} · {months} мес.",
                 price=price, days=months * 30, hwid=1, squad=plan["squad"],
                 whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
+                promo_code=promo_code,
             )
             return True
         # Без конкретного тарифа/срока — показываем экран выбора тарифа.
@@ -2692,10 +2747,12 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             return True
         plan  = PLANS[plan_key]
         price = await calc_plan_price(plan_key, months)
+        price, promo_code = await _apply_cabinet_discount(u_id, price)
         await _create_payment_page_from_message(
             message, kind="plan", item_name=f"Продление {plan['name']} · {months} мес.",
             price=price, days=months * 30, hwid=1, squad=plan["squad"],
             whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
+            promo_code=promo_code,
         )
         return True
 
@@ -3828,7 +3885,8 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
                                              price: int, days: int = 0, hwid: int | None = None,
                                              squad: str | list[str] | None = None, whitelist_gb: int = 0,
                                              plan_key: str | None = None, is_trial: bool = False,
-                                             qty: int = 0, display_prefix: str = ""):
+                                             qty: int = 0, display_prefix: str = "",
+                                             promo_code: str | None = None):
     """То же самое, что _create_payment_page, но когда вызов идёт из ответа на
     текстовое сообщение (ввод количества), а не из нажатия кнопки."""
     if not payments_available():
@@ -3838,6 +3896,7 @@ async def _create_payment_page_from_message(message: types.Message, *, kind: str
     kb, price_line, hint = await _create_payment_core(
         message.from_user.id, kind=kind, item_name=item_name, price=price, days=days, hwid=hwid,
         squad=squad, whitelist_gb=whitelist_gb, plan_key=plan_key, is_trial=is_trial, qty=qty,
+        promo_code=promo_code,
     )
     if not kb:
         await message.answer("Ошибка создания платежа.")
@@ -4827,6 +4886,16 @@ async def _consume_discount_promo(user_id: int, code: str) -> bool:
                     "UPDATE promos SET uses=uses-1 WHERE code=$1 AND uses>0", code,
                 )
         await _finish_promo_claim(code)
+        # Если этот код держался как «кабинетная» скидка — убираем, чтобы он
+        # не применился к следующей покупке.
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM cabinet_discounts WHERE user_id=$1 AND code=$2",
+                    user_id, code,
+                )
+        except Exception:
+            pass
         return True
     except Exception as e:
         log.exception("Списание скидочного промокода %s (user %s): %s", code, user_id, e)
