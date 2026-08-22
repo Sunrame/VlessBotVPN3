@@ -1328,33 +1328,143 @@ async def remna_disable_user(uuid_: str) -> bool:
     result = await remna_update_user(uuid_, {"status": "DISABLED"})
     return result is not None
 
+# ── Пагинация /api/users ──────────────────────────────────────────────
+# Разные версии Remnawave отдают список по-разному: меняются имена полей
+# в ответе и имена query-параметров, а размер страницы панель может резать
+# на своё усмотрение (просишь 100 — отдаёт 25/50). Поэтому ничего не
+# считаем константой: и форму ответа, и стиль пагинации определяем на лету.
+_REMNA_LIST_KEYS  = ("users", "records", "data", "items", "result")
+_REMNA_TOTAL_KEYS = ("total", "totalCount", "count", "totalRecords")
+
+_REMNA_PAGE_STYLES = (
+    ("start/size",   lambda off, size, page: {"start": off,  "size":  size}),
+    ("offset/limit", lambda off, size, page: {"offset": off, "limit": size}),
+    ("page/size",    lambda off, size, page: {"page": page,  "size":  size}),
+)
+
+def _as_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+def _remna_extract_page(payload) -> tuple[list, int | None]:
+    """Достаёт (список пользователей, total) из ответа любой формы."""
+    resp = payload.get("response", payload) if isinstance(payload, dict) else payload
+    if isinstance(resp, list):
+        return resp, None
+    if not isinstance(resp, dict):
+        return [], None
+
+    items: list = []
+    for key in _REMNA_LIST_KEYS:
+        val = resp.get(key)
+        if isinstance(val, list):
+            items = val
+            break
+
+    total = None
+    for src in (resp, resp.get("meta"), resp.get("pagination")):
+        if not isinstance(src, dict):
+            continue
+        for key in _REMNA_TOTAL_KEYS:
+            total = _as_int(src.get(key))
+            if total is not None:
+                break
+        if total is not None:
+            break
+    return items, total
+
 async def remna_get_all_users() -> list:
-    """Получает ВСЕХ пользователей через start+size (единственная рабочая пагинация)."""
-    all_users: list = []
+    """Получает ВСЕХ пользователей панели.
+
+    Старая версия молча обрезала список после обновления панели: она
+    выходила из цикла, если страница вернула меньше PAGE_SIZE записей или
+    если поле total не нашлось (тогда total=0 и условие len>=total давало
+    выход сразу после первой страницы). Здесь оба капкана убраны:
+
+      • смещение сдвигаем на ФАКТИЧЕСКОЕ число записей в странице;
+      • без total просто читаем страницы, пока они не кончатся;
+      • массив ищем в users / records / data / items;
+      • если панель игнорирует start — пробуем offset/limit и page/size.
+    """
     PAGE_SIZE = 100
-    start = 0
-    try:
-        async with httpx.AsyncClient(verify=True) as client:
-            while True:
+    MAX_PAGES = 500          # предохранитель от бесконечного цикла
+
+    async def _walk(client, make_params) -> tuple[list, int | None, str]:
+        """Проходит все страницы одним стилем параметров.
+        Возвращает (пользователи, total-от-панели, причина остановки)."""
+        collected: list = []
+        seen: set = set()
+        total  = None
+        offset = 0
+        page   = 1
+        try:
+            for _ in range(MAX_PAGES):
                 r = await client.get(
-                    f"{REMNAWAVE_URL}/api/users?start={start}&size={PAGE_SIZE}",
+                    f"{REMNAWAVE_URL}/api/users",
+                    params=make_params(offset, PAGE_SIZE, page),
                     headers=_remna_headers(), timeout=30,
                 )
                 r.raise_for_status()
-                data  = r.json().get("response", {})
-                users = data.get("users", [])
-                total = data.get("total", 0)
+                users, tot = _remna_extract_page(r.json())
+                if tot is not None:
+                    total = tot
                 if not users:
-                    break
-                existing = {u.get("uuid") for u in all_users}
-                new_u = [u for u in users if u.get("uuid") not in existing]
-                all_users.extend(new_u)
-                if len(all_users) >= total or len(users) < PAGE_SIZE:
-                    break
-                start += PAGE_SIZE
+                    return collected, total, "empty_page"
+
+                added = 0
+                for u in users:
+                    key = u.get("uuid") or u.get("username")
+                    if key is not None:
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    collected.append(u)
+                    added += 1
+
+                if added == 0:
+                    # панель проигнорировала смещение и вернула ту же страницу
+                    return collected, total, "no_progress"
+
+                offset += len(users)
+                page   += 1
+                if total is not None and len(collected) >= total:
+                    return collected, total, "total_reached"
+            return collected, total, "max_pages"
+        except Exception as e:
+            log.error("[Remna] get_all_users page: %s", e)
+            return collected, total, f"error: {e}"
+
+    best: list = []
+    best_total = None
+    try:
+        async with httpx.AsyncClient(verify=True) as client:
+            for style_name, make_params in _REMNA_PAGE_STYLES:
+                users, total, reason = await _walk(client, make_params)
+                if len(users) > len(best):
+                    best, best_total = users, total
+                if reason in ("total_reached", "empty_page"):
+                    # список вычерпан до конца — остальные стили не нужны
+                    log.info("[Remna] get_all_users: %d польз. (%s, %s, total=%s)",
+                             len(users), style_name, reason, total)
+                    return users
+                log.warning("[Remna] get_all_users: стиль %s остановился на %d "
+                            "польз. (%s, total=%s) — пробую следующий",
+                            style_name, len(users), reason, total)
     except Exception as e:
         log.error("[Remna] get_all_users: %s", e)
-    return all_users
+
+    if best_total is not None and len(best) < best_total:
+        log.error("[Remna] get_all_users: получено %d из %d — список НЕПОЛНЫЙ",
+                  len(best), best_total)
+    else:
+        log.info("[Remna] get_all_users: итог %d польз. (total от панели: %s)",
+                 len(best), best_total)
+    return best
 
 async def remna_get_user_hwid(uuid_: str) -> list:
     """Список HWID-устройств пользователя: GET /api/users/{uuid}/hwid"""
@@ -5282,7 +5392,7 @@ SUBS_PAGE_SIZE = 8
 async def _get_sorted_subs() -> list:
     now = int(time.time())
     all_users = await remna_get_all_users()
-    our = [u for u in all_users if u.get("username", "").startswith("truba_")]
+    our = [u for u in all_users if (u.get("username") or "").startswith("truba_")]
     active = [u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"]
     return sorted(active, key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
 
@@ -6617,7 +6727,7 @@ async def admin_online_cb(cb: CallbackQuery):
     all_users = await remna_get_all_users()
     online = [
         u for u in all_users
-        if u.get("username", "").startswith("truba_")
+        if (u.get("username") or "").startswith("truba_")
         and parse_dt(u.get("userTraffic", {}).get("onlineAt")) > (now - 180)
     ]
     if not online:
@@ -7563,7 +7673,7 @@ async def admin_stats_cb(cb: CallbackQuery):
         promos = await conn.fetchval("SELECT COUNT(*) FROM promos")
         ref_balance_total = await conn.fetchval("SELECT COALESCE(SUM(referral_balance),0) FROM users")
     all_users = await remna_get_all_users()
-    our    = [u for u in all_users if u.get("username", "").startswith("truba_")]
+    our    = [u for u in all_users if (u.get("username") or "").startswith("truba_")]
     active = sum(1 for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")
     sale_notify = await is_admin_sale_notify(cb.from_user.id)
     text = (
@@ -7810,7 +7920,7 @@ async def send_daily_report():
             revenue    = sum(float(p["amount"] or 0) for p in pay_rows)
             total_paid = await conn.fetchval("SELECT COUNT(*) FROM users WHERE has_paid=1") or 0
         all_users = await remna_get_all_users()
-        our    = [u for u in all_users if u.get("username", "").startswith("truba_")]
+        our    = [u for u in all_users if (u.get("username") or "").startswith("truba_")]
         active = sum(1 for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")
         report = (
             f"Отчёт за {date} (МСК)\n\n"
