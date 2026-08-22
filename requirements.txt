@@ -1,6 +1,8 @@
 Flask==3.0.3
 gunicorn==22.0.0
-psycopg2-binary==2.9.9
+# 2.9.9 не имеет колёс под Python 3.13 — pip лез собирать из исходников
+# и падал на _PyInterpreterState_Get(). С 2.9.10 ставится готовое колесо.
+psycopg2-binary==2.9.10
 requests==2.32.3
 python-dotenv==1.0.1
 yookassa==3.5.0
