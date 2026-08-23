@@ -1207,6 +1207,38 @@ def _squad_uuids(raw_squads) -> list[str]:
             out.append(s)
     return out
 
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+def _remna_uuid(user) -> str | None:
+    """UUID пользователя панели.
+
+    Раньше везде стояло _remna_uuid(remna) — и когда панель перестала отдавать
+    это поле под таким именем, всё, что ПИШЕТ в панель, начало падать с
+    KeyError: выдача, продление, смена лимита устройств. Читалка при этом
+    продолжала работать, поэтому /check находил людей, а изменить их было
+    нельзя. Теперь ключ ищется по нескольким именам, а если не нашёлся —
+    возвращаем None, и вызывающий код скажет об этом внятно.
+    """
+    if not isinstance(user, dict):
+        return None
+    for key in ("uuid", "userUuid", "user_uuid", "id", "userId", "user_id", "_id"):
+        val = user.get(key)
+        if isinstance(val, str) and _UUID_RE.match(val):
+            return val
+    # Последний шанс: любое поле с «uuid»/«id» в имени, похожее на UUID.
+    # Служебные ссылки (сквад, нода, подписка) исключаем, чтобы не
+    # отправить в панель чужой идентификатор.
+    for key, val in user.items():
+        low = key.lower()
+        if not isinstance(val, str) or not _UUID_RE.match(val):
+            continue
+        if any(bad in low for bad in ("squad", "node", "host", "config", "profile", "sub")):
+            continue
+        if "uuid" in low or low.endswith("id"):
+            return val
+    return None
+
 def _expire_at(days: int) -> str:
     dt = datetime.now(timezone.utc) + timedelta(days=days)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -1290,7 +1322,13 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
     base       = max(current, now)
     new_expire = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    payload: dict = {"uuid": user["uuid"], "expireAt": new_expire, "status": "ACTIVE"}
+    uuid_ = _remna_uuid(user)
+    if not uuid_:
+        _remna_note_error("PATCH /api/users (продление)",
+                          f"в ответе панели нет UUID пользователя; поля: {sorted(user.keys())}")
+        return None
+
+    payload: dict = {"uuid": uuid_, "expireAt": new_expire, "status": "ACTIVE"}
     if squad_uuid is not None:
         payload["activeInternalSquads"] = _normalize_squads(squad_uuid)
     if hwid is not None:
@@ -1313,7 +1351,10 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
         _remna_note_error("PATCH /api/users (продление)", repr(e))
         return None
 
-async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
+async def remna_update_user(uuid_: str | None, payload: dict) -> dict | None:
+    if not uuid_:
+        _remna_note_error("PATCH /api/users", "не удалось определить UUID пользователя в ответе панели")
+        return None
     payload = dict(payload)
     payload["uuid"] = uuid_
     try:
@@ -1333,7 +1374,11 @@ async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
         _remna_note_error("PATCH /api/users", repr(e))
         return None
 
-async def remna_update_user_verbose(uuid_: str, payload: dict) -> tuple[dict | None, str]:
+async def remna_update_user_verbose(uuid_: str | None, payload: dict) -> tuple[dict | None, str]:
+    if not uuid_:
+        msg = "не удалось определить UUID пользователя в ответе панели"
+        _remna_note_error("PATCH /api/users", msg)
+        return None, msg
     payload = dict(payload)
     payload["uuid"] = uuid_
     try:
@@ -1446,7 +1491,7 @@ async def remna_get_all_users() -> list:
 
                 added = 0
                 for u in users:
-                    key = u.get("uuid") or u.get("username")
+                    key = _remna_uuid(u) or u.get("username")
                     if key is not None:
                         if key in seen:
                             continue
@@ -1578,7 +1623,7 @@ async def activate_subscription(user_id: int, days: int, hwid: int = 1,
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE users SET remna_uuid=$1 WHERE user_id=$2",
-                result.get("uuid"), user_id,
+                _remna_uuid(result), user_id,
             )
             if whitelist_gb > 0:
                 await conn.execute(
@@ -4142,7 +4187,7 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
             else:
                 await conn.execute(
                     "UPDATE users SET plan=$1, extra_devices=0, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
-                    plan_key, result_user.get("uuid"), u_id,
+                    plan_key, _remna_uuid(result_user), u_id,
                 )
 
     elif kind == "device":
@@ -4151,7 +4196,7 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
             return await _rollback("пользователь не найден в панели.")
         add_count = qty if qty > 0 else 1
         new_hwid = remna.get("hwidDeviceLimit", 1) + add_count
-        result_user = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
+        result_user = await remna_update_user(_remna_uuid(remna), {"hwidDeviceLimit": new_hwid})
         if not result_user:
             return await _rollback("не удалось обновить лимит устройств.")
         async with pool.acquire() as conn:
@@ -4164,7 +4209,7 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
         if not remna:
             return await _rollback("пользователь не найден в панели.")
         result_user = await remna_update_user(
-            remna["uuid"], {"activeInternalSquads": [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]}
+            _remna_uuid(remna), {"activeInternalSquads": [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST]}
         )
         if not result_user:
             return await _rollback("не удалось обновить тариф.")
@@ -4198,7 +4243,7 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
             current_squads = _squad_uuids(remna.get("activeInternalSquads"))
             if SQUAD_UUID_WHITELIST not in current_squads:
                 current_squads.append(SQUAD_UUID_WHITELIST)
-                await remna_update_user(remna["uuid"], {"activeInternalSquads": current_squads})
+                await remna_update_user(_remna_uuid(remna), {"activeInternalSquads": current_squads})
 
     # Скидочный промокод, применённый к заказу, списываем только сейчас —
     # после фактической оплаты и успешной выдачи. Списание идемпотентно
@@ -5691,7 +5736,7 @@ async def set_hwid_limit(cb: CallbackQuery):
     if not remna:
         await safe_answer(cb, "Пользователь не найден в Remnawave.", show_alert=True)
         return
-    result = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
+    result = await remna_update_user(_remna_uuid(remna), {"hwidDeviceLimit": new_hwid})
     if not result:
         await safe_answer(cb, "Ошибка обновления.", show_alert=True)
         if _REMNA_LAST_ERROR:
@@ -5741,7 +5786,7 @@ async def ca_adddays_handler(message: types.Message, state: FSMContext):
     current = datetime.fromisoformat(remna["expireAt"].replace("Z", "+00:00"))
     base    = max(current, now_utc)
     new_exp = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp, "status": "ACTIVE"})
+    result  = await remna_update_user(_remna_uuid(remna), {"expireAt": new_exp, "status": "ACTIVE"})
     if not result:
         await message.answer("Ошибка обновления." + remna_err())
         return
@@ -5783,7 +5828,7 @@ async def ca_subdays_handler(message: types.Message, state: FSMContext):
     if new_exp_dt <= now_utc:
         new_exp_dt = now_utc + timedelta(minutes=5)
     new_exp = new_exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp, "status": "ACTIVE"})
+    result  = await remna_update_user(_remna_uuid(remna), {"expireAt": new_exp, "status": "ACTIVE"})
     if not result:
         await message.answer("Ошибка обновления." + remna_err())
         return
@@ -5824,7 +5869,7 @@ async def ca_setdate_handler(message: types.Message, state: FSMContext):
     if not remna:
         await message.answer("Пользователь не найден в Remnawave.")
         return
-    result = await remna_update_user(remna["uuid"], {"expireAt": dt_utc_str, "status": "ACTIVE"})
+    result = await remna_update_user(_remna_uuid(remna), {"expireAt": dt_utc_str, "status": "ACTIVE"})
     if not result:
         await message.answer("Ошибка обновления." + remna_err())
         return
@@ -5862,7 +5907,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
     if not remna:
         await message.answer("Пользователь не найден в Remnawave.")
         return
-    result = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": hwid})
+    result = await remna_update_user(_remna_uuid(remna), {"hwidDeviceLimit": hwid})
     if not result:
         await message.answer("Ошибка обновления." + remna_err())
         return
@@ -5891,7 +5936,7 @@ async def ca_devices_show(cb: CallbackQuery):
     if not remna:
         await cb.message.answer("Пользователь не найден в Remnawave.")
         return
-    devices = await remna_get_user_hwid(remna["uuid"])
+    devices = await remna_get_user_hwid(_remna_uuid(remna))
     if not devices:
         await cb.message.answer(f"Устройства ID:{user_id}\n\nНет зарегистрированных устройств.")
         return
@@ -5937,7 +5982,7 @@ async def ca_whitelist_toggle(cb: CallbackQuery, state: FSMContext):
         new_squads = [s for s in current_squads if s != SQUAD_UUID_WHITELIST]
         if SQUAD_UUID_BASIC not in new_squads:
             new_squads.append(SQUAD_UUID_BASIC)
-        result, err_text = await remna_update_user_verbose(remna["uuid"], {"activeInternalSquads": new_squads})
+        result, err_text = await remna_update_user_verbose(_remna_uuid(remna), {"activeInternalSquads": new_squads})
         if not result:
             await cb.message.answer(f"Ошибка обновления.\nОтправлено: {new_squads}\nОтвет: {err_text}")
             return
@@ -5974,7 +6019,7 @@ async def ca_whitelist_gb_handler(message: types.Message, state: FSMContext):
     new_squads = list(current_squads)
     if SQUAD_UUID_WHITELIST not in new_squads:
         new_squads.append(SQUAD_UUID_WHITELIST)
-    result, err_text = await remna_update_user_verbose(remna["uuid"], {"activeInternalSquads": new_squads})
+    result, err_text = await remna_update_user_verbose(_remna_uuid(remna), {"activeInternalSquads": new_squads})
     if not result:
         await message.answer(f"Ошибка обновления сквада.\nОтправлено: {new_squads}\nОтвет: {err_text}")
         return
@@ -6005,7 +6050,7 @@ async def quick_take(cb: CallbackQuery):
     user_id = int(cb.data.removeprefix("quicktake_"))
     remna = await remna_get_user(user_id)
     if remna:
-        await remna_disable_user(remna["uuid"])
+        await remna_disable_user(_remna_uuid(remna))
     # Сбрасываем классификацию тарифа — иначе в профиле остаются кнопки
     # "Добавить устройства"/"Улучшить тариф" от старого plan в БД, хотя
     # подписка уже отключена.
@@ -7821,16 +7866,49 @@ async def admin_diag(message: types.Message):
     if not users:
         lines.append("   ЧТЕНИЕ НЕ РАБОТАЕТ — проверь REMNAWAVE_URL/TOKEN/COOKIE")
 
-    # 2. ЗАПИСЬ (no-op: ставим ту же дату, что уже стоит)
+    global _REMNA_LAST_ERROR
+
+    # 2. ПОЛЯ, которые реально отдаёт панель
     lines.append("")
-    lines.append("2) ЗАПИСЬ (PATCH /api/users, без изменения данных)")
-    probe = next((u for u in ours if u.get("uuid") and u.get("expireAt")), None)
-    if probe is None:
-        lines.append("   не на ком проверить — нет ни одного truba_* с uuid")
+    lines.append("2) ФОРМАТ ОТВЕТА ПАНЕЛИ")
+    sample_list = ours[0] if ours else (users[0] if users else None)
+    if sample_list is None:
+        lines.append("   нечего показать — список пуст")
     else:
-        global _REMNA_LAST_ERROR
+        lines.append("   поля в списке /api/users:")
+        lines.append("   " + ", ".join(sorted(sample_list.keys())))
+        lines.append(f"   UUID из списка: {_remna_uuid(sample_list) or 'НЕ НАЙДЕН'}")
+
+    # Карточка одного человека — именно её использует выдача и редактирование
+    probe_id = None
+    for u in ours:
+        tail = (u.get("username") or "").replace("truba_", "")
+        if tail.isdigit():
+            probe_id = int(tail)
+            break
+    single = await remna_get_user(probe_id) if probe_id else None
+    if single:
+        lines.append("   поля в карточке /api/users/by-username:")
+        lines.append("   " + ", ".join(sorted(single.keys())))
+        lines.append(f"   UUID из карточки: {_remna_uuid(single) or 'НЕ НАЙДЕН'}")
+    elif probe_id:
+        lines.append(f"   карточка by-username НЕ читается (ID:{probe_id})")
+        lines.append(f"   {_REMNA_LAST_ERROR or 'без деталей'}")
+
+    # 3. ЗАПИСЬ (no-op: ставим ту же дату, что уже стоит)
+    lines.append("")
+    lines.append("3) ЗАПИСЬ (PATCH /api/users, без изменения данных)")
+    probe = single or next((u for u in ours if _remna_uuid(u) and u.get("expireAt")), None)
+    probe_uuid = _remna_uuid(probe) if probe else None
+    if probe is None:
+        lines.append("   не на ком проверить — ни списка, ни карточки")
+    elif not probe_uuid:
+        lines.append("   НЕВОЗМОЖНО: панель не отдаёт UUID пользователя ни в списке,")
+        lines.append("   ни в карточке. Именно по нему бот пишет изменения —")
+        lines.append("   поэтому не работают выдача, продление и правки.")
+    else:
         _REMNA_LAST_ERROR = ""
-        res = await remna_update_user(probe["uuid"], {"expireAt": probe["expireAt"]})
+        res = await remna_update_user(probe_uuid, {"expireAt": probe.get("expireAt")})
         if res:
             lines.append(f"   OK — запись проходит (проверено на {probe.get('username')})")
         else:
@@ -7841,7 +7919,7 @@ async def admin_diag(message: types.Message):
 
     # 3. СКВАДЫ из окружения — живы ли они в панели
     lines.append("")
-    lines.append("3) СКВАДЫ ИЗ ОКРУЖЕНИЯ")
+    lines.append("4) СКВАДЫ ИЗ ОКРУЖЕНИЯ")
     seen_squads: set[str] = set()
     for u in users:
         for s in _squad_uuids(u.get("activeInternalSquads")):
@@ -7860,7 +7938,7 @@ async def admin_diag(message: types.Message):
 
     # 4. УВЕДОМЛЕНИЯ
     lines.append("")
-    lines.append("4) УВЕДОМЛЕНИЯ О ПОКУПКАХ")
+    lines.append("5) УВЕДОМЛЕНИЯ О ПОКУПКАХ")
     admins = all_admin_ids()
     if not admins:
         lines.append("   АДМИНОВ НЕТ — проверь ADMIN_ID_1 / ADMIN_ID_2")
@@ -7870,7 +7948,7 @@ async def admin_diag(message: types.Message):
 
     # 5. ПРИЁМ ОПЛАТ
     lines.append("")
-    lines.append("5) ПРИЁМ ОПЛАТ")
+    lines.append("6) ПРИЁМ ОПЛАТ")
     lines.append(f"   ЮKassa: {'вкл' if PAYMENTS_ENABLED else 'выкл'}")
     lines.append(f"   Stars: {'вкл' if STARS_ENABLED else 'выкл'}")
     lines.append(f"   Platega: {'вкл' if platega_available() else 'выкл'}")
@@ -7956,7 +8034,7 @@ async def check_whitelist_limits():
                 new_squads = [s for s in current_squads if s != SQUAD_UUID_WHITELIST]
                 if SQUAD_UUID_BASIC not in new_squads:
                     new_squads.append(SQUAD_UUID_BASIC)
-                result = await remna_update_user(remna["uuid"], {"activeInternalSquads": new_squads})
+                result = await remna_update_user(_remna_uuid(remna), {"activeInternalSquads": new_squads})
                 if result:
                     async with pool.acquire() as conn:
                         await conn.execute("UPDATE whitelist_limits SET cut_off=TRUE WHERE user_id=$1", user_id)
