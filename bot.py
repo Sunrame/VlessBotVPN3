@@ -1211,6 +1211,22 @@ def _expire_at(days: int) -> str:
     dt = datetime.now(timezone.utc) + timedelta(days=days)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
+# ── Последняя ошибка панели ───────────────────────────────────────────
+# Раньше любая неудача записи в Remnawave превращалась в глухое
+# «Ошибка обновления.» — по такому сообщению невозможно понять, что
+# именно ответила панель (400? 401? какое поле не понравилось?).
+# Теперь ответ запоминается и подставляется прямо в сообщение админу.
+_REMNA_LAST_ERROR: str = ""
+
+def _remna_note_error(where: str, detail) -> None:
+    global _REMNA_LAST_ERROR
+    _REMNA_LAST_ERROR = f"{where} → {detail}"[:600]
+    log.error("[Remna] %s", _REMNA_LAST_ERROR)
+
+def remna_err(prefix: str = "\n\nОтвет панели:\n") -> str:
+    """Хвост для сообщения админу: что именно ответила панель."""
+    return f"{prefix}{_REMNA_LAST_ERROR}" if _REMNA_LAST_ERROR else ""
+
 async def remna_get_user(user_id: int) -> dict | None:
     try:
         async with httpx.AsyncClient(verify=True) as client:
@@ -1220,10 +1236,12 @@ async def remna_get_user(user_id: int) -> dict | None:
             )
             if r.status_code == 404:
                 return None
-            r.raise_for_status()
+            if r.status_code >= 400:
+                _remna_note_error(f"GET by-username HTTP {r.status_code}", r.text[:400])
+                return None
             return r.json().get("response")
     except Exception as e:
-        log.error("[Remna] get_user: %s", e)
+        _remna_note_error("GET by-username", repr(e))
         return None
 
 def _normalize_squads(squad_uuid) -> list[str]:
@@ -1253,10 +1271,12 @@ async def remna_create_user(user_id: int, days: int, hwid: int = 1,
             )
             if r.status_code == 409:
                 return await remna_extend_user(user_id, days, hwid, squad_uuid)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                _remna_note_error(f"POST /api/users HTTP {r.status_code}", r.text[:400])
+                return None
             return r.json().get("response")
     except Exception as e:
-        log.error("[Remna] create_user: %s", e)
+        _remna_note_error("POST /api/users", repr(e))
         return None
 
 async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
@@ -1282,10 +1302,15 @@ async def remna_extend_user(user_id: int, days: int, hwid: int | None = None,
                 f"{REMNAWAVE_URL}/api/users",
                 json=payload, headers=_remna_headers(), timeout=15,
             )
-            r.raise_for_status()
+            if r.status_code >= 400:
+                _remna_note_error(
+                    f"PATCH /api/users (продление) HTTP {r.status_code}",
+                    f"отправлено {sorted(payload.keys())}; ответ {r.text[:300]}",
+                )
+                return None
             return r.json().get("response")
     except Exception as e:
-        log.error("[Remna] extend_user: %s", e)
+        _remna_note_error("PATCH /api/users (продление)", repr(e))
         return None
 
 async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
@@ -1298,11 +1323,14 @@ async def remna_update_user(uuid_: str, payload: dict) -> dict | None:
                 json=payload, headers=_remna_headers(), timeout=15,
             )
             if r.status_code >= 400:
-                log.error("[Remna] update_user %s: %s", r.status_code, r.text[:500])
-            r.raise_for_status()
+                _remna_note_error(
+                    f"PATCH /api/users HTTP {r.status_code}",
+                    f"отправлено {sorted(payload.keys())}; ответ {r.text[:300]}",
+                )
+                return None
             return r.json().get("response")
     except Exception as e:
-        log.error("[Remna] update_user: %s", e)
+        _remna_note_error("PATCH /api/users", repr(e))
         return None
 
 async def remna_update_user_verbose(uuid_: str, payload: dict) -> tuple[dict | None, str]:
@@ -1806,12 +1834,35 @@ async def notify_admins_sale(u_id: int, username: str | None, item_name: str,
         f"Тип: {kind}\n"
         f"Время: {now_str}"
     )
-    for admin_id in all_admin_ids():
-        if await is_admin_sale_notify(admin_id):
-            try:
-                await bot.send_message(admin_id, text)
-            except Exception:
-                pass
+    recipients = all_admin_ids()
+    if not recipients:
+        log.error("notify_admins_sale: НЕТ АДМИНОВ — проверь ADMIN_ID_1/ADMIN_ID_2 в окружении")
+        return
+    sent = 0
+    for admin_id in recipients:
+        if not await is_admin_sale_notify(admin_id):
+            log.warning("notify_admins_sale: у админа %s уведомления ВЫКЛЮЧЕНЫ (/sale_notify)", admin_id)
+            continue
+        try:
+            await bot.send_message(admin_id, text)
+            sent += 1
+        except Exception as e:
+            # Раньше здесь было «except: pass» — уведомление молча пропадало.
+            log.error("notify_admins_sale: не доставлено админу %s: %r", admin_id, e)
+    log.info("notify_admins_sale: доставлено %d из %d", sent, len(recipients))
+
+async def notify_admins_alert(text: str) -> None:
+    """Тревожное сообщение админам (не зависит от переключателя /sale_notify).
+    Нужно, чтобы провалившаяся выдача оплаченного не проходила молча."""
+    recipients = all_admin_ids()
+    if not recipients:
+        log.error("notify_admins_alert: НЕТ АДМИНОВ — %s", text)
+        return
+    for admin_id in recipients:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            log.error("notify_admins_alert: не доставлено админу %s: %r", admin_id, e)
 
 async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str | None,
                            item_name: str, price: float):
@@ -4064,6 +4115,18 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
         except Exception as e:
             log.exception("rollback processed_payments %s: %s", pay_id, e)
         log.error("Выдача не удалась (%s, %s): %s", pay_id, source, err)
+        # Деньги человек заплатил, а выдача сорвалась — админ обязан узнать
+        # об этом сразу. Раньше такой случай проходил полностью молча:
+        # функция выходила здесь, до notify_admins_sale.
+        await notify_admins_alert(
+            "ВНИМАНИЕ: оплата прошла, выдача НЕ удалась\n\n"
+            f"Пользователь: {uname or f'ID:{u_id}'} (ID: {u_id})\n"
+            f"Позиция: {item_name}\n"
+            f"Сумма: {price:.0f} руб.\n"
+            f"Платёж: {pay_id} ({source})\n"
+            f"Причина: {err}"
+            f"{remna_err()}"
+        )
         return False, err, False
 
     if kind in ("trial", "plan"):
@@ -5631,6 +5694,8 @@ async def set_hwid_limit(cb: CallbackQuery):
     result = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": new_hwid})
     if not result:
         await safe_answer(cb, "Ошибка обновления.", show_alert=True)
+        if _REMNA_LAST_ERROR:
+            await cb.message.answer("Ошибка обновления." + remna_err())
         return
     await safe_answer(cb, f"Лимит: {new_hwid}", show_alert=True)
     remna2 = await remna_get_user(user_id)
@@ -5678,7 +5743,7 @@ async def ca_adddays_handler(message: types.Message, state: FSMContext):
     new_exp = (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp, "status": "ACTIVE"})
     if not result:
-        await message.answer("Ошибка обновления.")
+        await message.answer("Ошибка обновления." + remna_err())
         return
     new_ts = parse_dt(result.get("expireAt"))
     await message.answer(f"ID:{user_id} — добавлено +{days} дн. Новая дата: {fmt_dt(new_ts)}")
@@ -5720,7 +5785,7 @@ async def ca_subdays_handler(message: types.Message, state: FSMContext):
     new_exp = new_exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     result  = await remna_update_user(remna["uuid"], {"expireAt": new_exp, "status": "ACTIVE"})
     if not result:
-        await message.answer("Ошибка обновления.")
+        await message.answer("Ошибка обновления." + remna_err())
         return
     new_ts = parse_dt(result.get("expireAt"))
     await message.answer(f"ID:{user_id} — убрано -{days} дн. Новая дата: {fmt_dt(new_ts)}")
@@ -5761,7 +5826,7 @@ async def ca_setdate_handler(message: types.Message, state: FSMContext):
         return
     result = await remna_update_user(remna["uuid"], {"expireAt": dt_utc_str, "status": "ACTIVE"})
     if not result:
-        await message.answer("Ошибка обновления.")
+        await message.answer("Ошибка обновления." + remna_err())
         return
     await message.answer(f"ID:{user_id} — дата установлена: {message.text.strip()} 23:59 МСК")
     await _render_check(message, user_id)
@@ -5799,7 +5864,7 @@ async def ca_sethwid_handler(message: types.Message, state: FSMContext):
         return
     result = await remna_update_user(remna["uuid"], {"hwidDeviceLimit": hwid})
     if not result:
-        await message.answer("Ошибка обновления.")
+        await message.answer("Ошибка обновления." + remna_err())
         return
     await message.answer(f"ID:{user_id} — лимит устройств: {hwid}")
     await _render_check(message, user_id)
@@ -6570,7 +6635,8 @@ async def admin_give_start_cb(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await state.set_state(AdminGiveState.waiting_username)
-    await cb.message.answer("Выдача подписки\n\nВведите username (без @):", reply_markup=cancel_kb())
+    await cb.message.answer("Выдача подписки\n\nВведите username (без @) или user_id:",
+                            reply_markup=cancel_kb())
 
 @router.message(Command("cancel"), AdminGiveState.waiting_username)
 @router.message(Command("cancel"), AdminGiveState.waiting_days)
@@ -6581,15 +6647,39 @@ async def admin_give_cancel(message: types.Message, state: FSMContext):
 
 @router.message(AdminGiveState.waiting_username)
 async def admin_give_username(message: types.Message, state: FSMContext):
-    username = message.text.strip().lstrip("@")
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_id FROM users WHERE username=$1", username)
-    if not row:
-        await message.answer(f"@{username} не найден. Введите другой username.", reply_markup=cancel_kb())
+    target = (message.text or "").strip().lstrip("@")
+    if not target:
+        await message.answer("Введите username или user_id.", reply_markup=cancel_kb())
         return
-    await state.update_data(target_id=row["user_id"], target_username=username)
+    # Принимаем и user_id: у человека могло не быть @username или он его
+    # сменил — раньше в таком случае выдать было физически невозможно.
+    async with pool.acquire() as conn:
+        if target.isdigit():
+            row = await conn.fetchrow(
+                "SELECT user_id, username FROM users WHERE user_id=$1", int(target))
+        else:
+            row = await conn.fetchrow(
+                "SELECT user_id, username FROM users WHERE LOWER(username)=LOWER($1)", target)
+    if not row and target.isdigit():
+        # В боте не зарегистрирован, но выдать всё равно можно: панель
+        # заведёт пользователя по user_id.
+        await state.update_data(target_id=int(target), target_username=target)
+        await state.set_state(AdminGiveState.waiting_days)
+        await message.answer(
+            f"ID:{target} в базе бота не найден — подписка будет создана в панели.\n\n"
+            "Сколько дней выдать?", reply_markup=cancel_kb())
+        return
+    if not row:
+        await message.answer(
+            f"@{target} не найден в базе бота.\n"
+            "Он попадает туда только после /start. Введите его user_id — "
+            "по цифровому ID выдать можно в любом случае.",
+            reply_markup=cancel_kb())
+        return
+    await state.update_data(target_id=row["user_id"], target_username=row["username"] or str(row["user_id"]))
     await state.set_state(AdminGiveState.waiting_days)
-    await message.answer(f"@{username}\n\nСколько дней выдать?", reply_markup=cancel_kb())
+    await message.answer(f"@{row['username'] or row['user_id']}\n\nСколько дней выдать?",
+                         reply_markup=cancel_kb())
 
 @router.message(AdminGiveState.waiting_days)
 async def admin_give_days(message: types.Message, state: FSMContext):
@@ -6664,7 +6754,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
         target_id, days, hwid or 1, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
     )
     if not user:
-        await edit_screen(cb.message, "Ошибка активации.")
+        await edit_screen(cb.message, "Ошибка активации." + remna_err())
         return
 
     async with pool.acquire() as conn:
@@ -7702,6 +7792,93 @@ async def toggle_sale_notify(message: types.Message):
             await conn.execute("INSERT INTO admin_settings (admin_id, sale_notify) VALUES ($1,$2)", admin_id, new_val)
     await message.answer("Уведомления о покупках включены." if new_val else "Уведомления о покупках выключены.")
 
+# ─────────────────────────────────────────────
+#  /diag — самопроверка связки «бот ↔ панель»
+#
+#  Показывает, что реально отвечает Remnawave: читается ли список,
+#  проходит ли ЗАПИСЬ (без изменения данных — пишем ту же дату, что
+#  уже стоит), живы ли сквады из окружения и кому уходят уведомления.
+#  Именно эти три вещи ломаются после обновления панели.
+# ─────────────────────────────────────────────
+@router.message(Command("diag"))
+async def admin_diag(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Проверяю связку с панелью...")
+    lines: list[str] = [f"Панель: {REMNAWAVE_URL}"]
+
+    # 1. ЧТЕНИЕ
+    users = await remna_get_all_users()
+    ours  = [u for u in users if (u.get("username") or "").startswith("truba_")]
+    now   = int(time.time())
+    active = [u for u in ours
+              if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"]
+    lines.append("")
+    lines.append("1) ЧТЕНИЕ")
+    lines.append(f"   всего в панели: {len(users)}")
+    lines.append(f"   наших (truba_*): {len(ours)}")
+    lines.append(f"   активных: {len(active)}")
+    if not users:
+        lines.append("   ЧТЕНИЕ НЕ РАБОТАЕТ — проверь REMNAWAVE_URL/TOKEN/COOKIE")
+
+    # 2. ЗАПИСЬ (no-op: ставим ту же дату, что уже стоит)
+    lines.append("")
+    lines.append("2) ЗАПИСЬ (PATCH /api/users, без изменения данных)")
+    probe = next((u for u in ours if u.get("uuid") and u.get("expireAt")), None)
+    if probe is None:
+        lines.append("   не на ком проверить — нет ни одного truba_* с uuid")
+    else:
+        global _REMNA_LAST_ERROR
+        _REMNA_LAST_ERROR = ""
+        res = await remna_update_user(probe["uuid"], {"expireAt": probe["expireAt"]})
+        if res:
+            lines.append(f"   OK — запись проходит (проверено на {probe.get('username')})")
+        else:
+            lines.append(f"   НЕ ПРОХОДИТ (на {probe.get('username')})")
+            lines.append(f"   {_REMNA_LAST_ERROR or 'без деталей'}")
+            lines.append("   → из-за этого не выдаются и не редактируются подписки,")
+            lines.append("     и не приходят уведомления о покупках (выдача срывается раньше)")
+
+    # 3. СКВАДЫ из окружения — живы ли они в панели
+    lines.append("")
+    lines.append("3) СКВАДЫ ИЗ ОКРУЖЕНИЯ")
+    seen_squads: set[str] = set()
+    for u in users:
+        for s in _squad_uuids(u.get("activeInternalSquads")):
+            seen_squads.add(s)
+    for name, val in (("SQUAD_UUID (basic)", SQUAD_UUID_BASIC),
+                      ("SQUAD_UUID_WHITELIST", SQUAD_UUID_WHITELIST)):
+        if not val:
+            lines.append(f"   {name}: НЕ ЗАДАН")
+        elif val in seen_squads:
+            lines.append(f"   {name}: живой")
+        else:
+            lines.append(f"   {name}: НЕ ВСТРЕЧАЕТСЯ ни у кого в панели — "
+                         f"возможно, сквад пересоздан и UUID устарел")
+    if not seen_squads:
+        lines.append("   (у пользователей панели вообще нет сквадов — сверить нечем)")
+
+    # 4. УВЕДОМЛЕНИЯ
+    lines.append("")
+    lines.append("4) УВЕДОМЛЕНИЯ О ПОКУПКАХ")
+    admins = all_admin_ids()
+    if not admins:
+        lines.append("   АДМИНОВ НЕТ — проверь ADMIN_ID_1 / ADMIN_ID_2")
+    for a in admins:
+        on = await is_admin_sale_notify(a)
+        lines.append(f"   {a}: {'вкл' if on else 'ВЫКЛ (/sale_notify)'}")
+
+    # 5. ПРИЁМ ОПЛАТ
+    lines.append("")
+    lines.append("5) ПРИЁМ ОПЛАТ")
+    lines.append(f"   ЮKassa: {'вкл' if PAYMENTS_ENABLED else 'выкл'}")
+    lines.append(f"   Stars: {'вкл' if STARS_ENABLED else 'выкл'}")
+    lines.append(f"   Platega: {'вкл' if platega_available() else 'выкл'}")
+
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3800):
+        await message.answer(text[i:i + 3800])
+
 @router.message(Command("give"))
 async def admin_give(message: types.Message, command: CommandObject):
     """Выдать дни вручную, без привязки к тарифу (сквад не меняется)."""
@@ -7709,18 +7886,24 @@ async def admin_give(message: types.Message, command: CommandObject):
         return
     parts = (command.args or "").split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("Формат: /give username дни [устройств]")
+        await message.answer("Формат: /give username|user_id дни [устройств]")
         return
     target = parts[0].lstrip("@"); days = int(parts[1])
     hwid   = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_id FROM users WHERE username=$1", target)
+        if target.isdigit():
+            row = await conn.fetchrow("SELECT user_id FROM users WHERE user_id=$1", int(target))
+        else:
+            row = await conn.fetchrow(
+                "SELECT user_id FROM users WHERE LOWER(username)=LOWER($1)", target)
+    if not row and target.isdigit():
+        row = {"user_id": int(target)}          # выдаём по ID даже без записи в БД
     if not row:
-        await message.answer(f"@{target} не найден.")
+        await message.answer(f"@{target} не найден. Попробуй указать user_id вместо username.")
         return
     user = await activate_subscription(row["user_id"], days, hwid or 1, squad_uuid=None)
     if not user:
-        await message.answer("Ошибка активации.")
+        await message.answer("Ошибка активации." + remna_err())
         return
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
@@ -7736,13 +7919,15 @@ async def admin_help(message: types.Message):
         return
     await message.answer(
         "Команды администратора:\n\n"
-        "/give username дни [уст.] — быстро выдать дни (тариф/сквад не меняет; "
+        "/give username|user_id дни [уст.] — быстро выдать дни (тариф/сквад не меняет; "
         "для выбора тарифа используйте кнопку «Выдать» в панели)\n"
         "/check username|id — карточка подписчика\n"
         "/add_promo, /genpromo, /list_promos — промокоды\n"
         "/broadcast — рассылка\n"
         "/payout username — выплатить реф. баланс\n"
         "/sale_notify — вкл/выкл уведомления о покупках\n"
+        "/diag — самопроверка: читается ли панель, проходит ли запись,\n"
+        "        живы ли сквады, кому уходят уведомления\n"
         "/whitelist_check, /whitelist_status — лимиты 📶\n\n"
         "Кнопка «Панель» в профиле открывает то же самое через интерфейс."
     )
