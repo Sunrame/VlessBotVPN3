@@ -161,7 +161,7 @@ REQUIRE_CHANNEL_SUB = os.environ.get("REQUIRE_CHANNEL_SUB", "1").strip().lower()
 SUB_CACHE_TTL = max(0, int(os.environ.get("SUB_CACHE_TTL", "0")))
 
 # Юзернейм поддержки — кнопка "Тех.Поддержка" ведёт в личку с этим аккаунтом
-SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "vvvvvpppnn")
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "trubavpnsupport")
 SUPPORT_URL      = f"https://t.me/{SUPPORT_USERNAME}"
 
 # Документы сервиса. Вынесены в константы: используются и в разделе
