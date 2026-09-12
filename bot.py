@@ -2935,6 +2935,31 @@ def back_kb():
 #   wl_<ГБ>                   — докупить трафик (напр. wl_10) → сразу оплата
 #   upgrade                   — улучшить тариф до VPN + 📶
 # Если количество не передано, бот открывает соответствующий экран/ввод.
+async def _hold_cabinet_discount(u_id: int, code: str, percent: int) -> None:
+    """Закрепить скидочный промокод за пользователем в общей с сайтом таблице.
+
+    Раньше запись в cabinet_discounts делал только личный кабинет, а бот её
+    лишь читал и удалял. Из-за этого скидка, введённая В БОТЕ, до кабинета не
+    доходила: там о ней ничего не знали, и цены оставались без скидки.
+    Теперь направление симметрично — код, введённый в любом из двух мест,
+    действует и там, и там, пока не будет списан при оплате.
+    """
+    code = (code or "").strip().upper()
+    percent = clamp_discount(int(percent or 0))
+    if not code or percent <= 0:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO cabinet_discounts (user_id, code, percent, created_at) "
+                "VALUES ($1,$2,$3,$4) "
+                "ON CONFLICT (user_id) DO UPDATE SET code=$2, percent=$3, created_at=$4",
+                u_id, code, percent, int(time.time()),
+            )
+    except Exception as e:
+        log.error("не удалось закрепить скидку %s за %s: %s", code, u_id, e)
+
+
 async def _apply_cabinet_discount(u_id: int, price: int):
     """Применяет к цене тарифа скидочный промокод, введённый в личном кабинете
     (таблица cabinet_discounts). Возвращает (итоговая_цена, код|None).
@@ -4868,6 +4893,9 @@ async def order_promo_input(message: types.Message, state: FSMContext):
         )
         return
     await state.set_state(None)
+    # Дублируем скидку в общую с сайтом таблицу, чтобы она действовала и в
+    # личном кабинете, а не только в этом заказе.
+    await _hold_cabinet_discount(message.from_user.id, code, percent)
     await state.update_data(
         order_promo={"code": code, "percent": percent, "plan": plan_key,
                      "months": months, "renew": renew},
@@ -5288,11 +5316,20 @@ async def handle_promo(message: types.Message, state: FSMContext):
     # ошибочно «активировал» бы подписку на 0 дней и сгорал впустую.
     if promo_type == "discount":
         await state.clear()
-        await message.answer(
-            "Это промокод на скидку. Он применяется при покупке тарифа: "
-            "откройте «Купить», выберите тариф и срок, затем нажмите "
-            "«Ввести промокод»."
-        )
+        # Раньше бот просто отправлял человека в «Купить», ничего не сохраняя:
+        # код выглядел «не сработавшим», а кабинет о нём и вовсе не знал.
+        # Теперь проверяем код сразу и закрепляем скидку за пользователем —
+        # она подставится и при покупке в боте, и в личном кабинете.
+        percent, err = await _discount_promo_check(message.from_user.id, code)
+        if err or percent <= 0:
+            await message.answer(_discount_error_text(err or "not_found"))
+        else:
+            await _hold_cabinet_discount(message.from_user.id, code, percent)
+            await message.answer(
+                f"Промокод {code} применён: скидка −{percent}% на покупку тарифа.\n"
+                "Она уже учтена в ценах — и здесь, в боте, и в личном кабинете. "
+                "Выберите тариф и срок."
+            )
         text, kb = await _build_profile_view(message.from_user.id)
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
         return
