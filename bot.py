@@ -501,6 +501,9 @@ QTY_KINDS = ("device", "gb")
 MIN_PRICE = 1
 MAX_PRICE = 100_000
 MAX_DISCOUNT = 90
+# Потолок суммарной скидки: сколько бы скидок ни сложилось (за срок плюс
+# промокод), цена не опустится ниже этой доли от полной.
+MAX_TOTAL_DISCOUNT = 50
 MAX_QTY_THRESHOLD = 10_000
 
 # Сколько секунд держим цены в памяти, не перечитывая БД.
@@ -1067,6 +1070,16 @@ async def init_db():
             await conn.execute("ALTER TABLE naloggo_receipts ADD COLUMN IF NOT EXISTS attempted_at BIGINT DEFAULT 0")
         except Exception:
             pass
+        # Что именно дал промокод — сохраняем прямо в записи об активации.
+        # Сам промокод после исчерпания использований удаляется, и без этих
+        # полей в истории оставалось только «—».
+        for col in ("promo_type TEXT", "days INTEGER DEFAULT 0",
+                    "discount_percent INTEGER DEFAULT 0", "tariff_key TEXT"):
+            try:
+                await conn.execute(
+                    f"ALTER TABLE promo_redemptions ADD COLUMN IF NOT EXISTS {col}")
+            except Exception:
+                pass
         # Критическая миграция гейта документов. Её нельзя молча пропускать:
         # без столбца бот не способен отличить принятое согласие от нового
         # пользователя и раньше ошибочно сразу показывал подписку на канал.
@@ -1681,6 +1694,34 @@ def sum_whitelist_bytes_for_user(records: list[dict], user_id: int, since_ts: in
     uname = remna_username(user_id)
     return sum(r["bytes"] for r in records if r["username"] == uname and r["ts"] >= since_ts)
 
+async def carry_over_extras(u_id: int, base_hwid: int, plan_gb: int) -> tuple[int, int]:
+    """Докупленное сверх тарифа — переносим на новую подписку.
+
+    Устройства и 📶-трафик, купленные отдельно, человек уже оплатил. Раньше
+    покупка новой подписки их затирала: лимит устройств сбрасывался в 1, а
+    трафик — до стандарта тарифа. Так терялось оплаченное, например при
+    переходе с месяца на год.
+
+    Сверх тарифа считаем всё, что выше стандарта ТЕКУЩЕГО тарифа.
+    Возвращает (лимит_устройств, лимит_ГБ) уже с переносом.
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT plan, extra_devices FROM users WHERE user_id=$1", u_id)
+            cur_gb = await conn.fetchval(
+                "SELECT gb_limit FROM whitelist_limits WHERE user_id=$1", u_id)
+    except Exception as e:
+        log.error("перенос докупленного для %s не удался: %s", u_id, e)
+        return base_hwid, plan_gb
+
+    extra_dev = max(0, int((row["extra_devices"] if row else 0) or 0))
+    base_gb = int((PLANS.get(row["plan"] if row else None) or {}).get("whitelist_gb") or 0)
+    extra_gb = max(0, int(cur_gb or 0) - base_gb)
+
+    return max(base_hwid, 1 + extra_dev), plan_gb + extra_gb
+
+
 async def activate_subscription(user_id: int, days: int, hwid: int = 1,
                                  squad_uuid: str | list[str] | None = None,
                                  whitelist_gb: int = 0) -> dict | None:
@@ -2136,6 +2177,34 @@ async def calc_plan_price(plan_key: str, months: int) -> int:
     settings = await get_pricing()
     return pricing_plan_total(settings, plan_key, months,
                               PLANS.get(plan_key, {}).get("price_month"))
+
+async def calc_plan_full_price(plan_key: str, months: int) -> int:
+    """Полная цена за срок БЕЗ каких-либо скидок.
+
+    От неё считается потолок суммарной скидки: скидка за срок и скидка по
+    промокоду применяются одна за другой и вместе дают больше, чем каждая
+    по отдельности.
+    """
+    settings = await get_pricing()
+    per_month = pricing_price_month(settings, plan_key,
+                                    PLANS.get(plan_key, {}).get("price_month"))
+    return int(per_month) * max(1, int(months or 1))
+
+def cap_total_discount(full_price: int, price: int) -> int:
+    """Не дать суммарной скидке превысить MAX_TOTAL_DISCOUNT от полной цены."""
+    price = max(1, int(price))
+    full_price = int(full_price or 0)
+    if full_price <= 0:
+        return price
+    floor = max(1, int(round(full_price * (100 - MAX_TOTAL_DISCOUNT) / 100)))
+    return max(price, floor)
+
+def effective_discount(full_price: int, price: int) -> int:
+    """Фактическая суммарная скидка в процентах — то, что видно в цене."""
+    full_price = int(full_price or 0)
+    if full_price <= 0:
+        return 0
+    return max(0, min(100, int(round((1 - int(price) / full_price) * 100))))
 
 async def calc_upgrade_price(extra_devices: int) -> int:
     """
@@ -2935,7 +3004,7 @@ def back_kb():
 #   wl_<ГБ>                   — докупить трафик (напр. wl_10) → сразу оплата
 #   upgrade                   — улучшить тариф до VPN + 📶
 # Если количество не передано, бот открывает соответствующий экран/ввод.
-async def _hold_cabinet_discount(u_id: int, code: str, percent: int) -> None:
+async def _hold_cabinet_discount(u_id: int, code: str, percent: int):
     """Закрепить скидочный промокод за пользователем в общей с сайтом таблице.
 
     Раньше запись в cabinet_discounts делал только личный кабинет, а бот её
@@ -2943,26 +3012,72 @@ async def _hold_cabinet_discount(u_id: int, code: str, percent: int) -> None:
     доходила: там о ней ничего не знали, и цены оставались без скидки.
     Теперь направление симметрично — код, введённый в любом из двух мест,
     действует и там, и там, пока не будет списан при оплате.
+
+    Действующая скидка НЕ понижается: если удержана бóльшая, она остаётся.
+    Иначе код с меньшим процентом затирал бы выгодный — например, 1% поверх
+    15%. Отклонённый код при этом не тратится и доступен позже.
+
+    Применение СРАЗУ занимает одно использование промокода. Иначе код с
+    лимитом 1 могли удержать сразу несколько человек: скидку увидели бы все,
+    а достаться она должна одному — кто-то остался бы без неё, не понимая,
+    куда она делась. Занятый слот возвращается, если удержание снимают.
+
+    Возвращает (код, процент, ошибка|None) — фактически действующую скидку.
     """
     code = (code or "").strip().upper()
     percent = clamp_discount(int(percent or 0))
     if not code or percent <= 0:
-        return
+        return code, percent, None
     try:
         async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO cabinet_discounts (user_id, code, percent, created_at) "
-                "VALUES ($1,$2,$3,$4) "
-                "ON CONFLICT (user_id) DO UPDATE SET code=$2, percent=$3, created_at=$4",
-                u_id, code, percent, int(time.time()),
-            )
+            async with conn.transaction():
+                cur = await conn.fetchrow(
+                    "SELECT code, percent FROM cabinet_discounts WHERE user_id=$1", u_id)
+                cur_code = (cur["code"] or "").strip().upper() if cur else ""
+                cur_pct = clamp_discount(int(cur["percent"] or 0)) if cur else 0
+                # Тот же код или уже удержана не менее выгодная скидка —
+                # ничего не трогаем и лишний слот не занимаем.
+                if cur and (cur_code == code or cur_pct >= percent):
+                    return cur_code, cur_pct, None
+                taken = await conn.fetchval(
+                    "UPDATE promos SET uses=uses-1 WHERE code=$1 AND uses>0 RETURNING uses",
+                    code)
+                if taken is None:
+                    return (cur_code or code), (cur_pct or percent), "ended"
+                await conn.execute(
+                    "INSERT INTO cabinet_discounts (user_id, code, percent, created_at) "
+                    "VALUES ($1,$2,$3,$4) "
+                    "ON CONFLICT (user_id) DO UPDATE SET code=$2, percent=$3, created_at=$4",
+                    u_id, code, percent, int(time.time()),
+                )
+                if cur_code:
+                    # Прежнюю скидку сменили — её слот возвращаем в оборот.
+                    await _release_promo_slot(conn, cur_code)
     except Exception as e:
         log.error("не удалось закрепить скидку %s за %s: %s", code, u_id, e)
+        return code, percent, None
+    return code, percent, None
 
 
-async def _apply_cabinet_discount(u_id: int, price: int):
+async def _release_promo_slot(conn, code: str) -> None:
+    """Вернуть занятое использование обратно в промокод и убрать его, если
+    свободных использований не осталось и никто его больше не держит."""
+    code = (code or "").strip().upper()
+    if not code:
+        return
+    await conn.execute("UPDATE promos SET uses=uses+1 WHERE code=$1", code)
+    holds = await conn.fetchval(
+        "SELECT COUNT(*) FROM cabinet_discounts WHERE UPPER(code)=$1", code)
+    if not holds:
+        await conn.execute("DELETE FROM promos WHERE code=$1 AND uses<=0", code)
+
+
+async def _apply_cabinet_discount(u_id: int, price: int, full_price: int = 0):
     """Применяет к цене тарифа скидочный промокод, введённый в личном кабинете
-    (таблица cabinet_discounts). Возвращает (итоговая_цена, код|None).
+    (таблица cabinet_discounts). Возвращает (итоговая_цена, код|None, процент).
+
+    Процент возвращается отдельно, чтобы его можно было показать рядом с
+    ценой: иначе человек видит подешевевшую сумму и не понимает, откуда она.
 
     Скидка закреплена за пользователем: процент хранится в самой строке,
     поэтому она НЕ слетает, даже если у промокода закончились использования
@@ -2973,22 +3088,27 @@ async def _apply_cabinet_discount(u_id: int, price: int):
             row = await conn.fetchrow(
                 "SELECT code, percent FROM cabinet_discounts WHERE user_id=$1", u_id)
     except Exception:
-        return price, None
+        return price, None, 0
     if not row:
-        return price, None
+        return price, None, 0
     code = (row["code"] or "").strip().upper()
     percent = clamp_discount(int(row["percent"] or 0))
 
     async def _drop():
+        # Снимаем удержание и возвращаем занятое использование промокода —
+        # иначе слот остался бы занятым навсегда и не достался бы никому.
         try:
             async with pool.acquire() as conn:
-                await conn.execute("DELETE FROM cabinet_discounts WHERE user_id=$1", u_id)
+                async with conn.transaction():
+                    await conn.execute(
+                        "DELETE FROM cabinet_discounts WHERE user_id=$1", u_id)
+                    await _release_promo_slot(conn, code)
         except Exception:
-            pass
+            log.exception("снятие удержанной скидки user=%s", u_id)
 
     if not code or percent <= 0:
         await _drop()
-        return price, None
+        return price, None, 0
     try:
         async with pool.acquire() as conn:
             used = await conn.fetchval(
@@ -2997,8 +3117,17 @@ async def _apply_cabinet_discount(u_id: int, price: int):
         used = None
     if used:
         await _drop()
-        return price, None
-    return _apply_pct(price, percent), code
+        return price, None, 0
+    # Потолок суммарной скидки: промокод поверх скидки за срок не должен
+    # уводить цену ниже допустимой доли от полной.
+    raw = _apply_pct(price, percent)
+    final = cap_total_discount(full_price, raw)
+    if full_price and final > raw:
+        # Упёрлись в потолок: показываем долю, реально попавшую в цену,
+        # а не номинал промокода, которого в цене уже нет.
+        percent = max(0, effective_discount(full_price, final)
+                      - effective_discount(full_price, price))
+    return final, code, percent
 
 
 async def _open_paysection_from_message(message: types.Message, state: FSMContext,
@@ -3028,9 +3157,12 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
         if plan_key in PLANS and months and months > 0:
             plan  = PLANS[plan_key]
             price = await calc_plan_price(plan_key, months)
-            price, promo_code = await _apply_cabinet_discount(u_id, price)
+            price, promo_code, promo_pct = await _apply_cabinet_discount(
+                u_id, price, await calc_plan_full_price(plan_key, months))
             await _create_payment_page_from_message(
-                message, kind="plan", item_name=f"{plan['name']} · {months} мес.",
+                message, kind="plan",
+                item_name=f"{plan['name']} · {months} мес."
+                          + (f" · промокод {promo_code} −{promo_pct}%" if promo_code else ""),
                 price=price, days=months * 30, hwid=1, squad=plan["squad"],
                 whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
                 promo_code=promo_code,
@@ -3055,9 +3187,12 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             return True
         plan  = PLANS[plan_key]
         price = await calc_plan_price(plan_key, months)
-        price, promo_code = await _apply_cabinet_discount(u_id, price)
+        price, promo_code, promo_pct = await _apply_cabinet_discount(
+            u_id, price, await calc_plan_full_price(plan_key, months))
         await _create_payment_page_from_message(
-            message, kind="plan", item_name=f"Продление {plan['name']} · {months} мес.",
+            message, kind="plan",
+            item_name=f"Продление {plan['name']} · {months} мес."
+                      + (f" · промокод {promo_code} −{promo_pct}%" if promo_code else ""),
             price=price, days=months * 30, hwid=1, squad=plan["squad"],
             whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
             promo_code=promo_code,
@@ -4280,8 +4415,11 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
         return False, err, False
 
     if kind in ("trial", "plan"):
-        result_user = await activate_subscription(u_id, days, hwid or 1,
-                                                  squad_uuid=squad, whitelist_gb=whitelist_gb)
+        # Докупленные устройства и трафик переносим на новую подписку —
+        # иначе человек теряет уже оплаченное (см. carry_over_extras).
+        final_hwid, final_gb = await carry_over_extras(u_id, hwid or 1, whitelist_gb)
+        result_user = await activate_subscription(u_id, days, final_hwid,
+                                                  squad_uuid=squad, whitelist_gb=final_gb)
         if not result_user:
             return await _rollback("не удалось активировать подписку.")
         async with pool.acquire() as conn:
@@ -4290,8 +4428,10 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
                     "UPDATE users SET trial_used=TRUE, plan='trial' WHERE user_id=$1", u_id
                 )
             else:
+                # extra_devices НЕ обнуляем: докупленные устройства остаются
+                # за пользователем и уже учтены в final_hwid.
                 await conn.execute(
-                    "UPDATE users SET plan=$1, extra_devices=0, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
+                    "UPDATE users SET plan=$1, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
                     plan_key, _remna_ref_str(result_user), u_id,
                 )
 
@@ -4775,8 +4915,14 @@ async def _plan_order_view(user_id: int, plan_key: str, months: int, *,
                            renew: bool, state: FSMContext):
     plan = PLANS[plan_key]
     base = await calc_plan_price(plan_key, months)
+    full = await calc_plan_full_price(plan_key, months)
     code, percent = await _order_promo_state(state, plan_key, months, renew)
-    final = _apply_pct(base, percent)
+    # Потолок суммарной скидки, и в строке показываем то, что реально попало
+    # в цену, а не номинал промокода.
+    raw = _apply_pct(base, percent)
+    final = cap_total_discount(full, raw)
+    if code and percent > 0 and full and final > raw:
+        percent = max(0, effective_discount(full, final) - effective_discount(full, base))
     flag = "r" if renew else "n"
     suffix = f"_{flag}_{months}_{plan_key}"
     title = f"Продление {plan['name']}" if renew else plan["name"]
@@ -4894,17 +5040,27 @@ async def order_promo_input(message: types.Message, state: FSMContext):
         return
     await state.set_state(None)
     # Дублируем скидку в общую с сайтом таблицу, чтобы она действовала и в
-    # личном кабинете, а не только в этом заказе.
-    await _hold_cabinet_discount(message.from_user.id, code, percent)
+    # личном кабинете, а не только в этом заказе. Если ранее удержана более
+    # выгодная — остаётся она, и заказ считаем по ней же.
+    held_code, held_pct, hold_err = await _hold_cabinet_discount(
+        message.from_user.id, code, percent)
+    if hold_err == "ended" and held_code != code:
+        # Свободных использований не осталось — их заняли другие.
+        await message.answer(_discount_error_text("ended"))
+        return
     await state.update_data(
-        order_promo={"code": code, "percent": percent, "plan": plan_key,
+        order_promo={"code": held_code, "percent": held_pct, "plan": plan_key,
                      "months": months, "renew": renew},
         order_ctx=None,
     )
     text, kb = await _plan_order_view(message.from_user.id, plan_key, months,
                                       renew=renew, state=state)
-    await message.answer(f"Промокод {code} применён: −{percent}%.\n\n{text}",
-                         parse_mode="HTML", reply_markup=kb)
+    if held_code != code:
+        head = (f"У вас уже применена скидка −{held_pct}% по промокоду {held_code} — "
+                f"она выгоднее. Промокод {code} не потрачен, его можно применить позже.")
+    else:
+        head = f"Промокод {code} применён: −{held_pct}%."
+    await message.answer(f"{head}\n\n{text}", parse_mode="HTML", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("order_pay_"))
@@ -4930,7 +5086,9 @@ async def order_pay_cb(cb: CallbackQuery, state: FSMContext):
             await state.update_data(order_promo=None)
             await safe_answer(cb, "Промокод больше недействителен — оформляю без скидки.",
                               show_alert=True)
-    final = _apply_pct(base, percent)
+    # Потолок суммарной скидки — цена к оплате не ниже допустимой доли от полной.
+    final = cap_total_discount(await calc_plan_full_price(plan_key, months),
+                               _apply_pct(base, percent))
     name = f"Продление {plan['name']}" if renew else plan["name"]
     await _create_payment_page(
         cb, kind="plan", item_name=f"{name} · {months} мес.", price=final,
@@ -5100,7 +5258,8 @@ async def _claim_promo_once(user_id: int, code: str, selected_plan: str | None =
     async with pool.acquire() as conn:
         async with conn.transaction():
             promo = await conn.fetchrow(
-                "SELECT days, uses, promo_type, tariff_key, min_account_age_days "
+                "SELECT days, uses, promo_type, tariff_key, discount_percent, "
+                "min_account_age_days "
                 "FROM promos WHERE code=$1 AND uses>0 FOR UPDATE",
                 code,
             )
@@ -5131,10 +5290,17 @@ async def _claim_promo_once(user_id: int, code: str, selected_plan: str | None =
             )
             if used_before:
                 return None, "already"
+            # Вместе с фактом активации сохраняем, ЧТО промокод дал: сам код
+            # после исчерпания использований удаляется.
             inserted = await conn.fetchval(
-                "INSERT INTO promo_redemptions (user_id, code, redeemed_at, source) "
-                "VALUES ($1,$2,$3,'bot') ON CONFLICT (user_id, code) DO NOTHING RETURNING code",
+                "INSERT INTO promo_redemptions (user_id, code, redeemed_at, source, "
+                "promo_type, days, discount_percent, tariff_key) "
+                "VALUES ($1,$2,$3,'bot',$4,$5,$6,$7) "
+                "ON CONFLICT (user_id, code) DO NOTHING RETURNING code",
                 user_id, code, int(time.time()),
+                promo_type, int(promo["days"] or 0),
+                int(promo["discount_percent"] or 0),
+                target_plan,
             )
             if not inserted:
                 return None, "already"
@@ -5169,7 +5335,14 @@ async def _discount_promo_check(user_id: int, code: str):
     if percent <= 0:
         return 0, "not_found"
     if int(promo["uses"] or 0) <= 0:
-        return 0, "ended"
+        # Свой же удержанный код «закончившимся» не считаем: слот за этим
+        # пользователем уже занят, повторный ввод не должен его пугать.
+        async with pool.acquire() as conn:
+            holds_it = await conn.fetchval(
+                "SELECT 1 FROM cabinet_discounts WHERE user_id=$1 AND UPPER(code)=$2",
+                user_id, code)
+        if not holds_it:
+            return 0, "ended"
     async with pool.acquire() as conn:
         user = await conn.fetchrow("SELECT created_at FROM users WHERE user_id=$1", user_id)
         used = await conn.fetchval(
@@ -5200,28 +5373,30 @@ async def _consume_discount_promo(user_id: int, code: str) -> bool:
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                # Процент берём из удержанной скидки: промокод к моменту
+                # оплаты мог быть уже удалён, а знать размер скидки нужно.
+                percent = await conn.fetchval(
+                    "SELECT percent FROM cabinet_discounts WHERE user_id=$1", user_id)
+                if not percent:
+                    percent = await conn.fetchval(
+                        "SELECT discount_percent FROM promos WHERE code=$1", code)
                 inserted = await conn.fetchval(
-                    "INSERT INTO promo_redemptions (user_id, code, redeemed_at, source) "
-                    "VALUES ($1,$2,$3,'bot-discount') "
+                    "INSERT INTO promo_redemptions (user_id, code, redeemed_at, source, "
+                    "promo_type, days, discount_percent, tariff_key) "
+                    "VALUES ($1,$2,$3,'bot-discount','discount',0,$4,NULL) "
                     "ON CONFLICT (user_id, code) DO NOTHING RETURNING code",
-                    user_id, code, int(time.time()),
+                    user_id, code, int(time.time()), int(percent or 0),
                 )
                 if not inserted:
                     return False
-                await conn.execute(
-                    "UPDATE promos SET uses=uses-1 WHERE code=$1 AND uses>0", code,
-                )
-        await _finish_promo_claim(code)
-        # Если этот код держался как «кабинетная» скидка — убираем, чтобы он
-        # не применился к следующей покупке.
-        try:
-            async with pool.acquire() as conn:
+                # Использование уже было занято в момент применения промокода,
+                # поэтому здесь НЕ списываем повторно — только снимаем
+                # удержание, чтобы код не применился к следующей покупке.
                 await conn.execute(
                     "DELETE FROM cabinet_discounts WHERE user_id=$1 AND code=$2",
                     user_id, code,
                 )
-        except Exception:
-            pass
+        await _finish_promo_claim(code)
         return True
     except Exception as e:
         log.exception("Списание скидочного промокода %s (user %s): %s", code, user_id, e)
@@ -5240,8 +5415,14 @@ async def _release_promo_claim(user_id: int, code: str):
 
 
 async def _finish_promo_claim(code: str):
+    """Убрать исчерпанный промокод — но только если его никто не держит:
+    пока держат, строка нужна, чтобы было куда вернуть занятый слот."""
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM promos WHERE code=$1 AND uses<=0", code)
+        holds = await conn.fetchval(
+            "SELECT COUNT(*) FROM cabinet_discounts WHERE UPPER(code)=$1",
+            (code or "").strip().upper())
+        if not holds:
+            await conn.execute("DELETE FROM promos WHERE code=$1 AND uses<=0", code)
 
 
 async def _promo_claim_error(target, error: str):
@@ -5324,11 +5505,17 @@ async def handle_promo(message: types.Message, state: FSMContext):
         if err or percent <= 0:
             await message.answer(_discount_error_text(err or "not_found"))
         else:
-            await _hold_cabinet_discount(message.from_user.id, code, percent)
+            held_code, held_pct, hold_err = await _hold_cabinet_discount(
+                message.from_user.id, code, percent)
             await message.answer(
-                f"Промокод {code} применён: скидка −{percent}% на покупку тарифа.\n"
-                "Она уже учтена в ценах — и здесь, в боте, и в личном кабинете. "
-                "Выберите тариф и срок."
+                _discount_error_text("ended")
+                if hold_err == "ended" and held_code != code else
+                (f"У вас уже применена скидка −{held_pct}% по промокоду {held_code} — "
+                 f"она выгоднее. Промокод {code} не потрачен, его можно применить позже."
+                 if held_code != code else
+                 f"Промокод {code} применён: скидка −{held_pct}% на покупку тарифа.\n"
+                 "Она уже учтена в ценах — и здесь, в боте, и в личном кабинете. "
+                 "Выберите тариф и срок.")
             )
         text, kb = await _build_profile_view(message.from_user.id)
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -5342,14 +5529,17 @@ async def handle_promo(message: types.Message, state: FSMContext):
             return
         days = int(claimed["days"] or 0)
         plan = PLANS[tariff_key]
-        user = await activate_subscription(message.from_user.id, days, 1,
-                                            squad_uuid=plan["squad"], whitelist_gb=plan["whitelist_gb"])
+        final_hwid, final_gb = await carry_over_extras(
+            message.from_user.id, 1, int(plan["whitelist_gb"] or 0))
+        user = await activate_subscription(message.from_user.id, days, final_hwid,
+                                            squad_uuid=plan["squad"], whitelist_gb=final_gb)
         if not user:
             await _release_promo_claim(message.from_user.id, code)
             await message.answer("Не удалось применить промокод. Попробуйте позже.")
             return
         async with pool.acquire() as conn:
-            await conn.execute("UPDATE users SET plan=$1, extra_devices=0 WHERE user_id=$2",
+            # extra_devices сохраняем: докупленное уже учтено в final_hwid.
+            await conn.execute("UPDATE users SET plan=$1 WHERE user_id=$2",
                                tariff_key, message.from_user.id)
             # Сначала фиксируем операцию: DB-триггер создаст активность, а
             # веб-панель также умеет показать её напрямую из payments.
@@ -5428,14 +5618,17 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
         return
     days = int(claimed["days"] or 0)
     plan = PLANS[plan_key]
-    activated = await activate_subscription(cb.from_user.id, days, 1,
-                                            squad_uuid=plan["squad"], whitelist_gb=plan["whitelist_gb"])
+    final_hwid, final_gb = await carry_over_extras(
+        cb.from_user.id, 1, int(plan["whitelist_gb"] or 0))
+    activated = await activate_subscription(cb.from_user.id, days, final_hwid,
+                                            squad_uuid=plan["squad"], whitelist_gb=final_gb)
     if not activated:
         await _release_promo_claim(cb.from_user.id, promo_code)
         await safe_answer(cb, "Не удалось применить промокод. Попробуйте позже.", show_alert=True)
         return
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE users SET plan=$1, extra_devices=0 WHERE user_id=$2",
+        # extra_devices сохраняем: докупленное уже учтено в final_hwid.
+        await conn.execute("UPDATE users SET plan=$1 WHERE user_id=$2",
                            plan_key, cb.from_user.id)
         await conn.execute(
             "INSERT INTO payments "
