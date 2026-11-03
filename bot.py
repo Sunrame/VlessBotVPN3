@@ -3707,9 +3707,8 @@ async def accept_terms_cb(cb: CallbackQuery, state: FSMContext):
         else:
             await _show_home(cb)
 
-        # Отдельный закреп отправляется только при первом успешном принятии.
-        if accepted_now:
-            await pin_terms_message(u_id)
+        # Отдельное сообщение с документами после согласия больше не шлём:
+        # человек их уже видел и принял, а ссылки всегда есть в «О сервисе».
 
 
 @router.my_chat_member()
