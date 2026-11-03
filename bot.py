@@ -494,7 +494,7 @@ PLANS = {
         "key":          "vpn_bypass",
         "name":         os.environ.get("PLAN_BYPASS_NAME", "").strip() or "VPN + 📶",
         "price_month":  _env_int("PLAN_BYPASS_PRICE", 199),
-        "device_price": _env_int("PLAN_BYPASS_DEVICE_PRICE", 70),
+        "device_price": _env_int("PLAN_BYPASS_DEVICE_PRICE", 50),
         "hwid":         max(1, _env_int("PLAN_BYPASS_BASE_DEVICES", 1)),
         "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
         "whitelist_gb": _env_int("PLAN_BYPASS_WHITELIST_GB", 20),
@@ -2635,7 +2635,14 @@ def naloggo_configured(settings: dict) -> bool:
     return bool((settings or {}).get("inn") and (settings or {}).get("password"))
 
 
+# Чеки в «Мой налог» выключены во всех ботах. Вернуть можно переменной
+# NALOGO_ALLOWED=1 — тогда снова работает переключатель в админке.
+NALOGO_ALLOWED = os.environ.get("NALOGO_ALLOWED", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def naloggo_active(settings: dict) -> bool:
+    if not NALOGO_ALLOWED:
+        return False
     return bool((settings or {}).get("enabled")) and naloggo_configured(settings)
 
 
