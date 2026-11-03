@@ -47,6 +47,7 @@ _PLAN_BY_CODE = {code: key for key, code in _PLAN_CODES.items()}
 
 # Замены в названии позиции. Порядок важен: сначала длинные фразы.
 _YK_ITEM_REPLACES = (
+    (os.environ.get("BRAND_NAME", "TrubaVPN").strip() or "TrubaVPN", "Интернет-Сервис"),
     # Словесных формулировок из стоп-листа здесь больше нет: их нет и в самих
     # названиях позиций, чистить нечего. Осталось только то, что реально
     # может попасть в название: значок опции и слово VPN.
@@ -106,6 +107,16 @@ def _unpack_plan(code: str) -> str:
 #  КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────
 API_TOKEN    = os.environ["BOT_TOKEN"]
+
+# ─── Брендинг: позволяет запускать несколько ботов из одного кода ───
+# BRAND_NAME   — название сервиса в текстах бота.
+# REMNA_PREFIX — префикс имён пользователей в Remnawave (<префикс>_<tg id>).
+#               У КАЖДОГО бота должен быть свой, иначе боты увидят чужие подписки.
+# BOT_URL      — ссылка на бота, куда платёжки возвращают после оплаты.
+BRAND_NAME = os.environ.get("BRAND_NAME", "TrubaVPN").strip() or "TrubaVPN"
+REMNA_PREFIX = (os.environ.get("REMNA_PREFIX", "truba").strip().rstrip("_") or "truba")
+REMNA_USER_PREFIX = f"{REMNA_PREFIX}_"
+BOT_URL = os.environ.get("BOT_URL", "").strip() or "https://t.me/trubavpnbot"
 # Ключи ЮKassa больше не обязательны: пока приём оплаты отключён, их можно
 # вообще убрать из переменных окружения — бот стартует без них.
 SHOP_ID      = os.environ.get("SHOP_ID", "")
@@ -280,7 +291,7 @@ PLATEGA_SECRET      = os.environ.get("PLATEGA_SECRET", "").strip()
 
 # Куда платёжная форма вернёт человека после оплаты — обратно в бот.
 PLATEGA_RETURN_URL  = os.environ.get("PLATEGA_RETURN_URL", "").strip() \
-    or "https://t.me/trubavpnbot"
+    or BOT_URL
 
 # Жёстко заданный способ (если известен) — тогда перебора не будет.
 _platega_method = os.environ.get("PLATEGA_METHOD", "").strip()
@@ -431,8 +442,14 @@ EMOJI_STARS         = premium_emoji("5267500801240092311", "\u2b50")   # сум�
 #  device_price — цена ОДНОГО дополнительного устройства сверх базового.
 #  Базовое кол-во устройств у обоих планов = 1.
 # ─────────────────────────────────────────────
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
 TRIAL = {
-    "name":         "Пробная подписка",
+    "name":         os.environ.get("TRIAL_NAME", "").strip() or "Пробная подписка",
     "price":        0,
     "days":         1,
     "hwid":         1,
@@ -447,21 +464,21 @@ TRIAL = {
 PLANS = {
     "vpn": {
         "key":          "vpn",
-        "name":         "VPN",
-        "price_month":  99,
-        "device_price": 50,
+        "name":         os.environ.get("PLAN_VPN_NAME", "").strip() or "VPN",
+        "price_month":  _env_int("PLAN_VPN_PRICE", 99),
+        "device_price": _env_int("PLAN_VPN_DEVICE_PRICE", 50),
         "squad":        [SQUAD_UUID_BASIC],
         "whitelist_gb": 0,
-        "desc": "Более трёх локаций, 1 устройство, трафик не ограничен.",
+        "desc": os.environ.get("PLAN_VPN_DESC", "").strip() or "Более трёх локаций, 1 устройство, трафик не ограничен.",
     },
     "vpn_bypass": {
         "key":          "vpn_bypass",
-        "name":         "VPN + 📶",
-        "price_month":  199,
-        "device_price": 70,
+        "name":         os.environ.get("PLAN_BYPASS_NAME", "").strip() or "VPN + 📶",
+        "price_month":  _env_int("PLAN_BYPASS_PRICE", 199),
+        "device_price": _env_int("PLAN_BYPASS_DEVICE_PRICE", 70),
         "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
         "whitelist_gb": 20,
-        "desc": (
+        "desc": os.environ.get("PLAN_BYPASS_DESC", "").strip() or (
             "Более трёх локаций, 1 устройство, трафик не ограничен. "
             "Трафик 📶 ограничен 20 ГБ."
         ),
@@ -1200,7 +1217,7 @@ def _remna_headers() -> dict:
     }
 
 def remna_username(user_id: int) -> str:
-    return f"truba_{user_id}"
+    return f"{REMNA_USER_PREFIX}{user_id}"
 
 def _squad_uuids(raw_squads) -> list[str]:
     """
@@ -1871,8 +1888,8 @@ async def terms_accepted(user_id: int) -> bool:
 def terms_gate_view() -> tuple[str, InlineKeyboardMarkup]:
     """Экран, который видит человек до принятия оферты."""
     text = (
-        f"{hbold('Перед началом работы с TrubaVPN')}\n\n"
-        f"Ознакомьтесь с документами TrubaVPN и подтвердите согласие — "
+        f"{hbold(f'Перед началом работы с {BRAND_NAME}')}\n\n"
+        f"Ознакомьтесь с документами {BRAND_NAME} и подтвердите согласие — "
         f"без этого бот недоступен.\n\n"
         f"Нажимая «Принимаю», вы присоединяетесь к публичной оферте и даёте "
         f"согласие на обработку персональных данных."
@@ -1902,8 +1919,8 @@ async def pin_terms_message(chat_id: int) -> None:
     Ошибку закрепления глушим: без закрепа бот работать не перестаёт.
     """
     text = (
-        f"{hbold('Документы TrubaVPN')}\n\n"
-        f"Пользовательское соглашение TrubaVPN и политика обработки персональных данных. "
+        f"{hbold(f'Документы {BRAND_NAME}')}\n\n"
+        f"Пользовательское соглашение {BRAND_NAME} и политика обработки персональных данных. "
         f"Сообщение закреплено, чтобы документы всегда были под рукой."
     )
     try:
@@ -4218,7 +4235,7 @@ async def _create_payment_core(user_id: int, *, kind: str, item_name: str,
         try:
             payment = Payment.create({
                 "amount":       {"value": f"{price}.00", "currency": "RUB"},
-                "confirmation": {"type": "redirect", "return_url": "https://t.me/trubavpnbot"},
+                "confirmation": {"type": "redirect", "return_url": BOT_URL},
                 "capture":      True,
                 # В ЮKassa уходит только сумма: «Интернет-Сервис. Пополнение
                 # баланса на N рублей». В metadata название позиции обезличено,
@@ -5810,14 +5827,14 @@ SUBS_PAGE_SIZE = 8
 async def _get_sorted_subs() -> list:
     now = int(time.time())
     all_users = await remna_get_all_users()
-    our = [u for u in all_users if (u.get("username") or "").startswith("truba_")]
+    our = [u for u in all_users if (u.get("username") or "").startswith(REMNA_USER_PREFIX)]
     active = [u for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"]
     return sorted(active, key=lambda x: parse_dt(x.get("expireAt")), reverse=True)
 
 def _subs_page_kb(users_page: list, page: int, total: int) -> InlineKeyboardMarkup:
     rows = []
     for u in users_page:
-        uid = u["username"].replace("truba_", "")
+        uid = u["username"].replace(REMNA_USER_PREFIX, "", 1)
         expire = parse_dt(u.get("expireAt"))
         days_left = max(0, (expire - int(time.time())) // 86400)
         tg = u.get("_tg_label", f"ID:{uid}")
@@ -5844,7 +5861,7 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
 
         uid_list = []
         for u in page_users:
-            uid_str = u["username"].replace("truba_", "")
+            uid_str = u["username"].replace(REMNA_USER_PREFIX, "", 1)
             if uid_str.isdigit():
                 uid_list.append(int(uid_str))
 
@@ -5857,7 +5874,7 @@ async def _render_subs_page(cb: CallbackQuery, page: int):
             db_map = {r["user_id"]: r["username"] for r in db_rows}
 
         for u in page_users:
-            uid_str = u["username"].replace("truba_", "")
+            uid_str = u["username"].replace(REMNA_USER_PREFIX, "", 1)
             if uid_str.isdigit():
                 uid_int = int(uid_str)
                 tg_name = db_map.get(uid_int)
@@ -7055,8 +7072,8 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
     await state.update_data(devices=devices)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
-        [InlineKeyboardButton(text="VPN", callback_data="giveplan_vpn")],
-        [InlineKeyboardButton(text="VPN + 📶", callback_data="giveplan_vpn_bypass")],
+        [InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="giveplan_vpn")],
+        [InlineKeyboardButton(text=PLANS["vpn_bypass"]["name"], callback_data="giveplan_vpn_bypass")],
         [InlineKeyboardButton(text="Пробный доступ (📶, 1 ГБ)", callback_data="giveplan_trial")],
     ])
     await message.answer(
@@ -7122,7 +7139,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
 
     expire   = parse_dt(user.get("expireAt"))
     date_str = fmt_dt(expire, "%d.%m.%Y") if expire else "нет данных"
-    label = {"none": "без изменения тарифа", "vpn": "VPN", "vpn_bypass": "VPN + 📶", "trial": "пробный доступ"}[choice]
+    label = {"none": "без изменения тарифа", "vpn": PLANS["vpn"]["name"], "vpn_bypass": PLANS["vpn_bypass"]["name"], "trial": "пробный доступ"}[choice]
     await edit_screen(cb.message, f"@{target_uname} выдано {days} дн. ({label}). До: {date_str}")
     try:
         await bot.send_message(target_id, f"Администратор выдал вам {days} дней.", parse_mode="HTML")
@@ -7172,7 +7189,7 @@ async def admin_online_cb(cb: CallbackQuery):
     all_users = await remna_get_all_users()
     online = [
         u for u in all_users
-        if (u.get("username") or "").startswith("truba_")
+        if (u.get("username") or "").startswith(REMNA_USER_PREFIX)
         and parse_dt(u.get("userTraffic", {}).get("onlineAt")) > (now - 180)
     ]
     if not online:
@@ -7182,7 +7199,7 @@ async def admin_online_cb(cb: CallbackQuery):
         return
     lines = [f"Онлайн: {len(online)} чел.", ""]
     for u in online[:40]:
-        uid  = u["username"].replace("truba_", "")
+        uid  = u["username"].replace(REMNA_USER_PREFIX, "", 1)
         last = fmt_dt(parse_dt(u.get("userTraffic", {}).get("onlineAt")), "%H:%M:%S")
         async with pool.acquire() as conn:
             db = await conn.fetchrow("SELECT username FROM users WHERE user_id=$1", int(uid) if uid.isdigit() else 0)
@@ -8002,7 +8019,7 @@ async def admin_survey_send_cb(cb: CallbackQuery):
         try:
             await bot.send_message(
                 row["user_id"],
-                f"Оцените работу TrubaVPN\n\nНасколько вы довольны сервисом? Выберите оценку от 1 до 10:",
+                f"Оцените работу {BRAND_NAME}\n\nНасколько вы довольны сервисом? Выберите оценку от 1 до 10:",
                 parse_mode="HTML",
                 reply_markup=_rating_kb(),
             )
@@ -8118,11 +8135,11 @@ async def admin_stats_cb(cb: CallbackQuery):
         promos = await conn.fetchval("SELECT COUNT(*) FROM promos")
         ref_balance_total = await conn.fetchval("SELECT COALESCE(SUM(referral_balance),0) FROM users")
     all_users = await remna_get_all_users()
-    our    = [u for u in all_users if (u.get("username") or "").startswith("truba_")]
+    our    = [u for u in all_users if (u.get("username") or "").startswith(REMNA_USER_PREFIX)]
     active = sum(1 for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")
     sale_notify = await is_admin_sale_notify(cb.from_user.id)
     text = (
-        f"Статистика TrubaVPN\n\n"
+        f"Статистика {BRAND_NAME}\n\n"
         f"Всего: {total} · Платили: {paid}\n"
         f"Активных: {active} · Промокодов: {promos}\n"
         f"На реф. балансах: {float(ref_balance_total):.2f} руб.\n\n"
@@ -8164,14 +8181,14 @@ async def admin_diag(message: types.Message):
 
     # 1. ЧТЕНИЕ
     users = await remna_get_all_users()
-    ours  = [u for u in users if (u.get("username") or "").startswith("truba_")]
+    ours  = [u for u in users if (u.get("username") or "").startswith(REMNA_USER_PREFIX)]
     now   = int(time.time())
     active = [u for u in ours
               if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED"]
     lines.append("")
     lines.append("1) ЧТЕНИЕ")
     lines.append(f"   всего в панели: {len(users)}")
-    lines.append(f"   наших (truba_*): {len(ours)}")
+    lines.append(f"   наших ({REMNA_USER_PREFIX}*): {len(ours)}")
     lines.append(f"   активных: {len(active)}")
     if not users:
         lines.append("   ЧТЕНИЕ НЕ РАБОТАЕТ — проверь REMNAWAVE_URL/TOKEN/COOKIE")
@@ -8192,7 +8209,7 @@ async def admin_diag(message: types.Message):
     # Карточка одного человека — именно её использует выдача и редактирование
     probe_id = None
     for u in ours:
-        tail = (u.get("username") or "").replace("truba_", "")
+        tail = (u.get("username") or "").replace(REMNA_USER_PREFIX, "", 1)
         if tail.isdigit():
             probe_id = int(tail)
             break
@@ -8443,7 +8460,7 @@ async def admin_wl_traffic_cb(cb: CallbackQuery):
     # truba_<id> -> tg-username из БД + лимиты, если отслеживаются.
     uid_map = {}
     for uname in totals:
-        raw = uname.replace("truba_", "")
+        raw = uname.replace(REMNA_USER_PREFIX, "", 1)
         if raw.isdigit():
             uid_map[uname] = int(raw)
     db_names, limits = {}, {}
@@ -8492,7 +8509,7 @@ async def send_daily_report():
             revenue    = sum(float(p["amount"] or 0) for p in pay_rows)
             total_paid = await conn.fetchval("SELECT COUNT(*) FROM users WHERE has_paid=1") or 0
         all_users = await remna_get_all_users()
-        our    = [u for u in all_users if (u.get("username") or "").startswith("truba_")]
+        our    = [u for u in all_users if (u.get("username") or "").startswith(REMNA_USER_PREFIX)]
         active = sum(1 for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")
         report = (
             f"Отчёт за {date} (МСК)\n\n"
@@ -8679,7 +8696,7 @@ async def main():
              "включена" if PAYMENTS_ENABLED else "ОТКЛЮЧЕНА")
     log.info("Оплата звёздами Telegram: %s",
              f"включена, курс 1 ⭐ = {STARS_RUB_RATE:g} руб." if STARS_ENABLED else "ОТКЛЮЧЕНА")
-    log.info("TrubaVPN Bot starting (Remnawave)...")
+    log.info(f"{BRAND_NAME} Bot starting (Remnawave), prefix={REMNA_USER_PREFIX}")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
