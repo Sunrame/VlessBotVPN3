@@ -117,6 +117,10 @@ BRAND_NAME = os.environ.get("BRAND_NAME", "TrubaVPN").strip() or "TrubaVPN"
 REMNA_PREFIX = (os.environ.get("REMNA_PREFIX", "truba").strip().rstrip("_") or "truba")
 REMNA_USER_PREFIX = f"{REMNA_PREFIX}_"
 BOT_URL = os.environ.get("BOT_URL", "").strip() or "https://t.me/trubavpnbot"
+# SINGLE_PLAN=1 — режим одного тарифа (BedrockVPN): нет выбора тарифа, только
+# срока; вместо «Личного кабинета» — «Управление подпиской»; в админке вместо
+# Platega — «Поступления». Без переменной бот работает как раньше.
+SINGLE_PLAN = os.environ.get("SINGLE_PLAN", "0").strip().lower() in ("1", "true", "yes", "on")
 # Ключи ЮKassa больше не обязательны: пока приём оплаты отключён, их можно
 # вообще убрать из переменных окружения — бот стартует без них.
 SHOP_ID      = os.environ.get("SHOP_ID", "")
@@ -467,6 +471,7 @@ PLANS = {
         "name":         os.environ.get("PLAN_VPN_NAME", "").strip() or "VPN",
         "price_month":  _env_int("PLAN_VPN_PRICE", 99),
         "device_price": _env_int("PLAN_VPN_DEVICE_PRICE", 50),
+        "hwid":         max(1, _env_int("PLAN_VPN_BASE_DEVICES", 1)),
         "squad":        [SQUAD_UUID_BASIC],
         "whitelist_gb": 0,
         "desc": os.environ.get("PLAN_VPN_DESC", "").strip() or "Более трёх локаций, 1 устройство, трафик не ограничен.",
@@ -476,8 +481,9 @@ PLANS = {
         "name":         os.environ.get("PLAN_BYPASS_NAME", "").strip() or "VPN + 📶",
         "price_month":  _env_int("PLAN_BYPASS_PRICE", 199),
         "device_price": _env_int("PLAN_BYPASS_DEVICE_PRICE", 70),
+        "hwid":         max(1, _env_int("PLAN_BYPASS_BASE_DEVICES", 1)),
         "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
-        "whitelist_gb": 20,
+        "whitelist_gb": _env_int("PLAN_BYPASS_WHITELIST_GB", 20),
         "desc": os.environ.get("PLAN_BYPASS_DESC", "").strip() or (
             "Более трёх локаций, 1 устройство, трафик не ограничен. "
             "Трафик 📶 ограничен 20 ГБ."
@@ -485,7 +491,29 @@ PLANS = {
     },
 }
 
+# В режиме одного тарифа продаётся только тариф с 📶 (vpn_bypass).
+SINGLE_PLAN_KEY = "vpn_bypass"
+
+
+def plan_base_hwid(plan_key) -> int:
+    """Сколько устройств входит в тариф без доплаты (для пробной — 1)."""
+    return int((PLANS.get(plan_key) or {}).get("hwid") or 1)
+
+
+def visible_plan_keys() -> list:
+    """Тарифы, которые показываются в кнопках (покупка, выдача, промокоды)."""
+    return [SINGLE_PLAN_KEY] if SINGLE_PLAN else list(PLANS)
+
+
 MONTH_CHOICES = [1, 3, 6, 12]
+
+# Скидки за срок по умолчанию, пока админ не задал свои в «Тарифы и скидки».
+# Формат DEFAULT_DISCOUNTS: "3:20,6:0,12:0" (месяцы:процент).
+DEFAULT_DISCOUNTS = {}
+for _part in os.environ.get("DEFAULT_DISCOUNTS", "").replace(" ", "").split(","):
+    _m, _, _pct = _part.partition(":")
+    if _m.isdigit() and _pct.isdigit():
+        DEFAULT_DISCOUNTS[int(_m)] = int(_pct)
 
 # ─────────────────────────────────────────────
 #  ЦЕНЫ И СКИДКИ — ХРАНЕНИЕ И РАСЧЁТ
@@ -584,7 +612,7 @@ def pricing_build(rows, default_prices: dict | None = None,
                      for k, v in (default_device_prices or {}).items()}
     gb_price_value = clamp_price(default_gb_price if default_gb_price is not None
                                  else WHITELIST_PRICE_PER_GB)
-    discounts = {m: 0 for m in DISCOUNT_MONTHS}
+    discounts = {m: clamp_discount(DEFAULT_DISCOUNTS.get(m, 0)) for m in DISCOUNT_MONTHS}
     qty = {kind: {"pct": 0, "min": 1} for kind in QTY_KINDS}
     for row in rows or []:
         # asyncpg.Record читается по имени колонки, обычный кортеж — по индексу.
@@ -1736,7 +1764,8 @@ async def carry_over_extras(u_id: int, base_hwid: int, plan_gb: int) -> tuple[in
     base_gb = int((PLANS.get(row["plan"] if row else None) or {}).get("whitelist_gb") or 0)
     extra_gb = max(0, int(cur_gb or 0) - base_gb)
 
-    return max(base_hwid, 1 + extra_dev), plan_gb + extra_gb
+    # base_hwid — устройства, входящие в тариф; докупленные идут сверху.
+    return max(1, base_hwid) + extra_dev, plan_gb + extra_gb
 
 
 async def activate_subscription(user_id: int, days: int, hwid: int = 1,
@@ -3180,7 +3209,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
                 message, kind="plan",
                 item_name=f"{plan['name']} · {months} мес."
                           + (f" · промокод {promo_code} −{promo_pct}%" if promo_code else ""),
-                price=price, days=months * 30, hwid=1, squad=plan["squad"],
+                price=price, days=months * 30, hwid=plan_base_hwid(plan_key), squad=plan["squad"],
                 whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
                 promo_code=promo_code,
             )
@@ -3210,7 +3239,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             message, kind="plan",
             item_name=f"Продление {plan['name']} · {months} мес."
                       + (f" · промокод {promo_code} −{promo_pct}%" if promo_code else ""),
-            price=price, days=months * 30, hwid=1, squad=plan["squad"],
+            price=price, days=months * 30, hwid=plan_base_hwid(plan_key), squad=plan["squad"],
             whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
             promo_code=promo_code,
         )
@@ -3422,6 +3451,9 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if plan == "trial":
             plan_name  = "Пробная подписка"
             live_plan  = "trial"
+        elif SINGLE_PLAN:
+            live_plan = SINGLE_PLAN_KEY
+            plan_name = PLANS[live_plan]["name"]
         else:
             live_plan = "vpn_bypass" if has_whitelist else "vpn"
             plan_name = PLANS[live_plan]["name"]
@@ -3430,7 +3462,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             async with pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE users SET plan=$1, extra_devices=$2 WHERE user_id=$3",
-                    live_plan, max(0, hwid - 1), user_id,
+                    live_plan, max(0, hwid - plan_base_hwid(live_plan)), user_id,
                 )
         plan = live_plan
 
@@ -3485,8 +3517,10 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     def _place_cabinet():
         # Кнопка «Личный кабинет», а для админов — следом ссылка на админ-сайт,
-        # они и встанут в одну пару.
-        flow.extend(cabinet_row)
+        # они и встанут в одну пару. В режиме одного тарифа кабинета нет —
+        # его место занимает «Управление подпиской».
+        if not SINGLE_PLAN:
+            flow.extend(cabinet_row)
         if user_is_admin and admin_site_url:
             flow.append(btn("Админ-сайт", emoji_id=BTN_ICON_ADMIN, url=admin_site_url))
 
@@ -3520,6 +3554,9 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             _place_cabinet()
         flow.append(btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                         callback_data="buy_open"))
+    elif SINGLE_PLAN:
+        flow.append(btn("Управление подпиской", emoji_id="5282843764451195532",
+                        callback_data="sub_manage"))
     else:
         flow.append(btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
                         callback_data="dev_add"))
@@ -4791,6 +4828,8 @@ async def _buy_open_content() -> tuple[str, InlineKeyboardMarkup]:
     из личного кабинета (диплинк)."""
     if not payments_available():
         return PAYMENTS_OFF_TEXT, payments_off_kb()
+    if SINGLE_PLAN:
+        return await _plan_terms_view(SINGLE_PLAN_KEY, back_cb="back")
     vpn    = PLANS["vpn"]
     bypass = PLANS["vpn_bypass"]
     vpn_price    = await get_price_month("vpn")
@@ -4827,6 +4866,8 @@ async def renew_open_cb(cb: CallbackQuery):
         plan_key = await conn.fetchval(
             "SELECT plan FROM users WHERE user_id=$1", cb.from_user.id
         )
+    if SINGLE_PLAN and plan_key not in PLANS:
+        plan_key = SINGLE_PLAN_KEY
     if plan_key not in PLANS:
         await safe_answer(cb, 
             "Текущий тариф не найден. Сначала выберите тариф.",
@@ -4851,6 +4892,12 @@ async def buyplan_cb(cb: CallbackQuery):
     if plan_key not in PLANS:
         await safe_answer(cb, "Тариф не найден.", show_alert=True)
         return
+    text, kb = await _plan_terms_view(plan_key, back_cb="back" if SINGLE_PLAN else "buy_open")
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _plan_terms_view(plan_key: str, *, back_cb: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран выбора срока для тарифа: цена за месяц и кнопки 1/3/6/12 мес."""
     plan = PLANS[plan_key]
     plan_emoji = EMOJI_PLAN_BYPASS if plan_key == "vpn_bypass" else EMOJI_PLAN_VPN
     rows = []
@@ -4861,15 +4908,16 @@ async def buyplan_cb(cb: CallbackQuery):
         if percent > 0:
             label += f" (−{percent}%)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buymonths_{plan_key}_{months}")])
-    rows.append([InlineKeyboardButton(text="Назад", callback_data="buy_open")])
-    await edit_screen(cb.message,
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=back_cb)])
+    where = "в разделе «Управление подпиской»" if SINGLE_PLAN else "в главном меню"
+    text = (
         f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n"
         f"{await get_price_month(plan_key)} руб./мес.\n\n"
         f"Дополнительные устройства и трафик 📶 "
-        f"докупаются в главном меню после покупки.\n\n"
-        f"{EMOJI_CHOOSE_TERM} Выберите срок:",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        f"докупаются {where} после покупки.\n\n"
+        f"{EMOJI_CHOOSE_TERM} Выберите срок:"
     )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ─────────────────────────────────────────────
 #  ЭКРАН ЗАКАЗА ТАРИФА + СКИДОЧНЫЙ ПРОМОКОД
@@ -5109,9 +5157,44 @@ async def order_pay_cb(cb: CallbackQuery, state: FSMContext):
     name = f"Продление {plan['name']}" if renew else plan["name"]
     await _create_payment_page(
         cb, kind="plan", item_name=f"{name} · {months} мес.", price=final,
-        days=months * 30, hwid=1, squad=plan["squad"],
+        days=months * 30, hwid=plan_base_hwid(plan_key), squad=plan["squad"],
         whitelist_gb=plan["whitelist_gb"], plan_key=plan_key, promo_code=code,
     )
+
+# ─────────────────────────────────────────────
+#  УПРАВЛЕНИЕ ПОДПИСКОЙ (режим одного тарифа)
+# ─────────────────────────────────────────────
+@router.callback_query(F.data == "sub_manage")
+async def sub_manage_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    await state.clear()
+    u_id = cb.from_user.id
+    remna = await remna_get_user(u_id)
+    now = int(time.time())
+    if not remna or parse_dt(remna.get("expireAt")) <= now or remna.get("status") == "DISABLED":
+        await safe_answer(cb, "Подписка не активна. Оформите её через «Купить VPN».", show_alert=True)
+        return
+    async with pool.acquire() as conn:
+        plan_key = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", u_id)
+    plan_key = plan_key if plan_key in PLANS else SINGLE_PLAN_KEY
+    plan = PLANS[plan_key]
+    lines = [
+        f"{hbold('Управление подпиской')}",
+        "",
+        f"{EMOJI_PLAN_LABEL} Тариф: {plan['name']}",
+        f"Устройств: {remna.get('hwidDeviceLimit', plan_base_hwid(plan_key))}",
+        f"{EMOJI_ACTIVE_UNTIL} Активна до: {fmt_dt(parse_dt(remna.get('expireAt')), '%d.%m.%Y')}",
+        "",
+        f"Трафик 📶: {await get_gb_price()} руб. за 1 ГБ",
+        f"Устройство: {await get_device_price(plan_key)} руб. за 1 шт.",
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Продлить", emoji_id=BTN_ICON_PAY, callback_data="renew_open")],
+        [btn("Докупить трафик 📶", emoji_id=BTN_ICON_GB_TOPUP, callback_data="wl_topup"),
+         btn("Докупить устройства", emoji_id=BTN_ICON_DEV_TOPUP, callback_data="dev_add")],
+        [InlineKeyboardButton(text="Назад", callback_data="back")],
+    ])
+    await edit_screen(cb.message, "\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
 # ─────────────────────────────────────────────
 #  ДОБАВИТЬ УСТРОЙСТВА
@@ -5202,7 +5285,7 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
     async with pool.acquire() as conn:
         plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
     if plan != "vpn_bypass":
-        await safe_answer(cb, "Докупка доступна только на тарифе VPN + 📶.", show_alert=True)
+        await safe_answer(cb, f"Докупка доступна только на тарифе {PLANS['vpn_bypass']['name']}.", show_alert=True)
         return
     await state.set_state(WhitelistTopupState.waiting_gb)
     await edit_screen(cb.message,
@@ -5461,7 +5544,8 @@ async def _promo_claim_error(target, error: str):
 
 def _free_plan_kb(code: str):
     rows = []
-    for key, plan in PLANS.items():
+    for key in visible_plan_keys():
+        plan = PLANS[key]
         rows.append([InlineKeyboardButton(text=plan["name"], callback_data=f"pfree_{key}_{code}")])
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -5547,7 +5631,7 @@ async def handle_promo(message: types.Message, state: FSMContext):
         days = int(claimed["days"] or 0)
         plan = PLANS[tariff_key]
         final_hwid, final_gb = await carry_over_extras(
-            message.from_user.id, 1, int(plan["whitelist_gb"] or 0))
+            message.from_user.id, plan_base_hwid(tariff_key), int(plan["whitelist_gb"] or 0))
         user = await activate_subscription(message.from_user.id, days, final_hwid,
                                             squad_uuid=plan["squad"], whitelist_gb=final_gb)
         if not user:
@@ -5636,7 +5720,7 @@ async def handle_free_plan_choice(cb: CallbackQuery, state: FSMContext):
     days = int(claimed["days"] or 0)
     plan = PLANS[plan_key]
     final_hwid, final_gb = await carry_over_extras(
-        cb.from_user.id, 1, int(plan["whitelist_gb"] or 0))
+        cb.from_user.id, plan_base_hwid(plan_key), int(plan["whitelist_gb"] or 0))
     activated = await activate_subscription(cb.from_user.id, days, final_hwid,
                                             squad_uuid=plan["squad"], whitelist_gb=final_gb)
     if not activated:
@@ -5697,12 +5781,56 @@ def admin_panel_kb(is_main: bool = False):
         [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals"),
          InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast_start")],
         [InlineKeyboardButton(text="Настройки", callback_data="admin_settings"),
-         InlineKeyboardButton(text="Platega", callback_data="admin_platega")],
+         (InlineKeyboardButton(text="Поступления", callback_data="admin_income") if SINGLE_PLAN
+          else InlineKeyboardButton(text="Platega", callback_data="admin_platega"))],
     ]
     if is_main:
         rows.append([InlineKeyboardButton(text="Админы", callback_data="admin_admins")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def _income_period(conn, since: int) -> tuple[float, int, int, int, float]:
+    """(рубли, кол-во рублёвых оплат, звёзды, кол-во оплат звёздами, рубли по звёздам)."""
+    rub = await conn.fetchrow(
+        "SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS c FROM payments "
+        "WHERE source='purchase' AND amount>0 AND created_at>=$1", since)
+    st = await conn.fetchrow(
+        "SELECT COALESCE(SUM(stars),0) AS s, COUNT(*) AS c, COALESCE(SUM(price),0) AS r "
+        "FROM star_invoices WHERE paid_at IS NOT NULL AND paid_at>=$1", since)
+    return float(rub["s"]), int(rub["c"]), int(st["s"]), int(st["c"]), float(st["r"])
+
+
+@router.callback_query(F.data == "admin_income")
+async def admin_income_cb(cb: CallbackQuery):
+    """Поступления: рубли (карта/СБП) и звёзды Telegram — раздельно."""
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    now_msk = msk_now()
+    day_start = int(now_msk.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    now = int(time.time())
+    periods = [("Сегодня", day_start), ("7 дней", now - 7 * 86400),
+               ("30 дней", now - 30 * 86400), ("Всё время", 0)]
+    lines = [f"{hbold('Поступления')}", ""]
+    async with pool.acquire() as conn:
+        for title, since in periods:
+            rub, rub_n, stars, stars_n, stars_rub = await _income_period(conn, since)
+            lines += [
+                hbold(title),
+                f"Рубли: {rub:,.0f} руб. ({rub_n} опл.)".replace(",", " "),
+                f"Звёзды: {stars} {EMOJI_STARS} ({stars_n} опл., ≈{stars_rub:,.0f} руб.)".replace(",", " "),
+                "",
+            ]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обновить", callback_data="admin_income")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ])
+    try:
+        await edit_screen(cb.message, "\n".join(lines).strip(), parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e):
+            raise
+
 
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel_cb(cb: CallbackQuery):
@@ -6583,7 +6711,7 @@ async def promogen_type_free_cb(cb: CallbackQuery):
     await edit_screen(cb.message,
         "Какой тариф выдавать бесплатно?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="promogen_freeplan_vpn")],
+            *([] if SINGLE_PLAN else [[InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="promogen_freeplan_vpn")]]),
             [InlineKeyboardButton(text=PLANS["vpn_bypass"]["name"], callback_data="promogen_freeplan_vpn_bypass")],
             [InlineKeyboardButton(text="Пользователь выбирает сам", callback_data="promogen_freeplan_choice")],
             [InlineKeyboardButton(text="Назад", callback_data="promogen_start")],
@@ -7072,7 +7200,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
     await state.update_data(devices=devices)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
-        [InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="giveplan_vpn")],
+        *([] if SINGLE_PLAN else [[InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="giveplan_vpn")]]),
         [InlineKeyboardButton(text=PLANS["vpn_bypass"]["name"], callback_data="giveplan_vpn_bypass")],
         [InlineKeyboardButton(text="Пробный доступ (📶, 1 ГБ)", callback_data="giveplan_trial")],
     ])
@@ -7123,7 +7251,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
     # choice == "none": оставляем squad_uuid=None, new_plan=None (ничего не трогаем)
 
     user = await activate_subscription(
-        target_id, days, hwid or 1, squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
+        target_id, days, hwid or plan_base_hwid(new_plan), squad_uuid=squad_uuid, whitelist_gb=whitelist_gb
     )
     if not user:
         await edit_screen(cb.message, "Ошибка активации." + remna_err())
@@ -7131,7 +7259,7 @@ async def admin_give_finalize(cb: CallbackQuery, state: FSMContext):
 
     async with pool.acquire() as conn:
         if new_plan is not None:
-            extra_devices = max(0, (hwid or 1) - 1)
+            extra_devices = max(0, (hwid or plan_base_hwid(new_plan)) - plan_base_hwid(new_plan))
             await conn.execute(
                 "UPDATE users SET plan=$1, extra_devices=$2 WHERE user_id=$3",
                 new_plan, extra_devices, target_id,
