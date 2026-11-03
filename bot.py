@@ -121,6 +121,9 @@ BOT_URL = os.environ.get("BOT_URL", "").strip() or "https://t.me/trubavpnbot"
 # срока; вместо «Личного кабинета» — «Управление подпиской»; в админке вместо
 # Platega — «Поступления». Без переменной бот работает как раньше.
 SINGLE_PLAN = os.environ.get("SINGLE_PLAN", "0").strip().lower() in ("1", "true", "yes", "on")
+# SHOW_RENEW_BUTTON=0 — убрать кнопку «Продлить» из «Управления подпиской»
+# (продление остаётся в напоминаниях об окончании и через «Купить VPN»).
+SHOW_RENEW_BUTTON = os.environ.get("SHOW_RENEW_BUTTON", "1").strip().lower() in ("1", "true", "yes", "on")
 # Ключи ЮKassa больше не обязательны: пока приём оплаты отключён, их можно
 # вообще убрать из переменных окружения — бот стартует без них.
 SHOP_ID      = os.environ.get("SHOP_ID", "")
@@ -452,16 +455,27 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
+_TRIAL_DAYS = max(1, _env_int("TRIAL_DAYS", 1))
+_TRIAL_HWID = max(1, _env_int("TRIAL_DEVICES", 1))
+_TRIAL_GB   = max(0, _env_int("TRIAL_WHITELIST_GB", 1))
+
+
+def trial_period_label(days: int | None = None) -> str:
+    """«24 часа» для суток, иначе «N дн.» — для текстов о пробной подписке."""
+    days = _TRIAL_DAYS if days is None else int(days)
+    return "24 часа" if days == 1 else f"{days} дн."
+
+
 TRIAL = {
     "name":         os.environ.get("TRIAL_NAME", "").strip() or "Пробная подписка",
     "price":        0,
-    "days":         1,
-    "hwid":         1,
+    "days":         _TRIAL_DAYS,
+    "hwid":         _TRIAL_HWID,
     "squad":        [SQUAD_UUID_BASIC, SQUAD_UUID_WHITELIST],
-    "whitelist_gb": 1,
+    "whitelist_gb": _TRIAL_GB,
     "desc": (
-        "Бесплатно. 24 часа доступа ко всем серверам. Трафик VPN не ограничен, "
-        "трафик 📶 ограничен 1 ГБ. Лимит устройств — 1."
+        f"Бесплатно. {trial_period_label()} доступа ко всем серверам. Трафик VPN не ограничен, "
+        f"трафик 📶 ограничен {_TRIAL_GB} ГБ. Лимит устройств — {_TRIAL_HWID}."
     ),
 }
 
@@ -496,7 +510,9 @@ SINGLE_PLAN_KEY = "vpn_bypass"
 
 
 def plan_base_hwid(plan_key) -> int:
-    """Сколько устройств входит в тариф без доплаты (для пробной — 1)."""
+    """Сколько устройств входит в тариф без доплаты."""
+    if plan_key == "trial":
+        return int(TRIAL["hwid"] or 1)
     return int((PLANS.get(plan_key) or {}).get("hwid") or 1)
 
 
@@ -3252,7 +3268,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             await message.answer(error)
             return True
         text, kb = await _build_profile_view(u_id)
-        await message.answer(f"Пробная подписка активирована на 24 часа.\n\n{text}",
+        await message.answer(f"Пробная подписка активирована на {trial_period_label()}.\n\n{text}",
                              parse_mode="HTML", reply_markup=kb)
         await send_channel_instructions(u_id)
         return True
@@ -4814,7 +4830,7 @@ async def trial_buy_cb(cb: CallbackQuery):
         return
     text, kb = await _build_profile_view(cb.from_user.id)
     await edit_screen(cb.message,
-        f"Пробная подписка активирована на 24 часа.\n\n{text}",
+        f"Пробная подписка активирована на {trial_period_label()}.\n\n{text}",
         parse_mode="HTML", reply_markup=kb,
     )
     await send_channel_instructions(cb.from_user.id)
@@ -5189,7 +5205,8 @@ async def sub_manage_cb(cb: CallbackQuery, state: FSMContext):
         f"Устройство: {await get_device_price(plan_key)} руб. за 1 шт.",
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Продлить", emoji_id=BTN_ICON_PAY, callback_data="renew_open")],
+        *([[btn("Продлить", emoji_id=BTN_ICON_PAY, callback_data="renew_open")]]
+          if SHOW_RENEW_BUTTON else []),
         [btn("Докупить трафик 📶", emoji_id=BTN_ICON_GB_TOPUP, callback_data="wl_topup"),
          btn("Докупить устройства", emoji_id=BTN_ICON_DEV_TOPUP, callback_data="dev_add")],
         [InlineKeyboardButton(text="Назад", callback_data="back")],
@@ -7202,7 +7219,7 @@ async def admin_give_devices(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="Не менять тариф/сквад", callback_data="giveplan_none")],
         *([] if SINGLE_PLAN else [[InlineKeyboardButton(text=PLANS["vpn"]["name"], callback_data="giveplan_vpn")]]),
         [InlineKeyboardButton(text=PLANS["vpn_bypass"]["name"], callback_data="giveplan_vpn_bypass")],
-        [InlineKeyboardButton(text="Пробный доступ (📶, 1 ГБ)", callback_data="giveplan_trial")],
+        [InlineKeyboardButton(text=f"Пробный доступ (📶, {TRIAL['whitelist_gb']} ГБ)", callback_data="giveplan_trial")],
     ])
     await message.answer(
         "Какой тариф/доступ выставить?\n\n"
