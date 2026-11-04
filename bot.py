@@ -405,6 +405,7 @@ BTN_ICON_ADMIN           = "5231200819986047254"  # Панель (админ)
 BTN_ICON_DEV_TOPUP       = "5407025283456835913"  # Добавить устройства
 BTN_ICON_GB_TOPUP        = "5283080528818360566"  # Докупить трафик
 BTN_ICON_UPGRADE         = "5449683594425410231"  # Улучшить тариф
+BTN_ICON_SUB_MANAGE      = "5282843764451195532"  # Управление подпиской / Личный кабинет
 
 EMOJI_TRUBAVPN      = premium_emoji("5224450179368767019", "\U0001f310")  # "TrubaVPN" в приветствии
 EMOJI_INFO          = premium_emoji("5334544901428229844", "\u2728")   # заголовок "О сервисе"
@@ -422,6 +423,32 @@ EMOJI_GB_TOPUP      = premium_emoji("5283080528818360566", "\U0001f4ca")  # за
 EMOJI_UPGRADE       = premium_emoji("5449683594425410231", "\u2b06\ufe0f")  # "Улучшение тарифа" (оплата)
 EMOJI_INVITE        = premium_emoji("5264713049637409446", "\U0001f465")  # "Приглашайте друзей.."
 EMOJI_STARS         = premium_emoji("5267500801240092311", "\u2b50")   # сумма в звёздах
+
+# ── Свои эмодзи для отдельного бота ──────────────────────────────────
+# Любую иконку кнопки можно заменить переменной с тем же именем
+# (BTN_ICON_PROMO=123...), любой эмодзи в тексте — переменной <ИМЯ>_ID
+# (EMOJI_ACTIVE_UNTIL_ID=123...). Без переменных всё как раньше.
+for _name in [n for n in list(globals()) if n.startswith("BTN_ICON_")]:
+    _val = os.environ.get(_name, "").strip()
+    if _val:
+        globals()[_name] = _val
+for _name in [n for n in list(globals()) if n.startswith("EMOJI_") and isinstance(globals()[n], str)]:
+    _val = os.environ.get(f"{_name}_ID", "").strip()
+    _m = re.match(r'<tg-emoji emoji-id="[^"]*">(.*)</tg-emoji>$', globals()[_name], re.S)
+    if _val and _m:
+        globals()[_name] = premium_emoji(_val, _m.group(1))
+
+# PROFILE_TITLE_EMOJI_IDS — заголовок профиля из своих эмодзи (через
+# запятую, выводятся подряд без пробелов) вместо «⭐ Профиль».
+_PROFILE_IDS = [x.strip() for x in os.environ.get("PROFILE_TITLE_EMOJI_IDS", "").split(",") if x.strip()]
+PROFILE_TITLE = ("".join(premium_emoji(x, "\u2b50") for x in _PROFILE_IDS)
+                 if _PROFILE_IDS else None)
+# HIDE_PLAN_LINE=1 — не показывать в профиле строку «Вариант подписки».
+HIDE_PLAN_LINE = os.environ.get("HIDE_PLAN_LINE", "0").strip().lower() in ("1", "true", "yes", "on")
+# REFERRAL_DAYS>0 — вместо процентов с оплат приглашающий получает N дней
+# подписки за каждого друга, который впервые оплатил подписку. Кнопка
+# «Заработать» тогда называется «Бесплатные дни».
+REFERRAL_DAYS = max(0, int(os.environ.get("REFERRAL_DAYS", "0") or 0))
 
 # ─────────────────────────────────────────────
 #  Технически невозможно вставить (кнопки Telegram не поддерживают формати-
@@ -2091,6 +2118,9 @@ async def notify_admins_alert(text: str) -> None:
 
 async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str | None,
                            item_name: str, price: float):
+    if REFERRAL_DAYS:
+        await credit_referral_days(referrer_id, buyer_id, buyer_username)
+        return
     """
     Начисление рефереру процента от суммы оплаты приглашённого друга.
     Процент — персональный (users.referral_percent, задаёт админ через
@@ -2124,6 +2154,56 @@ async def credit_referral(referrer_id: int, buyer_id: int, buyer_username: str |
         )
     except Exception:
         pass
+
+async def credit_referral_days(referrer_id: int, buyer_id: int, buyer_username: str | None):
+    """REFERRAL_DAYS дней подписки приглашающему — один раз за каждого друга,
+    при первой оплате друга. Повторно за того же друга не начисляется."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS referral_day_rewards ("
+            "friend_id BIGINT PRIMARY KEY, referrer_id BIGINT NOT NULL, "
+            "days INTEGER NOT NULL, created_at BIGINT NOT NULL)"
+        )
+        inserted = await conn.fetchval(
+            "INSERT INTO referral_day_rewards (friend_id, referrer_id, days, created_at) "
+            "VALUES ($1,$2,$3,$4) ON CONFLICT (friend_id) DO NOTHING RETURNING friend_id",
+            buyer_id, referrer_id, REFERRAL_DAYS, int(time.time()),
+        )
+        if not inserted:
+            return
+        ref_plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", referrer_id)
+
+    remna = await remna_get_user(referrer_id)
+    if remna:
+        result = await remna_extend_user(referrer_id, REFERRAL_DAYS)
+    else:
+        plan_key = SINGLE_PLAN_KEY if SINGLE_PLAN else "vpn"
+        plan = PLANS[plan_key]
+        result = await activate_subscription(
+            referrer_id, REFERRAL_DAYS, plan_base_hwid(plan_key),
+            squad_uuid=plan["squad"], whitelist_gb=int(plan["whitelist_gb"] or 0))
+        if result and ref_plan not in PLANS:
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE users SET plan=$1 WHERE user_id=$2", plan_key, referrer_id)
+    if not result:
+        # Не вышло продлить — снимаем отметку, чтобы начислить при следующей оплате друга.
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM referral_day_rewards WHERE friend_id=$1", buyer_id)
+        await notify_admins_alert(
+            f"Не удалось начислить {REFERRAL_DAYS} дн. за реферала: "
+            f"пригласивший ID {referrer_id}, друг ID {buyer_id}.{remna_err()}"
+        )
+        return
+    buyer_label = f"@{buyer_username}" if buyer_username else "Ваш друг"
+    try:
+        await bot.send_message(
+            referrer_id,
+            f"{buyer_label} оформил подписку по вашей ссылке.\n"
+            f"Вам начислено {REFERRAL_DAYS} дн. подписки.",
+        )
+    except Exception:
+        pass
+
 
 async def send_channel_instructions(chat_id: int):
     """Отправляется после активации подписки (триал или покупка тарифа):
@@ -3430,9 +3510,9 @@ def _cabinet_button_row() -> list[InlineKeyboardButton]:
     кабинет временно недоступен."""
     url = get_cabinet_webapp_url()
     if url:
-        return [btn("Личный кабинет", emoji_id="5282843764451195532",
+        return [btn("Личный кабинет", emoji_id=BTN_ICON_SUB_MANAGE,
                     web_app=WebAppInfo(url=url))]
-    return [btn("Личный кабинет", emoji_id="5282843764451195532",
+    return [btn("Личный кабинет", emoji_id=BTN_ICON_SUB_MANAGE,
                 callback_data="cabinet_unavailable")]
 
 async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -3453,7 +3533,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     remna = await remna_get_user(user_id)
     now   = int(time.time())
 
-    lines = [f"{EMOJI_PROFILE} {hbold('Профиль')}", ""]
+    lines = [PROFILE_TITLE or f"{EMOJI_PROFILE} {hbold('Профиль')}", ""]
     subscription_active = bool(
         remna and parse_dt(remna.get("expireAt")) > now and remna.get("status") != "DISABLED"
     )
@@ -3504,10 +3584,9 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 remaining = max(0.0, wl_row["gb_limit"] - used_gb)
                 gb_line = f"Осталось трафика 📶: {remaining:.1f}/{wl_row['gb_limit']} ГБ"
 
-        lines += [
-            f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}",
-            f"Устройств: {hwid}",
-        ]
+        if not HIDE_PLAN_LINE:
+            lines.append(f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}")
+        lines.append(f"Устройств: {hwid}")
         if gb_line:
             lines.append(gb_line)
         lines.append(f"{EMOJI_ACTIVE_UNTIL} Активна до: {date_str}")
@@ -3578,7 +3657,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         flow.append(btn("Купить VPN", emoji_id=BTN_ICON_BUY_VPN,
                         callback_data="buy_open"))
     elif SINGLE_PLAN:
-        flow.append(btn("Управление подпиской", emoji_id="5282843764451195532",
+        flow.append(btn("Управление подпиской", emoji_id=BTN_ICON_SUB_MANAGE,
                         callback_data="sub_manage"))
     else:
         flow.append(btn("Добавить устройства", emoji_id=BTN_ICON_DEV_TOPUP,
@@ -3590,7 +3669,8 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             flow.append(btn("Докупить трафик (📶)", emoji_id=BTN_ICON_GB_TOPUP,
                             callback_data="wl_topup"))
 
-    flow.append(btn("Заработать", emoji_id=BTN_ICON_EARN, callback_data="earn_open"))
+    flow.append(btn("Бесплатные дни" if REFERRAL_DAYS else "Заработать",
+                    emoji_id=BTN_ICON_EARN, callback_data="earn_open"))
     flow.append(btn("Промокод", emoji_id=BTN_ICON_PROMO, callback_data="promo_enter"))
     flow.append(btn("О сервисе", emoji_id=BTN_ICON_INFO, callback_data="info_tab"))
     if user_is_admin:
@@ -5355,6 +5435,28 @@ async def earn_open_cb(cb: CallbackQuery):
         custom_pct = await conn.fetchval("SELECT referral_percent FROM users WHERE user_id=$1", u_id)
     balance = float(balance)
     my_percent = max(1, min(100, int(custom_pct))) if custom_pct else REFERRAL_PERCENT
+
+    if REFERRAL_DAYS:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS referral_day_rewards ("
+                "friend_id BIGINT PRIMARY KEY, referrer_id BIGINT NOT NULL, "
+                "days INTEGER NOT NULL, created_at BIGINT NOT NULL)"
+            )
+            paid_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM referral_day_rewards WHERE referrer_id=$1", u_id) or 0
+        text = (
+            f"{EMOJI_EARN} {hbold('Бесплатные дни')}\n\n"
+            f"{EMOJI_INVITE} Приглашайте друзей — получайте {REFERRAL_DAYS} дней подписки "
+            f"за каждого друга, который оформит подписку.\n\n"
+            f"Ваша ссылка:\n{hcode(link)}\n\n"
+            f"Приглашено: {ref_count}\n"
+            f"Оформили подписку: {paid_count}\n"
+            f"Получено дней: {paid_count * REFERRAL_DAYS}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back")]])
+        await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+        return
 
     text = (
         f"{EMOJI_EARN} {hbold('Заработать')}\n\n"
