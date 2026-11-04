@@ -5017,8 +5017,8 @@ async def renew_open_cb(cb: CallbackQuery):
     plan = PLANS[plan_key]
     await edit_screen(cb.message,
         f"{hbold('Продлить подписку')}\n\n"
-        f"Тариф: {plan['name']}\n"
-        f"Выберите срок продления:",
+        + ("" if HIDE_PLAN_LINE else f"Тариф: {plan['name']}\n")
+        + f"Выберите срок продления:",
         parse_mode="HTML",
         reply_markup=await _renew_kb(plan_key, include_back=True),
     )
@@ -5321,7 +5321,7 @@ async def sub_manage_cb(cb: CallbackQuery, state: FSMContext):
     lines = [
         f"{hbold('Управление подпиской')}",
         "",
-        f"{EMOJI_PLAN_LABEL} Тариф: {plan['name']}",
+        *([] if HIDE_PLAN_LINE else [f"{EMOJI_PLAN_LABEL} Тариф: {plan['name']}"]),
         f"Устройств: {remna.get('hwidDeviceLimit', plan_base_hwid(plan_key))}",
         f"{EMOJI_ACTIVE_UNTIL} Активна до: {fmt_dt(parse_dt(remna.get('expireAt')), '%d.%m.%Y')}",
         "",
