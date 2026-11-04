@@ -1736,51 +1736,89 @@ async def remna_get_user_hwid(ref) -> list:
         log.error("[Remna] get_user_hwid: %s", e)
         return []
 
-async def remna_get_node_bandwidth(node_uuid: str, start_dt: datetime, end_dt: datetime) -> list:
-    """
-    Трафик по каждому юзеру на конкретной ноде, по дням.
-    GET /api/bandwidth-stats/nodes/{uuid}/users/legacy?start=...&end=...
-    Формат дат: ISO с миллисекундами.
-    """
+# ── Трафик 📶 ──────────────────────────────────────────────────────
+# Панель 3.x убрала /bandwidth-stats/nodes/{uuid}/users/legacy (по дням).
+# Новый GET /api/bandwidth-stats/nodes/{uuid}/users?start=YYYY-MM-DD&end=...
+# отдаёт сумму трафика каждого пользователя за период (topUsers). Поэтому
+# расход считаем так: для каждой даты начала периода (whitelist_limits.
+# period_start) берём сумму с этой даты по сегодня включительно.
+# WHITELIST_NODE_UUID может содержать несколько нод через запятую.
+WHITELIST_NODE_UUIDS = [x.strip() for x in WHITELIST_NODE_UUID.split(",") if x.strip()]
+_WL_USAGE_CACHE: dict = {}
+_WL_USAGE_TTL = 60
+# Периоды старше этого считаем с даты WL_MAX_DAYS дней назад.
+WL_MAX_DAYS = 60
+
+
+def _utc_date(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%d")
+
+
+async def remna_get_node_users_usage(node_uuid: str, start_date: str, end_date: str) -> dict:
+    """{username: байты} на ноде за период [start_date; end_date] (даты UTC)."""
     if not node_uuid:
-        return []
-    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return {}
     try:
         async with httpx.AsyncClient(verify=True) as client:
             r = await client.get(
-                f"{REMNAWAVE_URL}/api/bandwidth-stats/nodes/{node_uuid}/users/legacy",
-                params={"start": start_str, "end": end_str},
+                f"{REMNAWAVE_URL}/api/bandwidth-stats/nodes/{node_uuid}/users",
+                params={"start": start_date, "end": end_date, "topUsersLimit": 100000},
                 headers=_remna_headers(), timeout=30,
             )
             r.raise_for_status()
-            data = r.json().get("response", [])
-            return data if isinstance(data, list) else []
+            data = (r.json() or {}).get("response") or {}
+            out = {}
+            for u in data.get("topUsers") or []:
+                name = u.get("username") or ""
+                if name:
+                    out[name] = out.get(name, 0) + int(u.get("total") or 0)
+            return out
     except Exception as e:
-        log.error("[Remna] get_node_bandwidth: %s", e)
-        return []
+        log.error("[Remna] node users usage %s: %s", node_uuid, e)
+        return {}
+
+
+async def whitelist_usage_since(start_date: str) -> dict:
+    """{username: байты} на нодах 📶 с даты start_date по сегодня. Кэш 60 с."""
+    today = _utc_date(int(time.time()))
+    key = (start_date, today)
+    hit = _WL_USAGE_CACHE.get(key)
+    if hit and time.time() - hit[0] < _WL_USAGE_TTL:
+        return hit[1]
+    total: dict = {}
+    for node in WHITELIST_NODE_UUIDS:
+        for name, b in (await remna_get_node_users_usage(node, start_date, today)).items():
+            total[name] = total.get(name, 0) + b
+    _WL_USAGE_CACHE[key] = (time.time(), total)
+    return total
+
 
 async def fetch_whitelist_daily_records(days_back: int = 40) -> list[dict]:
-    """Сырые дневные записи трафика для ВСЕХ юзеров на ноде 📶."""
-    if not WHITELIST_NODE_UUID:
+    """Расход 📶 по пользователям с каждой даты начала периода из whitelist_limits.
+
+    Возвращает записи {"username", "since", "bytes"}: since — дата (UTC) начала
+    периода, bytes — трафик с этой даты по сегодня. Аргумент days_back оставлен
+    для совместимости и не используется.
+    """
+    if not WHITELIST_NODE_UUIDS:
         return []
-    end_dt   = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days_back)
-    raw = await remna_get_node_bandwidth(WHITELIST_NODE_UUID, start_dt, end_dt)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT period_start FROM whitelist_limits WHERE gb_limit > 0")
+    floor_ts = int(time.time()) - WL_MAX_DAYS * 86400
+    dates = sorted({_utc_date(max(int(r["period_start"] or 0), floor_ts)) for r in rows})
     out = []
-    for rec in raw:
-        uname = rec.get("username", "")
-        date_str = rec.get("date", "")
-        try:
-            day_ts = int(datetime.fromisoformat(date_str.replace("Z", "+00:00")).timestamp())
-        except Exception:
-            continue
-        out.append({"username": uname, "ts": day_ts, "bytes": int(rec.get("total", 0) or 0)})
+    for d in dates:
+        for name, b in (await whitelist_usage_since(d)).items():
+            out.append({"username": name, "since": d, "bytes": b})
     return out
+
 
 def sum_whitelist_bytes_for_user(records: list[dict], user_id: int, since_ts: int) -> int:
     uname = remna_username(user_id)
-    return sum(r["bytes"] for r in records if r["username"] == uname and r["ts"] >= since_ts)
+    floor_ts = int(time.time()) - WL_MAX_DAYS * 86400
+    want = _utc_date(max(int(since_ts or 0), floor_ts))
+    return sum(r["bytes"] for r in records if r["username"] == uname and r["since"] == want)
 
 async def carry_over_extras(u_id: int, base_hwid: int, plan_gb: int) -> tuple[int, int]:
     """Докупленное сверх тарифа — переносим на новую подписку.
@@ -8696,14 +8734,11 @@ async def admin_wl_traffic_cb(cb: CallbackQuery):
         [InlineKeyboardButton(text="Обновить", callback_data="admin_wl_traffic")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ])
-    if not WHITELIST_NODE_UUID:
+    if not WHITELIST_NODE_UUIDS:
         await edit_screen(cb.message, "WHITELIST_NODE_UUID не задан.", reply_markup=back_kb_)
         return
     await edit_screen(cb.message, "Считаю расход трафика 📶...")
-    records = await fetch_whitelist_daily_records(days_back=30)
-    totals: dict = {}
-    for r in records:
-        totals[r["username"]] = totals.get(r["username"], 0) + r["bytes"]
+    totals = await whitelist_usage_since(_utc_date(int(time.time()) - 30 * 86400))
     totals = {u: b for u, b in totals.items() if b > 0}
     if not totals:
         await edit_screen(cb.message,
@@ -8727,6 +8762,7 @@ async def admin_wl_traffic_cb(cb: CallbackQuery):
                 "WHERE user_id = ANY($1::bigint[])", ids)
         db_names = {r["user_id"]: r["username"] for r in name_rows}
         limits   = {r["user_id"]: r for r in wl_rows}
+    records = await fetch_whitelist_daily_records()
     lines = ["Расход трафика 📶 (за 30 дней)", ""]
     for uname, used in sorted(totals.items(), key=lambda x: x[1], reverse=True):
         uid = uid_map.get(uname)
