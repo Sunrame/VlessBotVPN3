@@ -430,7 +430,9 @@ EMOJI_STARS         = premium_emoji("5267500801240092311", "\u2b50")   # сум�
 # (EMOJI_ACTIVE_UNTIL_ID=123...). Без переменных всё как раньше.
 for _name in [n for n in list(globals()) if n.startswith("BTN_ICON_")]:
     _val = os.environ.get(_name, "").strip()
-    if _val:
+    if _val.lower() in ("none", "off", "0", "-"):
+        globals()[_name] = None   # BTN_ICON_X=none — кнопка без иконки
+    elif _val:
         globals()[_name] = _val
 for _name in [n for n in list(globals()) if n.startswith("EMOJI_") and isinstance(globals()[n], str)]:
     _val = os.environ.get(f"{_name}_ID", "").strip()
