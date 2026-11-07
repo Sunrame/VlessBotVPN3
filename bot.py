@@ -443,6 +443,33 @@ for _name in [n for n in list(globals()) if n.startswith("EMOJI_") and isinstanc
 # EMOJI_WL_ID — свой эмодзи вместо 📶 (трафик белых списков) в текстах.
 _WL_ID = os.environ.get("EMOJI_WL_ID", "").strip()
 EMOJI_WL = premium_emoji(_WL_ID, "\U0001f4f6") if _WL_ID else "\U0001f4f6"
+# BUY_HIDE_TITLE=1 — на экране выбора срока без названия тарифа и эмодзи.
+BUY_HIDE_TITLE = os.environ.get("BUY_HIDE_TITLE", "0").strip().lower() in ("1", "true", "yes", "on")
+_TG_EMOJI_SPLIT = re.compile(r'(<tg-emoji emoji-id="[^"]*">.*?</tg-emoji>)', re.S)
+
+
+def _wl_html(text):
+    """📶 -> свой эмодзи EMOJI_WL_ID во всех HTML-текстах (кроме уже готовых тегов)."""
+    if not _WL_ID or not isinstance(text, str) or "\U0001f4f6" not in text:
+        return text
+    parts = _TG_EMOJI_SPLIT.split(text)
+    return "".join(p if i % 2 else p.replace("\U0001f4f6", EMOJI_WL) for i, p in enumerate(parts))
+
+
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware as _BRM
+
+
+class WlEmojiMiddleware(_BRM):
+    async def __call__(self, make_request, bot, method):
+        try:
+            if str(getattr(method, "parse_mode", "") or "").upper() == "HTML":
+                for field in ("text", "caption"):
+                    val = getattr(method, field, None)
+                    if isinstance(val, str):
+                        setattr(method, field, _wl_html(val))
+        except Exception:
+            pass
+        return await make_request(bot, method)
 
 # PROFILE_TITLE_EMOJI_IDS — заголовок профиля из своих эмодзи (через
 # запятую, выводятся подряд без пробелов) вместо «⭐ Профиль».
@@ -5063,12 +5090,14 @@ async def _plan_terms_view(plan_key: str, *, back_cb: str) -> tuple[str, InlineK
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buymonths_{plan_key}_{months}")])
     rows.append([InlineKeyboardButton(text="Назад", callback_data=back_cb)])
     where = "в разделе «Управление подпиской»" if SINGLE_PLAN else "в главном меню"
+    title = "" if BUY_HIDE_TITLE else f"{plan_emoji} {hbold(plan['name'])}\n"
+    choose = "Выберите срок:" if BUY_HIDE_TITLE else f"{EMOJI_CHOOSE_TERM} Выберите срок:"
     text = (
-        f"{plan_emoji} {hbold(plan['name'])}\n{plan['desc']}\n"
+        f"{title}{plan['desc']}\n"
         f"{await get_price_month(plan_key)} руб./мес.\n\n"
         f"Дополнительные устройства и трафик 📶 "
         f"докупаются {where} после покупки.\n\n"
-        f"{EMOJI_CHOOSE_TERM} Выберите срок:"
+        f"{choose}"
     )
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -8981,6 +9010,8 @@ async def expiry_reminder_scheduler():
 async def main():
     await init_db()
     await load_extra_admins()
+    if _WL_ID:
+        bot.session.middleware(WlEmojiMiddleware())
     dp.include_router(router)
     asyncio.create_task(daily_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
