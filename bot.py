@@ -5946,8 +5946,7 @@ def admin_panel_kb(is_main: bool = False):
         [InlineKeyboardButton(text="Рефералы", callback_data="admin_referrals"),
          InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast_start")],
         [InlineKeyboardButton(text="Настройки", callback_data="admin_settings"),
-         (InlineKeyboardButton(text="Поступления", callback_data="admin_income") if SINGLE_PLAN
-          else InlineKeyboardButton(text="Platega", callback_data="admin_platega"))],
+         InlineKeyboardButton(text="Поступления", callback_data="admin_income")],
     ]
     if is_main:
         rows.append([InlineKeyboardButton(text="Админы", callback_data="admin_admins")])
