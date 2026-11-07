@@ -467,6 +467,14 @@ class WlEmojiMiddleware(_BRM):
                     val = getattr(method, field, None)
                     if isinstance(val, str):
                         setattr(method, field, _wl_html(val))
+            # в тексте кнопки свой эмодзи нельзя — убираем 📶, иконку даёт BTN_ICON_*
+            mk = getattr(method, "reply_markup", None)
+            if isinstance(mk, InlineKeyboardMarkup) and any(
+                    "\U0001f4f6" in (bt.text or "") for row in mk.inline_keyboard for bt in row):
+                method.reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [bt.model_copy(update={"text": (re.sub(r"\s*\(\s*\U0001f4f6\s*\)|\s*\U0001f4f6", "",
+                                                           bt.text).strip() or bt.text)})
+                     for bt in row] for row in mk.inline_keyboard])
         except Exception:
             pass
         return await make_request(bot, method)
