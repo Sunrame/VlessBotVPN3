@@ -451,6 +451,13 @@ HIDE_PLAN_LINE = os.environ.get("HIDE_PLAN_LINE", "0").strip().lower() in ("1", 
 # подписки за каждого друга, который впервые оплатил подписку. Кнопка
 # «Заработать» тогда называется «Бесплатные дни».
 REFERRAL_DAYS = max(0, int(os.environ.get("REFERRAL_DAYS", "0") or 0))
+# BTN_STYLE_TRIAL — цвет кнопки «Пробная подписка»: success (зелёная),
+# primary (синяя), danger (красная).
+BTN_STYLE_TRIAL = os.environ.get("BTN_STYLE_TRIAL", "").strip() or "success"
+# PROFILE_TITLE_TEXT — жирная подпись в заголовке профиля (под эмодзи).
+PROFILE_TITLE_TEXT = os.environ.get("PROFILE_TITLE_TEXT", "").strip()
+if PROFILE_TITLE_TEXT:
+    PROFILE_TITLE = ((PROFILE_TITLE + "\n") if PROFILE_TITLE else "") + f"<b>{PROFILE_TITLE_TEXT}</b>"
 
 # ─────────────────────────────────────────────
 #  Технически невозможно вставить (кнопки Telegram не поддерживают формати-
@@ -3690,7 +3697,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     # напоминания об окончании (см. _renew_kb / renew_open).
     if not subscription_active or plan not in PLANS:
         if show_trial:
-            rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style="success",
+            rows.append([btn("Пробная подписка", emoji_id=BTN_ICON_TRIAL, style=BTN_STYLE_TRIAL,
                              callback_data="trial_buy")])
             # ЛК (и ссылка на админ-сайт для админов) — сразу под пробной подпиской
             _place_cabinet()
