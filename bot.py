@@ -440,6 +440,10 @@ for _name in [n for n in list(globals()) if n.startswith("EMOJI_") and isinstanc
     if _val and _m:
         globals()[_name] = premium_emoji(_val, _m.group(1))
 
+# EMOJI_WL_ID — свой эмодзи вместо 📶 (трафик белых списков) в текстах.
+_WL_ID = os.environ.get("EMOJI_WL_ID", "").strip()
+EMOJI_WL = premium_emoji(_WL_ID, "\U0001f4f6") if _WL_ID else "\U0001f4f6"
+
 # PROFILE_TITLE_EMOJI_IDS — заголовок профиля из своих эмодзи (через
 # запятую, выводятся подряд без пробелов) вместо «⭐ Профиль».
 _PROFILE_IDS = [x.strip() for x in os.environ.get("PROFILE_TITLE_EMOJI_IDS", "").split(",") if x.strip()]
@@ -3475,7 +3479,7 @@ async def _open_paysection_from_message(message: types.Message, state: FSMContex
             return True
         await state.set_state(WhitelistTopupState.waiting_gb)
         await message.answer(
-            f"{EMOJI_GB_TOPUP} Докупить трафик (📶)\n\n"
+            f"{EMOJI_GB_TOPUP} Докупить трафик ({EMOJI_WL})\n\n"
             f"Цена: {await get_gb_price()} руб. за 1 ГБ.\n"
             f"{await _qty_discount_hint('gb', 'ГБ')}\n"
             f"Введите, сколько ГБ хотите докупить:",
@@ -3629,7 +3633,7 @@ async def _build_profile_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 records   = await fetch_whitelist_daily_records(days_back=40)
                 used_gb   = sum_whitelist_bytes_for_user(records, user_id, wl_row["period_start"]) / 1024 ** 3
                 remaining = max(0.0, wl_row["gb_limit"] - used_gb)
-                gb_line = f"Осталось трафика 📶: {remaining:.1f}/{wl_row['gb_limit']} ГБ"
+                gb_line = f"Осталось трафика {EMOJI_WL}: {remaining:.1f}/{wl_row['gb_limit']} ГБ"
 
         if not HIDE_PLAN_LINE:
             lines.append(f"{EMOJI_PLAN_LABEL} Вариант подписки: {plan_name}")
@@ -5334,7 +5338,7 @@ async def sub_manage_cb(cb: CallbackQuery, state: FSMContext):
         f"Устройств: {remna.get('hwidDeviceLimit', plan_base_hwid(plan_key))}",
         f"{EMOJI_ACTIVE_UNTIL} Активна до: {fmt_dt(parse_dt(remna.get('expireAt')), '%d.%m.%Y')}",
         "",
-        f"Трафик 📶: {await get_gb_price()} руб. за 1 ГБ",
+        f"Трафик {EMOJI_WL}: {await get_gb_price()} руб. за 1 ГБ",
         f"Устройство: {await get_device_price(plan_key)} руб. за 1 шт.",
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -5439,7 +5443,7 @@ async def wl_topup_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(WhitelistTopupState.waiting_gb)
     await edit_screen(cb.message,
-        f"Докупить трафик (📶)\n\n"
+        f"Докупить трафик ({EMOJI_WL})\n\n"
         f"Цена: {await get_gb_price()} руб. за 1 ГБ.\n"
         f"{await _qty_discount_hint('gb', 'ГБ')}\n"
         f"Введите, сколько ГБ хотите докупить:",
