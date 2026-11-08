@@ -21,7 +21,7 @@ from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent,
     LabeledPrice, PreCheckoutQuery,
 )
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 # ЮKassa убрана из потока покупки (приём оплаты отключён, см.
 # PAYMENTS_ENABLED ниже). Импорт необязательный: библиотеку можно убрать
@@ -839,6 +839,7 @@ class PromoState(StatesGroup):
 class BroadcastState(StatesGroup):
     waiting_text = State()
     confirming   = State()
+    waiting_gift = State()
 
 class AdminPromoState(StatesGroup):
     waiting_input = State()
@@ -1037,6 +1038,26 @@ async def init_db():
         # Цены тарифов и скидки за срок. Таблица общая с админ-сайтом:
         # правка цен в любой из панелей действует и в боте, и в кабинете.
         await conn.execute(PRICING_CREATE_TABLE_SQL)
+        # Подарочные кнопки в рассылках: сколько дней, срок действия, кто забрал.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS gifts (
+                id          SERIAL PRIMARY KEY,
+                days        INTEGER NOT NULL,
+                button_text TEXT,
+                created_at  BIGINT,
+                expires_at  BIGINT DEFAULT 0,
+                created_by  BIGINT,
+                active      BOOLEAN DEFAULT TRUE
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS gift_claims (
+                gift_id    INTEGER,
+                user_id    BIGINT,
+                claimed_at BIGINT,
+                PRIMARY KEY (gift_id, user_id)
+            )
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS whitelist_limits (
                 user_id      BIGINT PRIMARY KEY,
@@ -2110,6 +2131,9 @@ async def terms_gate_passed(event) -> bool:
     if isinstance(event, CallbackQuery):
         await safe_answer(event, "Сначала примите условия.", show_alert=True)
         try:
+            if (event.data or "").startswith("gift:"):
+                # кнопка подарка остаётся в рассылке — после этого шага её можно нажать ещё раз
+                raise RuntimeError("keep gift message")
             await edit_screen(event.message, text, parse_mode="HTML", reply_markup=kb)
         except Exception:
             try:
@@ -2137,6 +2161,9 @@ async def sub_gate_passed(event) -> bool:
     if isinstance(event, CallbackQuery):
         await safe_answer(event, "Сначала подпишитесь на канал.", show_alert=True)
         try:
+            if (event.data or "").startswith("gift:"):
+                # кнопка подарка остаётся в рассылке — после этого шага её можно нажать ещё раз
+                raise RuntimeError("keep gift message")
             await edit_screen(event.message, text, parse_mode="HTML", reply_markup=kb)
         except Exception:
             try:
@@ -7101,26 +7128,115 @@ async def broadcast_cancel2(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Рассылка отменена.")
 
-@router.message(BroadcastState.waiting_text)
-async def broadcast_preview(message: types.Message, state: FSMContext):
-    await state.update_data(broadcast_text=message.text)
-    await state.set_state(BroadcastState.confirming)
+GIFT_HELP = (
+    "Кнопка подарка\n\n"
+    "Пришлите одной строкой: <b>текст кнопки | сколько дней дарим | сколько дней действует</b>\n"
+    "Пример: <code>🎁 Забрать 5 дней бесплатно | 5 | 7</code>\n\n"
+    "Последнее число можно не писать — тогда подарок бессрочный. "
+    "Кнопка будет зелёной, каждый человек может забрать подарок один раз."
+)
+
+
+def _gift_kb(text: str, gift_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        btn(text, style="success", callback_data=f"gift:{gift_id}")]])
+
+
+async def _broadcast_show_preview(message: types.Message, state: FSMContext):
+    """Показывает рассылку ровно так, как её увидят люди, и пульт управления."""
+    data = await state.get_data()
+    text_body = data.get("broadcast_text", "")
+    gift = data.get("broadcast_gift")
+    try:
+        await message.answer(text_body, parse_mode="HTML",
+                             reply_markup=_gift_kb(gift["text"], "preview") if gift else None)
+    except Exception as e:
+        await message.answer(f"Не получилось показать предпросмотр: {e}")
+    if gift:
+        exp = f", действует {gift['valid_days']} дн." if gift.get("valid_days") else ", бессрочно"
+        gift_line = f"Подарок: +{gift['days']} дн.{exp}"
+        gift_btn = InlineKeyboardButton(text="Убрать кнопку подарка", callback_data="bc_gift_del")
+    else:
+        gift_line = "Без кнопки подарка."
+        gift_btn = InlineKeyboardButton(text="🎁 Добавить кнопку подарка", callback_data="bc_gift_add")
     await message.answer(
-        f"Предпросмотр:\n\n{message.text}\n\nПодтвердите:",
+        f"Это предпросмотр рассылки (сообщение выше).\n{gift_line}\n\nПодтвердите:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [gift_btn],
             [InlineKeyboardButton(text="Разослать всем", callback_data="bc_confirm")],
             [InlineKeyboardButton(text="Разослать подписчикам", callback_data="bc_confirm_subs")],
             [InlineKeyboardButton(text="Отмена", callback_data="bc_cancel")],
         ]),
     )
 
+
+@router.message(BroadcastState.waiting_text)
+async def broadcast_preview(message: types.Message, state: FSMContext):
+    # html_text сохраняет жирный/курсив/ссылки, которые админ набрал в Telegram
+    body = message.html_text if (message.text or message.caption) else ""
+    if not body:
+        await message.answer("Нужен текст сообщения.")
+        return
+    await state.update_data(broadcast_text=body)
+    await state.set_state(BroadcastState.confirming)
+    await _broadcast_show_preview(message, state)
+
+
+@router.callback_query(F.data == "bc_gift_add")
+async def broadcast_gift_add(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.set_state(BroadcastState.waiting_gift)
+    await cb.message.answer(GIFT_HELP, parse_mode="HTML", reply_markup=cancel_kb())
+
+
+@router.callback_query(F.data == "bc_gift_del")
+async def broadcast_gift_del(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.update_data(broadcast_gift=None)
+    await state.set_state(BroadcastState.confirming)
+    await _broadcast_show_preview(cb.message, state)
+
+
+@router.message(BroadcastState.waiting_gift)
+async def broadcast_gift_input(message: types.Message, state: FSMContext):
+    parts = [x.strip() for x in (message.text or "").split("|")]
+    try:
+        text = parts[0]
+        days = int(parts[1])
+        valid_days = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+        if not text or len(text) > 60 or not (1 <= days <= 365) or not (0 <= valid_days <= 365):
+            raise ValueError
+    except Exception:
+        await message.answer("Не понял формат. " + GIFT_HELP, parse_mode="HTML", reply_markup=cancel_kb())
+        return
+    await state.update_data(broadcast_gift={"text": text, "days": days, "valid_days": valid_days})
+    await state.set_state(BroadcastState.confirming)
+    await _broadcast_show_preview(message, state)
+
+
 async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = False):
     data = await state.get_data()
     text_body = data.get("broadcast_text", "")
+    gift = data.get("broadcast_gift")
     await state.clear()
     if not text_body:
         await safe_answer(cb, "Текст не найден.", show_alert=True)
         return
+    kb = None
+    gift_id = None
+    if gift:
+        now = int(time.time())
+        exp = now + int(gift.get("valid_days") or 0) * 86400 if gift.get("valid_days") else 0
+        async with pool.acquire() as conn:
+            gift_id = await conn.fetchval(
+                "INSERT INTO gifts (days, button_text, created_at, expires_at, created_by) "
+                "VALUES ($1,$2,$3,$4,$5) RETURNING id",
+                int(gift["days"]), gift["text"], now, exp, cb.from_user.id)
+        kb = _gift_kb(gift["text"], gift_id)
     await edit_screen(cb.message, "Рассылка запущена...")
     async with pool.acquire() as conn:
         if subs_only:
@@ -7130,12 +7246,104 @@ async def _do_broadcast(cb: CallbackQuery, state: FSMContext, subs_only: bool = 
     ok = fail = 0
     for row in users:
         try:
-            await bot.send_message(row["user_id"], text_body)
+            await bot.send_message(row["user_id"], text_body, parse_mode="HTML", reply_markup=kb)
             ok += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.send_message(row["user_id"], text_body, parse_mode="HTML", reply_markup=kb)
+                ok += 1
+            except Exception:
+                fail += 1
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-    await edit_screen(cb.message, f"Готово.\nОтправлено: {ok} · Ошибок: {fail}")
+    extra = f"\nПодарок #{gift_id}: статистика — /gifts" if gift_id else ""
+    await edit_screen(cb.message, f"Готово.\nОтправлено: {ok} · Ошибок: {fail}{extra}")
+
+
+@router.callback_query(F.data.startswith("gift:"))
+async def gift_claim_cb(cb: CallbackQuery):
+    raw = cb.data.split(":", 1)[1]
+    if raw == "preview":
+        await safe_answer(cb, "Это предпросмотр — кнопка заработает в рассылке.", show_alert=True)
+        return
+    try:
+        gift_id = int(raw)
+    except ValueError:
+        await safe_answer(cb)
+        return
+    uid = cb.from_user.id
+    now = int(time.time())
+    async with pool.acquire() as conn:
+        g = await conn.fetchrow("SELECT * FROM gifts WHERE id=$1", gift_id)
+        if not g or not g["active"]:
+            await safe_answer(cb, "Этот подарок больше не действует.", show_alert=True)
+            return
+        if g["expires_at"] and now > g["expires_at"]:
+            await safe_answer(cb, "Срок подарка закончился.", show_alert=True)
+            return
+        got = await conn.fetchval(
+            "INSERT INTO gift_claims (gift_id, user_id, claimed_at) VALUES ($1,$2,$3) "
+            "ON CONFLICT DO NOTHING RETURNING gift_id", gift_id, uid, now)
+    if not got:
+        await safe_answer(cb, "Вы уже забрали этот подарок.", show_alert=True)
+        return
+    days = int(g["days"])
+    user = await activate_subscription(uid, days)
+    if not user:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM gift_claims WHERE gift_id=$1 AND user_id=$2", gift_id, uid)
+        await safe_answer(cb, "Не получилось начислить дни. Попробуйте чуть позже.", show_alert=True)
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO payments (user_id, amount, tariff_key, days, is_trial, source, note, created_at) "
+            "VALUES ($1,0,'gift',$2,FALSE,'gift',$3,$4)", uid, days, f"gift#{gift_id}", now)
+    await safe_answer(cb, f"Готово! +{days} дн.")
+    text, kb = await _build_profile_view(uid)
+    await cb.message.answer(f"🎁 Подарок получен — добавлено {days} дн.\n\n{text}",
+                            parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(Command("gifts"))
+async def gifts_stats(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT g.id, g.days, g.button_text, g.created_at, g.expires_at, g.active, "
+            "(SELECT COUNT(*) FROM gift_claims c WHERE c.gift_id=g.id) AS claims, "
+            "(SELECT COUNT(DISTINCT p.user_id) FROM payments p WHERE p.amount>0 "
+            " AND p.created_at > g.created_at AND p.user_id IN "
+            " (SELECT user_id FROM gift_claims c2 WHERE c2.gift_id=g.id)) AS paid "
+            "FROM gifts g ORDER BY g.id DESC LIMIT 10")
+    if not rows:
+        await message.answer("Подарков ещё не было.")
+        return
+    lines = ["Подарки из рассылок:\n"]
+    for r in rows:
+        exp = f"до {fmt_dt(r['expires_at'])}" if r["expires_at"] else "бессрочно"
+        state = "" if r["active"] else " (выключен)"
+        lines.append(f"#{r['id']} «{r['button_text']}» — +{r['days']} дн., {exp}{state}\n"
+                     f"   забрали: {r['claims']} · потом оплатили: {r['paid']}")
+    lines.append("\nВыключить подарок: /gift_off номер")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("gift_off"))
+async def gift_off(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        gid = int((message.text or "").split()[1])
+    except Exception:
+        await message.answer("Формат: /gift_off номер")
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE gifts SET active=FALSE WHERE id=$1", gid)
+    await message.answer(f"Подарок #{gid} выключен.")
+
 
 @router.callback_query(F.data == "bc_confirm")
 async def broadcast_confirm(cb: CallbackQuery, state: FSMContext):
