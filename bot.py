@@ -19,7 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode, hbold
 from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent,
-    LabeledPrice, PreCheckoutQuery,
+    LabeledPrice, PreCheckoutQuery, BufferedInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
@@ -6007,7 +6007,7 @@ async def info_tab(cb: CallbackQuery):
 def admin_panel_kb(is_main: bool = False):
     rows = [
         [InlineKeyboardButton(text="Статистика", callback_data="admin_stats"),
-         InlineKeyboardButton(text="Отчёт", callback_data="admin_report")],
+         InlineKeyboardButton(text="Отчёт за неделю", callback_data="admin_report")],
         [InlineKeyboardButton(text="Подписчики", callback_data="admin_subs"),
          InlineKeyboardButton(text="Выдать", callback_data="admin_give_start")],
         [InlineKeyboardButton(text="Найти юзера", callback_data="admin_find_start"),
@@ -7540,8 +7540,8 @@ async def admin_report_cb(cb: CallbackQuery):
     await safe_answer(cb)
     if not is_admin(cb.from_user.id):
         return
-    await edit_screen(cb.message, "Формирую отчёт...")
-    await send_daily_report()
+    await edit_screen(cb.message, "Формирую недельный отчёт...")
+    await send_weekly_report(only_to=cb.from_user.id)
     await edit_screen(cb.message, "Отчёт отправлен в личные сообщения.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
     ]))
@@ -9038,57 +9038,198 @@ async def admin_wl_traffic_cb(cb: CallbackQuery):
     await edit_screen(cb.message, text, reply_markup=back_kb_)
 
 # ─────────────────────────────────────────────
-#  ЕЖЕДНЕВНЫЙ ОТЧЁТ
+#  ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ (воскресенье, 21:00 МСК) С ГРАФИКОМ
 # ─────────────────────────────────────────────
-async def send_daily_report():
-    now       = int(time.time())
-    date      = msk_now().strftime("%d.%m.%Y")
-    day_start = int(msk_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+WEEKLY_REPORT_WEEKDAY = 6   # 0 = понедельник … 6 = воскресенье
+WEEKLY_REPORT_HOUR    = 21  # по Москве
+_WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+async def _collect_week_stats() -> dict:
+    """Статистика за 7 дней по Москве: сегодня и шесть предыдущих дней,
+    плюс итоги такой же недели перед ней для сравнения."""
+    now_msk   = msk_now()
+    today     = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start = [today - timedelta(days=6 - i) for i in range(7)]
+    week_from = int(day_start[0].timestamp())
+    prev_from = int((day_start[0] - timedelta(days=7)).timestamp())
+    now_ts    = int(time.time())
+
+    async with pool.acquire() as conn:
+        pays  = await conn.fetch(
+            "SELECT created_at, is_trial, amount FROM payments WHERE created_at>=$1", prev_from)
+        users = await conn.fetch(
+            "SELECT created_at FROM users WHERE created_at>=$1", prev_from)
+        total_paid = await conn.fetchval("SELECT COUNT(*) FROM users WHERE has_paid=1") or 0
+
+    def bucket(ts: int) -> int:
+        if ts < week_from:
+            return -1
+        return min(6, (ts - week_from) // 86400)
+
+    days = [{"date": d, "revenue": 0.0, "paid": 0, "trials": 0, "new_users": 0} for d in day_start]
+    prev = {"revenue": 0.0, "paid": 0, "trials": 0, "new_users": 0}
+    for p in pays:
+        ts = int(p["created_at"] or 0)
+        amount = float(p["amount"] or 0)
+        target = days[bucket(ts)] if ts >= week_from else prev
+        target["revenue"] += amount
+        if amount > 0:
+            target["paid"] += 1
+        if p["is_trial"]:
+            target["trials"] += 1
+    for u in users:
+        ts = int(u["created_at"] or 0)
+        target = days[bucket(ts)] if ts >= week_from else prev
+        target["new_users"] += 1
+
+    all_users = await remna_get_all_users()
+    our    = [u for u in all_users if (u.get("username") or "").startswith(REMNA_USER_PREFIX)]
+    active = sum(1 for u in our if parse_dt(u.get("expireAt")) > now_ts and u.get("status") != "DISABLED")
+    return {"days": days, "prev": prev, "active": active, "total_paid": total_paid}
+
+
+def _render_week_chart(stats: dict) -> bytes | None:
+    """PNG-график недели: столбцы — поступления по дням, линия — оплаты."""
     try:
-        async with pool.acquire() as conn:
-            new_users  = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at>=$1", day_start) or 0
-            pay_rows   = await conn.fetch("SELECT is_trial, amount FROM payments WHERE created_at>=$1", day_start)
-            # Триал — такая же покупка: попадает и в оплаты, и в поступления.
-            # Выдачи админом и промо идут с amount=0, поэтому продажей не считаются.
-            new_trials = sum(1 for p in pay_rows if p["is_trial"])
-            new_paid   = sum(1 for p in pay_rows if float(p["amount"] or 0) > 0)
-            revenue    = sum(float(p["amount"] or 0) for p in pay_rows)
-            total_paid = await conn.fetchval("SELECT COUNT(*) FROM users WHERE has_paid=1") or 0
-        all_users = await remna_get_all_users()
-        our    = [u for u in all_users if (u.get("username") or "").startswith(REMNA_USER_PREFIX)]
-        active = sum(1 for u in our if parse_dt(u.get("expireAt")) > now and u.get("status") != "DISABLED")
-        report = (
-            f"Отчёт за {date} (МСК)\n\n"
-            f"Новых пользователей: {new_users}\n"
-            f"Новых триалов: {new_trials}\n"
-            f"Новых оплат: {new_paid}\n"
-            f"Поступления за день: {revenue:.2f} руб.\n\n"
-            f"Активных подписок: {active}\n"
-            f"Платили хоть раз: {total_paid}"
-        )
-        for admin_id in all_admin_ids():
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        log.warning("weekly chart: matplotlib недоступен: %r", e)
+        return None
+    days    = stats["days"]
+    labels  = [f"{_WEEKDAYS_RU[d['date'].weekday()]}\n{d['date'].strftime('%d.%m')}" for d in days]
+    revenue = [d["revenue"] for d in days]
+    paid    = [d["paid"] for d in days]
+    users   = [d["new_users"] for d in days]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=150)
+    bars = ax.bar(labels, revenue, color="#4C9AFF", width=0.6, label="Поступления, ₽")
+    for b, v in zip(bars, revenue):
+        if v > 0:
+            ax.annotate(f"{v:.0f}", (b.get_x() + b.get_width() / 2, b.get_height()),
+                        ha="center", va="bottom", fontsize=8, xytext=(0, 2),
+                        textcoords="offset points")
+    ax.set_ylabel("Поступления, ₽")
+    ax.set_ylim(0, max(revenue + [1]) * 1.2)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", alpha=0.25)
+
+    ax2 = ax.twinx()
+    ax2.plot(labels, paid, color="#2E7D32", marker="o", linewidth=2, label="Оплат")
+    ax2.plot(labels, users, color="#F59E0B", marker="s", linewidth=1.5,
+             linestyle="--", label="Новых пользователей")
+    ax2.set_ylim(0, max(paid + users + [1]) * 1.3)
+    ax2.set_ylabel("Штук")
+    ax2.spines[["top"]].set_visible(False)
+
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=8, frameon=False)
+    period = f"{days[0]['date'].strftime('%d.%m')}–{days[-1]['date'].strftime('%d.%m.%Y')}"
+    ax.set_title(f"{BRAND_NAME}: неделя {period}", fontsize=11)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _pct_change(cur: float, prev: float) -> str:
+    if prev <= 0:
+        return "новое" if cur > 0 else "без изменений"
+    pct = (cur - prev) / prev * 100
+    return f"{pct:+.0f}%"
+
+
+def _format_week_report(stats: dict, test: bool = False) -> str:
+    days, prev = stats["days"], stats["prev"]
+    revenue   = sum(d["revenue"] for d in days)
+    paid      = sum(d["paid"] for d in days)
+    trials    = sum(d["trials"] for d in days)
+    new_users = sum(d["new_users"] for d in days)
+    best      = max(days, key=lambda d: d["revenue"])
+    period    = f"{days[0]['date'].strftime('%d.%m')}–{days[-1]['date'].strftime('%d.%m.%Y')}"
+    lines = [
+        f"{'[ТЕСТ] ' if test else ''}{BRAND_NAME} — отчёт за неделю {period} (МСК)",
+        "",
+        f"Поступления: {revenue:.2f} руб. ({_pct_change(revenue, prev['revenue'])} к прошлой неделе, "
+        f"было {prev['revenue']:.2f})",
+        f"Оплат: {paid} ({_pct_change(paid, prev['paid'])})",
+        f"Новых пользователей: {new_users} ({_pct_change(new_users, prev['new_users'])})",
+        f"Новых триалов: {trials} ({_pct_change(trials, prev['trials'])})",
+    ]
+    if best["revenue"] > 0:
+        lines.append(f"Лучший день: {_WEEKDAYS_RU[best['date'].weekday()]} "
+                     f"{best['date'].strftime('%d.%m')} — {best['revenue']:.2f} руб.")
+    lines += [
+        "",
+        f"Активных подписок: {stats['active']}",
+        f"Платили хоть раз: {stats['total_paid']}",
+    ]
+    return "\n".join(lines)
+
+
+async def send_weekly_report(only_to: int | None = None, test: bool = False):
+    """Шлёт недельный отчёт с графиком всем админам (или одному — для теста)."""
+    try:
+        stats = await _collect_week_stats()
+        text  = _format_week_report(stats, test=test)
+        png   = await asyncio.to_thread(_render_week_chart, stats)
+        targets = [only_to] if only_to else all_admin_ids()
+        for admin_id in targets:
             try:
-                await bot.send_message(admin_id, report)
+                if png:
+                    await bot.send_photo(admin_id, BufferedInputFile(png, "week.png"), caption=text[:1024])
+                else:
+                    await bot.send_message(admin_id, text)
+            except Exception as e:
+                log.warning("weekly report to %s: %r", admin_id, e)
+    except Exception as e:
+        log.error("send_weekly_report error: %s", e)
+        if only_to:
+            try:
+                await bot.send_message(only_to, f"Не удалось собрать отчёт: {e}")
             except Exception:
                 pass
-    except Exception as e:
-        log.error("send_daily_report error: %s", e)
 
-async def daily_report_scheduler():
+
+def _next_weekly_report_at(now: datetime) -> datetime:
+    target = now.replace(hour=WEEKLY_REPORT_HOUR, minute=0, second=0, microsecond=0)
+    target += timedelta(days=(WEEKLY_REPORT_WEEKDAY - now.weekday()) % 7)
+    if target <= now:
+        target += timedelta(days=7)
+    return target
+
+
+async def weekly_report_scheduler():
     while True:
         now    = msk_now()
-        target = now.replace(hour=23, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
+        target = _next_weekly_report_at(now)
+        log.info("Следующий недельный отчёт: %s", target.strftime("%d.%m.%Y %H:%M МСК"))
         await asyncio.sleep((target - now).total_seconds())
-        await send_daily_report()
+        await send_weekly_report()
+        await asyncio.sleep(60)
 
-@router.message(Command("report"))
+
+@router.message(Command("report", "week_report"))
 async def admin_report_cmd(message: types.Message):
+    """Недельный отчёт сейчас — во все админы."""
     if not is_admin(message.from_user.id):
         return
-    await message.answer("Формирую отчёт...")
-    await send_daily_report()
+    await message.answer("Формирую недельный отчёт...")
+    await send_weekly_report()
+
+
+@router.message(Command("test_report"))
+async def admin_test_report_cmd(message: types.Message):
+    """Тестовый недельный отчёт — только тому, кто вызвал команду."""
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Формирую тестовый недельный отчёт...")
+    await send_weekly_report(only_to=message.from_user.id, test=True)
 
 # ─────────────────────────────────────────────
 #  MAIN
@@ -9229,7 +9370,7 @@ async def main():
     if _WL_ID:
         bot.session.middleware(WlEmojiMiddleware())
     dp.include_router(router)
-    asyncio.create_task(daily_report_scheduler())
+    asyncio.create_task(weekly_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
     asyncio.create_task(expiry_reminder_scheduler())
     asyncio.create_task(naloggo_queue_scheduler())
