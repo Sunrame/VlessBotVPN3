@@ -9,3 +9,4 @@ yookassa==3.5.0
 aiogram>=3.29.0
 asyncpg
 httpx
+matplotlib>=3.9
