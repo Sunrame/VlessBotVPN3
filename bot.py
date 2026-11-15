@@ -2187,6 +2187,10 @@ async def is_admin_sale_notify(admin_id: int) -> bool:
 
 async def notify_admins_sale(u_id: int, username: str | None, item_name: str,
                               days: int, price: float, is_trial: bool):
+    # Админам сообщаем только о покупках с деньгами: пробные подписки
+    # и бесплатные активации (промо на 100% и т.п.) не присылаем.
+    if is_trial or float(price or 0) <= 0:
+        return
     uname = f"@{username}" if username else f"ID:{u_id}"
     kind  = "Триал" if is_trial else "Оплата"
     now_str = fmt_dt(int(time.time()))
