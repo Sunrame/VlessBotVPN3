@@ -7,6 +7,7 @@ import secrets
 import logging
 import time
 import asyncio
+import html
 import asyncpg
 import httpx
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,7 @@ from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, WebAppInfo, ErrorEvent,
     LabeledPrice, PreCheckoutQuery, BufferedInputFile,
 )
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramForbiddenError
 
 # ЮKassa убрана из потока покупки (приём оплаты отключён, см.
 # PAYMENTS_ENABLED ниже). Импорт необязательный: библиотеку можно убрать
@@ -1302,6 +1303,26 @@ async def init_db():
             await conn.execute("ALTER TABLE user_activity ADD COLUMN seen BOOLEAN DEFAULT FALSE")
         except Exception:
             pass
+        # Возврат ушедших (winback): состояние цепочки у пользователя и журнал.
+        for col in ("trial_extended BOOLEAN DEFAULT FALSE", "blocked BOOLEAN DEFAULT FALSE",
+                    "winback_step INTEGER DEFAULT 0", "winback_sent_at BIGINT DEFAULT 0",
+                    "winback_expire_ts BIGINT DEFAULT 0", "winback_stopped BOOLEAN DEFAULT FALSE",
+                    "winback_bonus_at BIGINT DEFAULT 0", "winback_gift_until BIGINT DEFAULT 0",
+                    "winback_gift_kind TEXT", "winback_reason TEXT",
+                    "winback_offer_until BIGINT DEFAULT 0", "winback_gift_ok_until BIGINT DEFAULT 0"):
+            await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col}")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS winback_log (
+                id         BIGSERIAL PRIMARY KEY,
+                user_id    BIGINT,
+                event      TEXT,
+                step       INTEGER DEFAULT 0,
+                detail     TEXT,
+                created_at BIGINT DEFAULT 0
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS winback_log_created_idx ON winback_log (created_at)")
         try:
             await conn.execute("""
                 CREATE OR REPLACE FUNCTION trubavpn_log_promo_activity()
@@ -4707,6 +4728,8 @@ async def _fulfill_purchase(*, pay_id: str, u_id: int, kind: str, days: int = 0,
                     "UPDATE users SET plan=$1, has_paid=1, remna_uuid=$2 WHERE user_id=$3",
                     plan_key, _remna_ref_str(result_user), u_id,
                 )
+        if kind == "plan":
+            await winback_on_paid(u_id)
 
     elif kind == "device":
         remna = await remna_get_user(u_id)
@@ -6026,6 +6049,7 @@ def admin_panel_kb(is_main: bool = False):
          InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast_start")],
         [InlineKeyboardButton(text="Настройки", callback_data="admin_settings"),
          InlineKeyboardButton(text="Поступления", callback_data="admin_income")],
+        [InlineKeyboardButton(text="Возврат ушедших", callback_data="admin_wb")],
     ]
     if is_main:
         rows.append([InlineKeyboardButton(text="Админы", callback_data="admin_admins")])
@@ -9368,6 +9392,849 @@ async def expiry_reminder_scheduler():
         await asyncio.sleep(15 * 60)
 
 
+# ─────────────────────────────────────────────
+#  ВОЗВРАТ УШЕДШИХ (winback)
+#
+#  Короткие автоматические цепочки для тех, у кого закончилась подписка.
+#
+#  Триал (ни разу не платил):
+#    шаг 1 — через 1 день после конца: «дарим ещё 3 дня» (без БС, один раз
+#            на аккаунт, флаг trial_extended);
+#    шаг 2 — когда подарочные дни закончились: «вот тарифы». Дальше тишина.
+#  Платник (платил хотя бы раз):
+#    шаг 1 — через 2 дня после конца: опрос «почему ушёл» (4 кнопки);
+#    шаг 2 — через 14 дней после конца: «давно не виделись» + 3 дня или,
+#            если уже брал 3 дня по «Плохо работало», 3 месяца со скидкой.
+#            Не шлём тем, кто ответил «Больше не нужен». Дальше тишина.
+#
+#  Время отсчитывается от конца подписки, на которой цепочка началась
+#  (winback_expire_ts) — подарочные дни отсчёт не сдвигают. Оплата
+#  сбрасывает цепочку. Подарочные дни не чаще раза в 90 дней.
+#  Сообщения уходят только с 12:00 до 21:00 МСК и только после того, как
+#  админ нажал «Запустить» в админ-панели. Если человек заблокировал бота
+#  (403), ставим blocked и больше ему не пишем.
+#  Всё, что происходит, пишется в winback_log — это статистика: какой шаг
+#  сработал, почему уходят, кто заблокировал.
+# ─────────────────────────────────────────────
+WB_KEY_ENABLED    = "winback_enabled"
+WB_KEY_ENABLED_AT = "winback_enabled_at"
+WB_KEY_NEWS       = "winback_news"
+WB_KEY_DISCOUNT   = "winback_discount3"
+
+WB_DEFAULT_DISCOUNT = 15          # скидка «за возвращение» на 3 месяца, %
+WB_GIFT_DAYS        = 3
+WB_GIFT_COOLDOWN    = 90 * 86400  # подарочные дни не чаще раза в 90 дней
+WB_OFFER_TTL        = 7 * 86400   # сколько живёт предложение после сообщения
+WB_TRIAL_DELAY      = 1 * 86400   # триал: шаг 1 через сутки после конца
+WB_PAID_DELAY_1     = 2 * 86400   # платник: опрос через 2 дня
+WB_PAID_DELAY_2     = 14 * 86400  # платник: последнее сообщение через 14 дней
+WB_MAX_PER_TICK     = 200         # не больше сообщений за один проход
+WB_HOURS_MSK        = (12, 21)    # окно отправки по Москве
+
+WB_REASON_LABELS = {"expensive": "Дорого", "bad": "Плохо работало", "no": "Больше не нужен"}
+
+_WB_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]+")
+
+
+class WinbackState(StatesGroup):
+    news     = State()
+    discount = State()
+
+
+def _wb_plain(text: str) -> str:
+    """Название без эмодзи: в сообщениях возврата эмодзи не используем."""
+    text = (text or "").replace("\U0001F4F6", "БС")  # значок обхода БС в названиях тарифов
+    return re.sub(r"\s{2,}", " ", _WB_EMOJI_RE.sub("", text)).strip()
+
+
+async def _wb_settings() -> dict:
+    data = await get_bot_settings([WB_KEY_ENABLED, WB_KEY_ENABLED_AT,
+                                   WB_KEY_NEWS, WB_KEY_DISCOUNT])
+    try:
+        pct = int(data.get(WB_KEY_DISCOUNT) or WB_DEFAULT_DISCOUNT)
+    except ValueError:
+        pct = WB_DEFAULT_DISCOUNT
+    try:
+        enabled_at = int(data.get(WB_KEY_ENABLED_AT) or 0)
+    except ValueError:
+        enabled_at = 0
+    return {
+        "enabled":    _setting_on(data.get(WB_KEY_ENABLED)),
+        "enabled_at": enabled_at,
+        "news":       (data.get(WB_KEY_NEWS) or "").strip(),
+        "discount":   max(0, min(90, pct)),
+    }
+
+
+async def _wb_log(user_id: int, event: str, step: int = 0, detail: str = "") -> None:
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO winback_log (user_id, event, step, detail, created_at) "
+                "VALUES ($1,$2,$3,$4,$5)",
+                user_id, event, step, detail[:200], int(time.time()))
+    except Exception as e:
+        log.error("winback_log %s: %s", user_id, e)
+
+
+def _wb_plan_key(plan) -> str:
+    """Тариф, по которому считаем «3 месяца»: тот, что был у человека."""
+    if plan in PLANS and (not SINGLE_PLAN or plan == SINGLE_PLAN_KEY):
+        return plan
+    return SINGLE_PLAN_KEY if SINGLE_PLAN else "vpn_bypass"
+
+
+async def _wb_price3(plan_key: str) -> tuple[int, int, int, int]:
+    """(к оплате за 3 мес., за месяц, полная цена 3 мес., итоговая скидка %).
+
+    Скидка «за возвращение» считается от полной цены, но итог не дороже
+    обычной цены за 3 месяца со скидкой за срок и не ниже общего потолка
+    суммарной скидки."""
+    pct  = (await _wb_settings())["discount"]
+    full = await calc_plan_full_price(plan_key, 3)
+    term = await calc_plan_price(plan_key, 3)
+    final = cap_total_discount(full, min(term, _apply_pct(full, pct)))
+    eff = effective_discount(full, final) if full else 0
+    return final, int(round(final / 3)), full, eff
+
+
+def _wb_bs_line() -> str:
+    if SINGLE_PLAN:
+        return "Обход белых списков включён в тариф."
+    return f"Обход белых списков есть в тарифе «{_wb_plain(PLANS['vpn_bypass']['name'])}»."
+
+
+# ── Тексты: одни и те же для настоящей отправки и для теста ───────────
+def _wb_test_prefix(test: bool) -> str:
+    return "[ТЕСТ] " if test else ""
+
+
+def _wb_kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t, callback_data=c) for t, c in row] for row in rows])
+
+
+async def wb_msg_trial_offer(test: bool = False):
+    p = "wbt_" if test else "wb_"
+    text = (
+        f"{_wb_test_prefix(test)}Привет! Пробный период в {BRAND_NAME} закончился.\n\n"
+        "Если не успел толком распробовать, дарим ещё 3 дня бесплатно. "
+        "Просто жми кнопку, всё заработает сразу.\n\n"
+        "В подарочные дни работают обычные сервера. "
+        "Обход белых списков доступен только в платной подписке."
+    )
+    return text, _wb_kb([[("Забрать 3 дня", f"{p}gift_t")]])
+
+
+async def wb_msg_trial_gift_over(test: bool = False):
+    text = (
+        f"{_wb_test_prefix(test)}Дополнительные дни закончились. "
+        f"Если хочешь остаться, вот тарифы. {_wb_bs_line()}"
+    )
+    return text, _wb_kb([[("Тарифы", "wbt_tariffs" if test else "buy_open")]])
+
+
+async def wb_msg_paid_survey(test: bool = False):
+    p = "wbt_" if test else "wb_"
+    text = (
+        f"{_wb_test_prefix(test)}Привет! Подписка {BRAND_NAME} закончилась пару дней назад.\n\n"
+        "Если просто забыл, продлить можно в один клик, ключ останется тем же.\n\n"
+        "А если ушёл из-за чего-то, скажи почему. Это правда помогает нам стать лучше."
+    )
+    return text, _wb_kb([
+        [("Продлить", "wbt_renew" if test else "renew_open")],
+        [("Дорого", f"{p}r_expensive"), ("Плохо работало", f"{p}r_bad")],
+        [("Больше не нужен", f"{p}r_no")],
+    ])
+
+
+async def wb_msg_paid_last(plan_key: str, *, gift: bool, test: bool = False):
+    p = "wbt_" if test else "wb_"
+    news = (await _wb_settings())["news"]
+    news_part = f"{html.escape(news)}\n\n" if news else ""
+    head = f"{_wb_test_prefix(test)}Привет! Давно не виделись.\n\n{news_part}"
+    if gift:
+        text = head + ("Если захочешь вернуться, вот 3 дня бесплатно, "
+                       "чтобы проверить, как сейчас работает.")
+        return text, _wb_kb([[("Забрать 3 дня", f"{p}gift_p")]])
+    final, per_month, _, _ = await _wb_price3(plan_key)
+    text = head + (f"Если захочешь вернуться, вот вариант выгоднее: 3 месяца за {final} руб., "
+                   f"это {per_month} руб. в месяц.")
+    return text, _wb_kb([[("Взять 3 месяца", f"{p}take3")]])
+
+
+async def wb_reply_expensive(plan_key: str, test: bool = False):
+    p = "wbt_" if test else "wb_"
+    final, per_month, _, _ = await _wb_price3(plan_key)
+    text = (f"{_wb_test_prefix(test)}Понял. Тогда вот вариант выгоднее: "
+            f"3 месяца за {final} руб., это {per_month} руб. в месяц.")
+    return text, _wb_kb([[("Взять 3 месяца", f"{p}take3")]])
+
+
+def wb_reply_bad(*, gift: bool, test: bool = False):
+    p = "wbt_" if test else "wb_"
+    text = (f"{_wb_test_prefix(test)}Жаль, что так вышло. Напиши в @{SUPPORT_USERNAME}, "
+            "что именно не работало, разберёмся.")
+    if not gift:
+        return text, None
+    text += " А чтобы ты сам проверил, дарим 3 дня бесплатно."
+    return text, _wb_kb([[("Забрать 3 дня", f"{p}gift_p")]])
+
+
+def wb_reply_no(test: bool = False):
+    return (f"{_wb_test_prefix(test)}Понял, больше не побеспокоим. "
+            "Если снова понадобится, бот на месте."), None
+
+
+# ── Отправка ──────────────────────────────────────────────────────────
+async def _wb_send(user_id: int, text: str, kb) -> str:
+    """'ok' | 'blocked' | 'error'. При 403 помечает человека blocked."""
+    for attempt in range(2):
+        try:
+            await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=kb,
+                                   disable_web_page_preview=True)
+            return "ok"
+        except TelegramForbiddenError:
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE users SET blocked=TRUE WHERE user_id=$1", user_id)
+            return "blocked"
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(60, int(getattr(e, "retry_after", 5)) + 1))
+        except TelegramBadRequest as e:
+            if "chat not found" in str(e).lower() or "user is deactivated" in str(e).lower():
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE users SET blocked=TRUE WHERE user_id=$1", user_id)
+                return "blocked"
+            log.error("winback send %s: %s", user_id, e)
+            return "error"
+        except Exception as e:
+            log.error("winback send %s: %s", user_id, e)
+            return "error"
+    return "error"
+
+
+def _wb_in_hours() -> bool:
+    h = msk_now().hour
+    return WB_HOURS_MSK[0] <= h < WB_HOURS_MSK[1]
+
+
+async def _wb_candidates() -> list[dict]:
+    """Пользователи ЭТОГО бота, у которых подписка закончилась.
+    [{user_id, expire_ts, ...поля из users}]"""
+    remna_users = await remna_get_all_users()
+    now = int(time.time())
+    expired: dict[int, int] = {}
+    for ru in remna_users:
+        uname = str(ru.get("username") or "")
+        if not uname.startswith(REMNA_USER_PREFIX):
+            continue
+        tail = uname[len(REMNA_USER_PREFIX):]
+        if not tail.isdigit():
+            continue
+        if (ru.get("status") or "").upper() == "DISABLED":
+            continue
+        exp = parse_dt(ru.get("expireAt"))
+        if exp and exp <= now:
+            expired[int(tail)] = int(exp)
+    if not expired:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, has_paid, plan, trial_used, trial_extended, blocked, "
+            "winback_step, winback_sent_at, winback_expire_ts, winback_stopped, "
+            "winback_bonus_at, winback_gift_until, winback_reason, winback_gift_kind "
+            "FROM users WHERE user_id = ANY($1::bigint[])", list(expired))
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["expire_ts"] = expired[r["user_id"]]
+        out.append(d)
+    return out
+
+
+def _wb_gift_allowed(u: dict, now: int) -> bool:
+    return not u.get("winback_bonus_at") or now - int(u["winback_bonus_at"]) >= WB_GIFT_COOLDOWN
+
+
+def _wb_next(u: dict, now: int, enabled_at: int):
+    """Что отправить человеку сейчас: (ключ_сообщения, новый_шаг) или None."""
+    if u.get("blocked") or u.get("winback_stopped"):
+        return None
+    step   = int(u.get("winback_step") or 0)
+    anchor = int(u.get("winback_expire_ts") or 0) or u["expire_ts"]
+    if not int(u.get("has_paid") or 0):
+        if step == 0:
+            # Подарок уже брал (или кулдаун) — первое сообщение не шлём,
+            # а значит и второе тоже: цепочка для него пустая.
+            if u.get("trial_extended") or not _wb_gift_allowed(u, now):
+                return None
+            if now >= max(anchor + WB_TRIAL_DELAY, enabled_at):
+                return "trial_offer", 1
+        elif step == 1:
+            gift_until = int(u.get("winback_gift_until") or 0)
+            if u.get("trial_extended") and gift_until and now >= gift_until:
+                return "trial_gift_over", 2
+        return None
+    if step == 0:
+        if now >= max(anchor + WB_PAID_DELAY_1, enabled_at):
+            return "paid_survey", 1
+    elif step == 1:
+        sent = int(u.get("winback_sent_at") or 0)
+        due = max(anchor + WB_PAID_DELAY_2, sent + (WB_PAID_DELAY_2 - WB_PAID_DELAY_1))
+        if now >= due:
+            return "paid_last", 2
+    return None
+
+
+async def _wb_build(key: str, u: dict, now: int):
+    if key == "trial_offer":
+        return await wb_msg_trial_offer()
+    if key == "trial_gift_over":
+        return await wb_msg_trial_gift_over()
+    if key == "paid_survey":
+        return await wb_msg_paid_survey()
+    # paid_last: если уже брал 3 дня по «Плохо работало» (или подарок на
+    # кулдауне) — дни не дарим, предлагаем 3 месяца.
+    gift = (u.get("winback_gift_kind") != "bad") and _wb_gift_allowed(u, now)
+    return await wb_msg_paid_last(_wb_plan_key(u.get("plan")), gift=gift)
+
+
+async def _run_winback(force: bool = False) -> int:
+    st = await _wb_settings()
+    if not st["enabled"] and not force:
+        return 0
+    if not _wb_in_hours():
+        return 0
+    now = int(time.time())
+    sent = 0
+    for u in await _wb_candidates():
+        if sent >= WB_MAX_PER_TICK:
+            break
+        nxt = _wb_next(u, now, st["enabled_at"])
+        if not nxt:
+            continue
+        key, new_step = nxt
+        text, kb = await _wb_build(key, u, now)
+        res = await _wb_send(u["user_id"], text, kb)
+        anchor = int(u.get("winback_expire_ts") or 0) or u["expire_ts"]
+        if res == "ok":
+            offer_until = 0
+            if key == "paid_last" and "take3" in str(kb):
+                offer_until = now + WB_OFFER_TTL
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE users SET winback_step=$1, winback_sent_at=$2, winback_expire_ts=$3, "
+                    "winback_offer_until=GREATEST(winback_offer_until, $4), "
+                    "winback_gift_ok_until=CASE WHEN $5 THEN $6 ELSE winback_gift_ok_until END "
+                    "WHERE user_id=$7",
+                    new_step, now, anchor, offer_until,
+                    key in ("trial_offer",) or (key == "paid_last" and "gift_p" in str(kb)),
+                    now + WB_OFFER_TTL, u["user_id"])
+            await _wb_log(u["user_id"], f"sent:{key}", new_step)
+            sent += 1
+        elif res == "blocked":
+            await _wb_log(u["user_id"], "blocked", new_step, key)
+        await asyncio.sleep(0.1)
+    if sent:
+        log.info("winback: отправлено %s сообщений", sent)
+    return sent
+
+
+async def winback_scheduler():
+    """Раз в час: кому пора следующий шаг цепочки возврата."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await _run_winback()
+        except Exception as e:
+            log.error("winback_scheduler: %s", e)
+        await asyncio.sleep(60 * 60)
+
+
+async def winback_on_paid(u_id: int) -> None:
+    """Оплата сбрасывает цепочку. В лог пишем, после какого шага оплатил."""
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT winback_step, has_paid FROM users WHERE user_id=$1", u_id)
+            if row and int(row["winback_step"] or 0) > 0:
+                await _wb_log(u_id, "paid", int(row["winback_step"]))
+            await conn.execute(
+                "UPDATE users SET winback_step=0, winback_sent_at=0, winback_expire_ts=0, "
+                "winback_stopped=FALSE, winback_offer_until=0, winback_gift_ok_until=0, "
+                "winback_gift_kind=NULL, winback_gift_until=0 WHERE user_id=$1", u_id)
+    except Exception as e:
+        log.error("winback_on_paid %s: %s", u_id, e)
+
+
+# ── Кнопки в настоящих сообщениях ─────────────────────────────────────
+async def _wb_user(u_id: int):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT has_paid, plan, trial_extended, winback_step, winback_bonus_at, "
+            "winback_offer_until, winback_gift_ok_until, winback_gift_kind, winback_reason "
+            "FROM users WHERE user_id=$1", u_id)
+
+
+async def _wb_drop_kb(cb: CallbackQuery):
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def _wb_is_active(u_id: int):
+    remna = await remna_get_user(u_id)
+    active = bool(remna and parse_dt(remna.get("expireAt")) > int(time.time())
+                  and remna.get("status") != "DISABLED")
+    return active, remna
+
+
+async def _wb_gift_done_text(result: dict) -> str:
+    exp = parse_dt(result.get("expireAt")) if result else 0
+    lines = [f"Готово! Добавили {WB_GIFT_DAYS} дня, подписка активна до "
+             f"{fmt_dt(exp, '%d.%m.%Y %H:%M')}."]
+    sub = format_sub_url(result) if result else ""
+    if sub:
+        lines += ["", "Ссылка на подписку та же:", hcode(sub)]
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "wb_gift_t")
+async def wb_gift_trial_cb(cb: CallbackQuery):
+    u_id = cb.from_user.id
+    row = await _wb_user(u_id)
+    now = int(time.time())
+    if not row or int(row["has_paid"] or 0) or row["trial_extended"]:
+        await safe_answer(cb, "Подарок уже получен или недоступен.", show_alert=True)
+        await _wb_drop_kb(cb)
+        return
+    if row["winback_bonus_at"] and now - int(row["winback_bonus_at"]) < WB_GIFT_COOLDOWN:
+        await safe_answer(cb, "Подарок уже получен или недоступен.", show_alert=True)
+        return
+    active, _ = await _wb_is_active(u_id)
+    if active:
+        await safe_answer(cb, "Подписка уже активна.", show_alert=True)
+        return
+    await safe_answer(cb)
+    # Только обычные сервера: сквад без нод обхода белых списков.
+    result = await activate_subscription(u_id, WB_GIFT_DAYS, int(TRIAL["hwid"] or 1),
+                                         squad_uuid=[SQUAD_UUID_BASIC], whitelist_gb=0)
+    if not result:
+        await cb.message.answer("Не получилось выдать дни. Напишите в поддержку: "
+                                f"@{SUPPORT_USERNAME}")
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET trial_extended=TRUE, winback_bonus_at=$1, winback_gift_until=$2, "
+            "winback_gift_kind='trial', plan='trial' WHERE user_id=$3",
+            now, parse_dt(result.get("expireAt")), u_id)
+    await _wb_log(u_id, "gift:trial", int(row["winback_step"] or 0))
+    await _wb_drop_kb(cb)
+    await cb.message.answer(await _wb_gift_done_text(result), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "wb_gift_p")
+async def wb_gift_paid_cb(cb: CallbackQuery):
+    u_id = cb.from_user.id
+    row = await _wb_user(u_id)
+    now = int(time.time())
+    ok = (row and int(row["has_paid"] or 0)
+          and int(row["winback_gift_ok_until"] or 0) > now
+          and (not row["winback_bonus_at"] or now - int(row["winback_bonus_at"]) >= WB_GIFT_COOLDOWN))
+    if not ok:
+        await safe_answer(cb, "Подарок уже получен или недоступен.", show_alert=True)
+        await _wb_drop_kb(cb)
+        return
+    active, remna = await _wb_is_active(u_id)
+    if active:
+        await safe_answer(cb, "Подписка уже активна.", show_alert=True)
+        return
+    await safe_answer(cb)
+    plan_key = _wb_plan_key(row["plan"])
+    plan = PLANS[plan_key]
+    # С обходом БС, только если у человека был тариф с БС.
+    hwid = int((remna or {}).get("hwidDeviceLimit") or plan_base_hwid(plan_key))
+    result = await activate_subscription(
+        u_id, WB_GIFT_DAYS, hwid, squad_uuid=list(plan["squad"]),
+        whitelist_gb=int(plan.get("whitelist_gb") or 0))
+    if not result:
+        await cb.message.answer("Не получилось выдать дни. Напишите в поддержку: "
+                                f"@{SUPPORT_USERNAME}")
+        return
+    kind = "bad" if row["winback_reason"] == "bad" and int(row["winback_step"] or 0) <= 1 else "last"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET winback_bonus_at=$1, winback_gift_until=$2, winback_gift_kind=$3, "
+            "winback_gift_ok_until=0 WHERE user_id=$4",
+            now, parse_dt(result.get("expireAt")), kind, u_id)
+    await _wb_log(u_id, f"gift:{kind}", int(row["winback_step"] or 0))
+    await _wb_drop_kb(cb)
+    await cb.message.answer(await _wb_gift_done_text(result), parse_mode="HTML")
+
+
+@router.callback_query(F.data.in_({"wb_r_expensive", "wb_r_bad", "wb_r_no"}))
+async def wb_reason_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    u_id = cb.from_user.id
+    reason = cb.data.removeprefix("wb_r_")
+    row = await _wb_user(u_id)
+    if not row:
+        return
+    now = int(time.time())
+    await _wb_drop_kb(cb)
+    await _wb_log(u_id, f"answer:{reason}", int(row["winback_step"] or 0))
+    if reason == "expensive":
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET winback_reason='expensive', winback_offer_until=$1 WHERE user_id=$2",
+                now + WB_OFFER_TTL, u_id)
+        text, kb = await wb_reply_expensive(_wb_plan_key(row["plan"]))
+    elif reason == "bad":
+        gift = (not row["winback_bonus_at"]
+                or now - int(row["winback_bonus_at"]) >= WB_GIFT_COOLDOWN)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET winback_reason='bad', "
+                "winback_gift_ok_until=CASE WHEN $1 THEN $2 ELSE 0 END WHERE user_id=$3",
+                gift, now + WB_OFFER_TTL, u_id)
+        text, kb = wb_reply_bad(gift=gift)
+    else:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET winback_reason='no', winback_stopped=TRUE WHERE user_id=$1", u_id)
+        text, kb = wb_reply_no()
+    await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _wb_take3_view(u_id: int, plan_key: str, *, test: bool):
+    plan = PLANS[plan_key]
+    final, per_month, full, eff = await _wb_price3(plan_key)
+    lines = [f"{_wb_test_prefix(test)}{hbold(_wb_plain(plan['name']))} · 3 мес.", ""]
+    if full and final < full:
+        lines.append(f"Цена: <s>{full} руб.</s>")
+        lines.append(f"Скидка за возвращение: −{eff}%")
+        lines.append(hbold(f"К оплате: {final} руб."))
+    else:
+        lines.append(f"К оплате: {final} руб.")
+    if test:
+        lines += ["", "В тесте оплата не создаётся."]
+        return "\n".join(lines), None
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Оплатить", emoji_id=BTN_ICON_PAY, style="success", callback_data="wb_pay3")],
+    ])
+    return "\n".join(lines), kb
+
+
+@router.callback_query(F.data == "wb_take3")
+async def wb_take3_cb(cb: CallbackQuery):
+    if await payments_off_stop(cb):
+        return
+    row = await _wb_user(cb.from_user.id)
+    if not row or int(row["winback_offer_until"] or 0) <= int(time.time()):
+        await safe_answer(cb, "Предложение больше не действует.", show_alert=True)
+        await _wb_drop_kb(cb)
+        return
+    await safe_answer(cb)
+    text, kb = await _wb_take3_view(cb.from_user.id, _wb_plan_key(row["plan"]), test=False)
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "wb_pay3")
+async def wb_pay3_cb(cb: CallbackQuery):
+    if await payments_off_stop(cb):
+        return
+    row = await _wb_user(cb.from_user.id)
+    if not row or int(row["winback_offer_until"] or 0) <= int(time.time()):
+        await safe_answer(cb, "Предложение больше не действует.", show_alert=True)
+        return
+    await safe_answer(cb)
+    plan_key = _wb_plan_key(row["plan"])
+    plan = PLANS[plan_key]
+    final, _, _, _ = await _wb_price3(plan_key)
+    await _wb_log(cb.from_user.id, "take3", int(row["winback_step"] or 0), str(final))
+    await _create_payment_page(
+        cb, kind="plan", item_name=f"Продление {_wb_plain(plan['name'])} · 3 мес.",
+        price=final, days=90, hwid=plan_base_hwid(plan_key), squad=plan["squad"],
+        whitelist_gb=plan["whitelist_gb"], plan_key=plan_key,
+    )
+
+
+# ── Тестовые кнопки: только показывают ответы, ничего не меняют ───────
+def _wb_admin_plan(plan) -> str:
+    return _wb_plan_key(plan)
+
+
+@router.callback_query(F.data.startswith("wbt_"))
+async def wb_test_buttons_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    action = cb.data.removeprefix("wbt_")
+    async with pool.acquire() as conn:
+        plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
+    plan_key = _wb_admin_plan(plan)
+    kb = None
+    if action in ("gift_t", "gift_p"):
+        until = int(time.time()) + WB_GIFT_DAYS * 86400
+        where = ("только обычные сервера, без обхода белых списков" if action == "gift_t"
+                 else ("с обходом белых списков" if PLANS[plan_key]["squad"] != [SQUAD_UUID_BASIC]
+                       else "только обычные сервера"))
+        text = (f"[ТЕСТ] Готово! Добавили {WB_GIFT_DAYS} дня, подписка активна до "
+                f"{fmt_dt(until, '%d.%m.%Y %H:%M')}.\n\nСсылка на подписку та же: (здесь будет ссылка)"
+                f"\n\nНа самом деле дни не выданы. У пользователя будут: {where}.")
+    elif action == "tariffs":
+        text = "[ТЕСТ] Здесь откроется обычный экран «Купить VPN» с тарифами."
+    elif action == "renew":
+        text = "[ТЕСТ] Здесь откроется обычное продление: выбор срока для тарифа пользователя."
+    elif action == "r_expensive":
+        text, kb = await wb_reply_expensive(plan_key, test=True)
+    elif action == "r_bad":
+        text, kb = wb_reply_bad(gift=True, test=True)
+    elif action == "r_no":
+        text, kb = wb_reply_no(test=True)
+    elif action == "take3":
+        text, kb = await _wb_take3_view(cb.from_user.id, plan_key, test=True)
+    else:
+        return
+    await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ── Админ-панель ──────────────────────────────────────────────────────
+async def _wb_stats(days: int = 30) -> dict:
+    since = int(time.time()) - days * 86400
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT event, COUNT(*) AS c FROM winback_log WHERE created_at>=$1 GROUP BY event", since)
+        paid_rows = await conn.fetch(
+            "SELECT step, COUNT(*) AS c FROM winback_log WHERE event='paid' AND created_at>=$1 "
+            "GROUP BY step", since)
+    ev = {r["event"]: int(r["c"]) for r in rows}
+    return {"ev": ev, "paid": {int(r["step"]): int(r["c"]) for r in paid_rows}}
+
+
+async def _wb_admin_view():
+    st = await _wb_settings()
+    s = await _wb_stats()
+    ev = s["ev"]
+    status = (f"работает с {fmt_dt(st['enabled_at'], '%d.%m.%Y')}" if st["enabled"]
+              else "выключена (сообщения не отправляются)")
+    paid_total = sum(s["paid"].values())
+    lines = [
+        hbold("Возврат ушедших"), "",
+        f"Рассылка: {status}",
+        f"Новость в сообщении через 14 дней: {html.escape(st['news']) if st['news'] else 'нет'}",
+        f"Скидка за возвращение на 3 мес.: {st['discount']}%",
+        "",
+        hbold("За 30 дней"),
+        f"Триал, «дарим 3 дня»: {ev.get('sent:trial_offer', 0)}, забрали: {ev.get('gift:trial', 0)}",
+        f"Триал, «доп. дни закончились»: {ev.get('sent:trial_gift_over', 0)}",
+        f"Платники, опрос: {ev.get('sent:paid_survey', 0)}",
+        f"  дорого: {ev.get('answer:expensive', 0)}, плохо работало: {ev.get('answer:bad', 0)}, "
+        f"не нужен: {ev.get('answer:no', 0)}",
+        f"Платники, через 14 дней: {ev.get('sent:paid_last', 0)}",
+        f"Подарочные дни платникам: {ev.get('gift:bad', 0) + ev.get('gift:last', 0)}",
+        f"Открыли оплату 3 мес. со скидкой: {ev.get('take3', 0)}",
+        f"Оплатили после цепочки: {paid_total}"
+        + (" (" + ", ".join(f"после шага {k}: {v}" for k, v in sorted(s['paid'].items())) + ")"
+           if paid_total else ""),
+        f"Заблокировали бота: {ev.get('blocked', 0)}",
+    ]
+    toggle = ("Остановить рассылку", "admin_wb_stop") if st["enabled"] else \
+             ("Запустить рассылку", "admin_wb_start")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Тест сообщений возврата", callback_data="admin_wb_test")],
+        [InlineKeyboardButton(text="Новость", callback_data="admin_wb_news"),
+         InlineKeyboardButton(text="Скидка 3 мес.", callback_data="admin_wb_disc")],
+        [InlineKeyboardButton(text=toggle[0], callback_data=toggle[1])],
+        [InlineKeyboardButton(text="Обновить", callback_data="admin_wb"),
+         InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
+    ])
+    return "\n".join(lines), kb
+
+
+@router.callback_query(F.data == "admin_wb")
+async def admin_wb_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    text, kb = await _wb_admin_view()
+    try:
+        await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e):
+            raise
+
+
+@router.callback_query(F.data == "admin_wb_test")
+async def admin_wb_test_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Триал: +3 дня без БС", callback_data="admin_wbt_1")],
+        [InlineKeyboardButton(text="Триал: доп. дни закончились", callback_data="admin_wbt_2")],
+        [InlineKeyboardButton(text="Платник: +2 дня, опрос", callback_data="admin_wbt_3")],
+        [InlineKeyboardButton(text="Платник: +14 дней", callback_data="admin_wbt_4")],
+        [InlineKeyboardButton(text="Платник: +14 дней, уже брал 3 дня", callback_data="admin_wbt_5")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin_wb")],
+    ])
+    await edit_screen(cb.message,
+        f"{hbold('Тест сообщений возврата')}\n\n"
+        "Бот пришлёт выбранное сообщение так, как его увидит пользователь. "
+        "Кнопки в нём нажимаются, но ничего не выдают и ничего не меняют.",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("admin_wbt_"))
+async def admin_wb_test_send_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    which = cb.data.removeprefix("admin_wbt_")
+    async with pool.acquire() as conn:
+        plan = await conn.fetchval("SELECT plan FROM users WHERE user_id=$1", cb.from_user.id)
+    plan_key = _wb_admin_plan(plan)
+    if which == "1":
+        text, kb = await wb_msg_trial_offer(test=True)
+    elif which == "2":
+        text, kb = await wb_msg_trial_gift_over(test=True)
+    elif which == "3":
+        text, kb = await wb_msg_paid_survey(test=True)
+    elif which == "4":
+        text, kb = await wb_msg_paid_last(plan_key, gift=True, test=True)
+    elif which == "5":
+        text, kb = await wb_msg_paid_last(plan_key, gift=False, test=True)
+    else:
+        return
+    await bot.send_message(cb.from_user.id, text, parse_mode="HTML", reply_markup=kb,
+                           disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "admin_wb_start")
+async def admin_wb_start_cb(cb: CallbackQuery):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    await edit_screen(cb.message, "Считаю, кому уйдут сообщения…")
+    try:
+        cands = await _wb_candidates()
+    except Exception as e:
+        cands = []
+        log.error("winback preview: %s", e)
+    now = int(time.time())
+    trial = paid = 0
+    for u in cands:
+        if _wb_next(u, now, now) is None:
+            continue
+        if int(u.get("has_paid") or 0):
+            paid += 1
+        else:
+            trial += 1
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Да, запустить", callback_data="admin_wb_start_yes")],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin_wb")],
+    ])
+    await edit_screen(cb.message,
+        f"{hbold('Запустить рассылку возврата?')}\n\n"
+        f"Сейчас первое сообщение получат:\n"
+        f"Триал («дарим 3 дня»): {trial}\n"
+        f"Платники (опрос): {paid}\n\n"
+        f"Сообщения уходят с {WB_HOURS_MSK[0]}:00 до {WB_HOURS_MSK[1]}:00 МСК, "
+        f"не больше {WB_MAX_PER_TICK} в час. Дальше цепочка идёт сама.",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_wb_start_yes")
+async def admin_wb_start_yes_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await safe_answer(cb)
+        return
+    await save_bot_settings({WB_KEY_ENABLED: "1", WB_KEY_ENABLED_AT: str(int(time.time()))},
+                            cb.from_user.id)
+    await safe_answer(cb, "Рассылка запущена.", show_alert=True)
+    text, kb = await _wb_admin_view()
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+    asyncio.create_task(_run_winback())
+
+
+@router.callback_query(F.data == "admin_wb_stop")
+async def admin_wb_stop_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await safe_answer(cb)
+        return
+    await save_bot_settings({WB_KEY_ENABLED: "0"}, cb.from_user.id)
+    await safe_answer(cb, "Рассылка остановлена.", show_alert=True)
+    text, kb = await _wb_admin_view()
+    await edit_screen(cb.message, text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_wb_news")
+async def admin_wb_news_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    st = await _wb_settings()
+    await state.set_state(WinbackState.news)
+    await edit_screen(cb.message,
+        f"{hbold('Новость для сообщения через 14 дней')}\n\n"
+        f"Сейчас: {html.escape(st['news']) if st['news'] else 'нет'}\n\n"
+        "Пришлите одну строку о реальном изменении, например «Добавили Польшу». "
+        "Без эмодзи. Чтобы убрать новость, пришлите «-».",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Назад", callback_data="admin_wb")]]))
+
+
+@router.message(WinbackState.news)
+async def admin_wb_news_input(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    value = "" if raw in ("-", "—") else _wb_plain(raw)[:300]
+    await save_bot_settings({WB_KEY_NEWS: value}, message.from_user.id)
+    await state.clear()
+    text, kb = await _wb_admin_view()
+    await message.answer(("Новость убрана." if not value else "Новость сохранена.") + "\n\n" + text,
+                         parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_wb_disc")
+async def admin_wb_disc_cb(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    if not is_admin(cb.from_user.id):
+        return
+    st = await _wb_settings()
+    plan_key = _wb_plan_key(None)
+    final, per_month, full, _ = await _wb_price3(plan_key)
+    await state.set_state(WinbackState.discount)
+    await edit_screen(cb.message,
+        f"{hbold('Скидка за возвращение на 3 месяца')}\n\n"
+        f"Сейчас: {st['discount']}%. Для тарифа «{_wb_plain(PLANS[plan_key]['name'])}» это "
+        f"{final} руб. вместо {full} руб. ({per_month} руб. в месяц).\n\n"
+        "Действует только в сообщениях возврата. Пришлите число от 0 до 90. "
+        "Совет: не больше скидки за 6–12 месяцев, иначе уходить станет выгодно.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Назад", callback_data="admin_wb")]]))
+
+
+@router.message(WinbackState.discount)
+async def admin_wb_disc_input(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip().rstrip("%")
+    if not raw.isdigit() or not 0 <= int(raw) <= 90:
+        await message.answer("Нужно число от 0 до 90.")
+        return
+    await save_bot_settings({WB_KEY_DISCOUNT: raw}, message.from_user.id)
+    await state.clear()
+    text, kb = await _wb_admin_view()
+    await message.answer(f"Скидка сохранена: {raw}%.\n\n{text}", parse_mode="HTML", reply_markup=kb)
+
+
 async def main():
     await init_db()
     await load_extra_admins()
@@ -9377,6 +10244,7 @@ async def main():
     asyncio.create_task(weekly_report_scheduler())
     asyncio.create_task(whitelist_limit_scheduler())
     asyncio.create_task(expiry_reminder_scheduler())
+    asyncio.create_task(winback_scheduler())
     asyncio.create_task(naloggo_queue_scheduler())
     if platega_available():
         asyncio.create_task(platega_watcher())
