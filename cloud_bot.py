@@ -2087,9 +2087,6 @@ async def main() -> None:
             asyncio.create_task(handle_update(up))
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
 
 # ─────────────────────────────────────────────
 #  ОБЫЧНЫЕ СООБЩЕНИЯ С КНОПКАМИ (пока Telegram не пускает виджеты)
@@ -2464,3 +2461,7 @@ async def start_http() -> None:
                                                        "web_app": {"url": MINIAPP_URL}})
         except TgError as e:
             log.warning("setChatMenuButton: %s", e)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
