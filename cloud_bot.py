@@ -33,6 +33,7 @@ import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cloud")
+logging.getLogger("httpx").setLevel(logging.WARNING)   # иначе в логах будет URL с токеном
 
 
 def env(name: str, default: str = "") -> str:
