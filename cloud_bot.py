@@ -27,6 +27,7 @@ import secrets
 import time
 import zlib
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import asyncpg
 import httpx
@@ -822,6 +823,9 @@ async def user_state(uid: int, cached: bool = True) -> dict:
         "rd": REF_DAYS, "rl": ref_link(uid), "sp": SUPPORT,
         "ton": 1 if TON_WALLET else 0,
     }
+    rr = await db_row("SELECT count(*) AS n, count(r.friend_id) AS p FROM cn_users u "
+                      "LEFT JOIN cn_ref r ON r.friend_id=u.user_id WHERE u.referrer_id=$1", uid)
+    state["r"] = [int(rr["n"]), int(rr["p"])]
     if pp:
         state["pc"], state["pp"] = pc, pp
     if s in (1, 3):
@@ -858,37 +862,83 @@ def main_kb() -> dict:
                 [("Друзья", "fb:ref"), ("Поддержка", f"https://t.me/{SUPPORT}")]])
 
 
+# ── Виджеты разрешены? ─────────────────────────────────────────────────
+# С 13.11.2026 Telegram отвечает обычным ботам INPUT_MEDIA_WIDGET_NOT_ALLOWED.
+# Тогда бот работает обычными сообщениями с кнопками (classic_*) и раз в
+# полчаса пробует виджеты снова — как только их разрешат, переключится сам.
+WIDGETS_MODE = env("WIDGETS", "auto")          # auto | off
+_widget_block = {"until": 0}
+
+
+def widgets_on() -> bool:
+    return WIDGETS_MODE != "off" and now() >= _widget_block["until"]
+
+
+async def send_widget(**params) -> dict | None:
+    """sendWidget; None — виджеты сейчас недоступны (тогда шлём обычное сообщение)."""
+    if not widgets_on():
+        return None
+    try:
+        return await tg("sendWidget", **params)
+    except TgError as e:
+        if "WIDGET_NOT_ALLOWED" in str(e):
+            if not _widget_block["until"] or now() - _widget_block["until"] > 3600:
+                log.warning("Telegram не разрешает боту виджеты — работаю обычными сообщениями")
+            _widget_block["until"] = now() + 1800
+            return None
+        raise
+
+
+async def show_screen(uid: int, screen: dict, edit_mid: int | None = None) -> dict | None:
+    """Экран (тот же формат, что у карточки) обычным сообщением: правка или новое."""
+    text, kb = screen_to_msg(screen)
+    if edit_mid:
+        try:
+            await tg("editMessageText", chat_id=uid, message_id=edit_mid, text=text, parse_mode="HTML",
+                     reply_markup=kb, link_preview_options={"is_disabled": True})
+            return {"message_id": edit_mid}
+        except TgError as e:
+            if "not modified" in str(e):
+                return {"message_id": edit_mid}
+    return await send_text(uid, text, kb)
+
+
 async def send_main(uid: int, view: str | None = None) -> None:
     state = await user_state(uid, cached=False)
     data = dict(state, v=view) if view else state
     try:
-        m = await tg("sendWidget", chat_id=uid, html=MAIN_HTML, chat_data=jdump(data),
-                     caption=main_caption(state), parse_mode="HTML",
-                     allow_queries=True, reply_markup=main_kb())
+        m = await send_widget(chat_id=uid, html=MAIN_HTML, chat_data=jdump(data),
+                              caption=main_caption(state), parse_mode="HTML",
+                              allow_queries=True, reply_markup=main_kb())
     except TgError as e:
-        log.warning("sendWidget main → %s: %s", uid, e)
-        if "blocked" in str(e).lower():
-            return await note_send_error(uid, e)
-        await send_text(uid, main_caption(state), main_kb())
-        return
-    await db_exec("UPDATE cn_users SET last_main=$2 WHERE user_id=$1", uid, m["message_id"])
+        await note_send_error(uid, e)
+        m = None
+    if not m:
+        m = await show_screen(uid, await main_screen(uid, view or "h", "p1", state))
+    if m:
+        await db_exec("UPDATE cn_users SET last_main=$2 WHERE user_id=$1", uid, m["message_id"])
 
 
 async def push_state(uid: int) -> None:
-    """Обновляет последний главный виджет пользователя без нового сообщения."""
+    """Обновляет последнее меню пользователя без нового сообщения."""
     u = await get_user(uid)
     if not u or not u.get("last_main"):
         return
     state = await user_state(uid, cached=False)
+    if widgets_on():
+        try:
+            await tg("editMessageWidgetData", chat_id=uid, message_id=u["last_main"],
+                     chat_data=jdump(state))
+            await tg("editMessageCaption", chat_id=uid, message_id=u["last_main"],
+                     caption=main_caption(state), parse_mode="HTML", reply_markup=main_kb())
+            return
+        except TgError as e:
+            if "not modified" in str(e):
+                return
     try:
-        await tg("editMessageWidgetData", chat_id=uid, message_id=u["last_main"],
-                 chat_data=jdump(state))
-    except TgError as e:
-        if "not modified" not in str(e):
-            log.info("push_state %s: %s", uid, e)
-    try:
-        await tg("editMessageCaption", chat_id=uid, message_id=u["last_main"],
-                 caption=main_caption(state), parse_mode="HTML", reply_markup=main_kb())
+        text, kb = screen_to_msg(await main_screen(uid, "h", "p1", state))
+        await tg("editMessageText", chat_id=uid, message_id=u["last_main"], text=text,
+                 parse_mode="HTML", reply_markup=kb, link_preview_options={"is_disabled": True})
     except TgError:
         pass
 
@@ -903,16 +953,15 @@ async def send_guide(uid: int) -> None:
     caption = ("<b>Как подключиться</b>\n1. Установите приложение Happ.\n"
                "2. Скопируйте ссылку подписки:\n" + (f"<code>{esc(su)}</code>\n" if su else "") +
                "3. В Happ нажмите «+» → «Вставить из буфера» и подключитесь.")
-    kb = ikb([[("App Store", "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973"),
-               ("Google Play", "https://play.google.com/store/apps/details?id=com.happproxy")],
-              [("Windows", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe"),
-               ("macOS", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg")]])
+    kb = ikb([[("App Store", HAPP["ios_ru"]), ("Google Play", HAPP["gp"])],
+              [("Windows", HAPP["win"]), ("macOS", HAPP["dmg"])]])
     try:
-        await tg("sendWidget", chat_id=uid, html=GUIDE_HTML, chat_data=jdump(data),
-                 caption=caption, parse_mode="HTML", reply_markup=kb)
+        if await send_widget(chat_id=uid, html=GUIDE_HTML, chat_data=jdump(data),
+                             caption=caption, parse_mode="HTML", reply_markup=kb):
+            return
     except TgError as e:
         log.warning("sendWidget guide → %s: %s", uid, e)
-        await send_text(uid, caption, kb)
+    await show_screen(uid, guide_screen(su, ""))
 
 
 def card_fit(card: dict) -> dict:
@@ -938,17 +987,18 @@ def card_caption(card: dict) -> str:
 
 async def send_card(uid: int, card: dict, *, kb=None, caption: str | None = None,
                     queries: bool = True) -> dict | None:
-    card = card_fit(card)
     try:
-        return await tg("sendWidget", chat_id=uid, html=CARD_HTML, chat_data=jdump(card),
-                        caption=(caption or card_caption(card))[:1024], parse_mode="HTML",
-                        allow_queries=queries, reply_markup=kb)
+        m = await send_widget(chat_id=uid, html=CARD_HTML, chat_data=jdump(card_fit(card)),
+                              caption=(caption or card_caption(card))[:1024], parse_mode="HTML",
+                              allow_queries=queries, reply_markup=kb)
+        if m:
+            return m
     except TgError as e:
         if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
             await note_send_error(uid, e)
             return None
         log.warning("sendWidget card → %s: %s", uid, e)
-        return await send_text(uid, caption or card_caption(card), kb)
+    return await show_screen(uid, card)
 
 
 # ─────────────────────────────────────────────
@@ -1509,16 +1559,17 @@ async def adm_route(admin: int, data: str) -> dict:
 
 
 async def adm_show(admin: int, card: dict) -> None:
-    """Показывает карточку в админ-виджете (новый, если старого нет)."""
+    """Показывает экран в админ-панели (правит прежнее сообщение или шлёт новое)."""
     u = await get_user(admin)
-    card = card_fit(card)
-    if u and u.get("aw"):
+    aw = u.get("aw") if u else None
+    if aw and widgets_on():
         try:
-            await tg("editMessageWidgetData", chat_id=admin, message_id=u["aw"], chat_data=jdump(card))
+            await tg("editMessageWidgetData", chat_id=admin, message_id=aw, chat_data=jdump(card_fit(card)))
             return
         except TgError as e:
             if "not modified" in str(e):
                 return
+    # после сообщения админа — новый экран ниже, а не правка старого где-то выше
     m = await send_card(admin, card, caption="<b>Админ-панель</b>")
     if m:
         await db_exec("UPDATE cn_users SET aw=$2 WHERE user_id=$1", admin, m["message_id"])
@@ -1726,46 +1777,19 @@ async def on_message(msg: dict) -> None:
     await send_card(uid, card)
 
 
+FB_MAP = {"fb:menu": "open:h", "fb:buy": "m:b:p1", "fb:conn": "gd:", "fb:ref": "m:r"}
+
+
 async def on_callback(cb: dict) -> None:
-    uid = cb["from"]["id"]
-    data = cb.get("data") or ""
-    try:
-        await tg("answerCallbackQuery", callback_query_id=cb["id"])
-    except TgError:
-        pass
-    if not await get_user(uid):
+    """Кнопки под сообщениями. Старые «fb:…» под виджетом ведут в те же экраны."""
+    if not await get_user(cb["from"]["id"]):
         await touch_user(cb["from"])
-    if data == "fb:menu":
-        await send_main(uid)
-    elif data == "fb:buy":
-        st = await settings()
-        _, pct = await user_promo(await get_user(uid))
-        rows = []
-        for mth in MONTHS:
-            _, price = calc_price(st, "p", mth, pct)
-            rows.append([(f"{mth} мес · {price} ₽", f"fb:p:{mth}")])
-        await send_text(uid, f"<b>Подписка {esc(BRAND)}</b>\n{st['price']} ₽ в месяц · {st['bd']} устройства · "
-                             f"все локации · 📶 {st['pg']} ГБ в месяц\n"
-                             + (f"Скидка по промокоду: {pct}%\n" if pct else "") + "\nВыберите срок:", ikb(rows))
-    elif data.startswith("fb:p:") and data[5:].isdigit():
-        inv, err = await make_invoice(uid, "p", int(data[5:]), "platega")
-        if not inv:
-            await send_text(uid, esc(err))
-        else:
-            await send_text(uid, f"Счёт на {inv['amount']} ₽ — {esc(item_name('p', inv['qty']))}.\n"
-                                 "После оплаты подписка включится сама.",
-                            ikb([[(f"Оплатить {inv['amount']} ₽", inv["url"])]]))
-    elif data == "fb:conn":
-        state = await user_state(uid, cached=False)
-        if state["s"] in (1, 3):
-            await send_guide(uid)
-        else:
-            await send_text(uid, "Сначала оформите подписку.", ikb([[("Купить", "fb:buy")]]))
-    elif data == "fb:ref":
-        n = await db_val("SELECT count(*) FROM cn_users WHERE referrer_id=$1", uid)
-        await send_text(uid, f"<b>Приглашайте друзей</b>\nЗа каждого, кто оформит подписку, — "
-                             f"{REF_DAYS} дней бесплатно.\nПриглашено: {n}\n\nВаша ссылка:\n"
-                             f"<code>{ref_link(uid)}</code>")
+    data = cb.get("data") or ""
+    if data in FB_MAP:
+        cb = dict(cb, data=FB_MAP[data])
+    elif data.startswith("fb:p:"):
+        cb = dict(cb, data=f"pay:p{data[5:]}:p")
+    await classic_callback(cb)
 
 
 # ─────────────────────────────────────────────
@@ -1973,3 +1997,242 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# ─────────────────────────────────────────────
+#  ОБЫЧНЫЕ СООБЩЕНИЯ С КНОПКАМИ (пока Telegram не пускает виджеты)
+#
+#  Экраны описываются тем же словарём, что карточка-виджет:
+#  t — заголовок, x — текст, r — строки «название: значение»,
+#  b — кнопки [текст, действие], c — колонки, kb — готовые ряды кнопок.
+#  Действия: «c:текст» копирует, «o:/g:ссылка» открывает, остальное — callback.
+# ─────────────────────────────────────────────
+HAPP = {
+    "ios_ru": "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+    "ios": "https://apps.apple.com/app/happ-proxy-utility/id6504287215",
+    "gp": "https://play.google.com/store/apps/details?id=com.happproxy",
+    "apk": "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk",
+    "win": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe",
+    "dmg": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg",
+    "atv": "https://apps.apple.com/app/happ-proxy-utility-for-tv/id6748297274",
+}
+GUIDE_DEVICES = {
+    "i": ("iPhone и iPad", "Установите Happ из App Store",
+          [("App Store (Россия)", HAPP["ios_ru"]), ("App Store (другие страны)", HAPP["ios"])]),
+    "a": ("Android", "Установите Happ из Google Play или скачайте APK",
+          [("Google Play", HAPP["gp"]), ("Скачать APK", HAPP["apk"])]),
+    "w": ("Windows", "Скачайте и установите Happ для Windows", [("Скачать для Windows", HAPP["win"])]),
+    "m": ("macOS", "Установите Happ из App Store или скачайте DMG",
+          [("App Store", HAPP["ios_ru"]), ("Скачать DMG", HAPP["dmg"])]),
+    "t": ("Телевизор", "Установите Happ из Google Play на Android TV или из App Store на Apple TV",
+          [("Google Play", HAPP["gp"]), ("Apple TV", HAPP["atv"])]),
+}
+
+
+def screen_to_msg(card: dict) -> tuple[str, dict]:
+    parts = []
+    if card.get("t"):
+        parts.append(f"<b>{card['t']}</b>")
+    if card.get("x"):
+        parts.append(re.sub(r"<br\s*/?>", "\n", card["x"]))
+    if card.get("r"):
+        parts.append("\n".join(f"{k}: <b>{v}</b>" for k, v in card["r"]))
+    text = "\n\n".join(parts) or "…"
+
+    def button(label, act):
+        if act.startswith("c:"):
+            return {"text": label, "copy_text": {"text": act[2:][:256]}}
+        if act[:2] in ("o:", "g:"):
+            return {"text": label, "url": act[2:]}
+        if act.startswith("https://"):
+            return {"text": label, "url": act}
+        return {"text": label, "callback_data": act[:64]}
+
+    if card.get("kb"):
+        rows = [[button(lbl, act) for lbl, act in row] for row in card["kb"]]
+    else:
+        btns = [button(b[0], b[1]) for b in card.get("b") or []]
+        cols = max(1, int(card.get("c") or 1))
+        rows = [btns[i:i + cols] for i in range(0, len(btns), cols)]
+    return text, {"inline_keyboard": rows}
+
+
+async def main_screen(uid: int, view: str = "h", sel: str = "p1", state: dict | None = None) -> dict:
+    s = state or await user_state(uid)
+    if view == "b":
+        return buy_screen(s, sel)
+    if view == "r":
+        share = "https://t.me/share/url?url=" + quote(s["rl"])
+        return {"t": "Друзья", "x": f"За каждого друга, который оформит подписку, — <b>{s['rd']} дней</b> "
+                                    f"бесплатно.\nПриглашено: {s['r'][0]} · оплатили: {s['r'][1]}\n\n"
+                                    f"Ваша ссылка:\n<code>{esc(s['rl'])}</code>",
+                "kb": [[("Скопировать ссылку", "c:" + s["rl"]), ("Поделиться", "o:" + share)],
+                       [("Назад", "m:h")]]}
+    if view == "c":
+        x = ("Отправьте промокод обычным сообщением в этот чат — он применится сам.\n\n"
+             f"Каждые выходные −{s['wp']}% по промокоду <b>{esc(s['wc'])}</b> (суббота и воскресенье).")
+        if s.get("pp"):
+            x += f"\n\nСейчас действует: <b>{esc(s['pc'])}</b>, скидка {s['pp']}%."
+        return {"t": "Промокод", "x": x, "kb": [[("Назад", "m:h")]]}
+    # главный экран
+    if s["s"] in (1, 3):
+        left = max(0, math.ceil((s["e"] - now()) / 86400))
+        x = (f"{'Пробный доступ' if s['s'] == 3 else 'Подписка активна'} до <b>{fmt_date(s['e'])}</b> "
+             f"({left} {plural(left, 'день', 'дня', 'дней')})\nУстройств: {s['d']}")
+        if s.get("g"):
+            x += f"\n📶 {s['g'][0]} из {s['g'][1]} ГБ"
+    elif s["s"] == 2:
+        x = f"Подписка закончилась {fmt_date(s['e'])}. Продлите — всё заработает сразу, настраивать заново не нужно."
+    else:
+        x = (f"<b>{s['p']} ₽ в месяц</b>\n{s['bd']} устройства · все локации · "
+             f"📶 {s['pg']} ГБ в месяц")
+    pay = s.get("pay") or {}
+    if pay.get("st") == "w":
+        x += f"\n\n⏳ Ждём оплату {pay['a']} {'TON' if pay.get('m') == 't' else '₽'} — после оплаты всё включится само."
+    elif pay.get("st") == "ok":
+        x += "\n\n✅ Оплата прошла. Инструкция по подключению — в сообщении ниже."
+    if s.get("wk"):
+        x += f"\n\n🔥 Выходные: −{s['wk']}% по промокоду <b>{esc(s['wc'])}</b>"
+    if s.get("pp"):
+        x += f"\n\nПромокод {esc(s['pc'])}: −{s['pp']}% на следующую покупку"
+    kb = []
+    if s.get("t"):
+        kb.append([(f"Попробовать бесплатно · {s['td']} дн.", "trial")])
+    if s.get("wk"):
+        kb.append([(f"Применить −{s['wk']}%", "wk")])
+    kb.append([("Продлить подписку" if s["s"] else "Купить подписку", "m:b:p1")])
+    kb.append([("Подключить", "gd:" if s["s"] in (1, 3) else "m:b:p1"), ("Друзья", "m:r")])
+    kb.append([("Промокод", "m:c"), ("Поддержка", f"g:https://t.me/{s['sp']}")])
+    return {"t": f"☁️ {esc(BRAND)}", "x": x, "kb": kb}
+
+
+def buy_screen(s: dict, sel: str) -> dict:
+    kind, qty = sel[:1], int(sel[1:] or 1) if sel[1:].isdigit() else 1
+    if kind not in VALID_QTY or qty not in VALID_QTY[kind] or (kind != "p" and s["s"] != 1):
+        kind, qty = "p", 1
+    st = {"price": s["p"], "dp": s["dp"], "gp": s["gp"], **{f"d{k}": v for k, v in s["dm"].items()}}
+    full, price = calc_price(st, kind, qty, s.get("pp") or 0)
+    if kind == "p":
+        dm = s["dm"].get(str(qty), 0)
+        x = (f"Подписка на {qty} мес.\n{s['bd'] + s['xd']} устройства · все локации · 📶 {s['pg'] * qty} ГБ"
+             + (f"\nСкидка за срок: {dm}%" if dm else ""))
+        chips = [(f"{'• ' if q == qty else ''}{q} мес", f"m:b:p{q}") for q in MONTHS]
+    elif kind == "d":
+        x = f"+{qty} к лимиту устройств, навсегда\n{s['dp']} ₽ за устройство"
+        chips = [(f"{'• ' if q == qty else ''}+{q}", f"m:b:d{q}") for q in (1, 2, 3, 5)]
+    else:
+        x = f"📶 +{qty} ГБ к текущему периоду\n{s['gp']} ₽ за 1 ГБ"
+        chips = [(f"{'• ' if q == qty else ''}{q} ГБ", f"m:b:g{q}") for q in (10, 25, 50, 100)]
+    x += f"\n\nК оплате: <b>{price} ₽</b>" + (f" <s>{full} ₽</s>" if price < full else "")
+    if s.get("pp"):
+        x += f"\nПромокод {esc(s['pc'])}: −{s['pp']}%"
+    kb = []
+    if s["s"] == 1:
+        kb.append([(("✓ " if kind == k else "") + name, f"m:b:{k}{q}")
+                   for k, name, q in (("p", "Подписка", 1), ("d", "Устройства", 1), ("g", "📶 ГБ", 10))])
+    kb.append(chips)
+    sel = f"{kind}{qty}"
+    if PLATEGA_ON:
+        kb.append([(f"💳 Картой или СБП · {price} ₽", f"pay:{sel}:p")])
+    if TON_WALLET:
+        kb.append([("💎 Оплатить TON", f"pay:{sel}:t")])
+    kb.append([("Назад", "m:h")])
+    return {"t": "Покупка", "x": x, "kb": kb}
+
+
+def guide_screen(su: str, dev: str) -> dict:
+    if dev not in GUIDE_DEVICES:
+        x = "Выберите устройство — покажем, что сделать."
+        if su:
+            x += f"\n\nСсылка подписки:\n<code>{esc(su)}</code>"
+        keys = list(GUIDE_DEVICES)
+        kb = [[(GUIDE_DEVICES[k][0], f"gd:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
+        kb.append([("Поддержка", f"g:https://t.me/{SUPPORT}")])
+        return {"t": "Как подключиться", "x": x, "kb": kb}
+    name, first, links = GUIDE_DEVICES[dev]
+    steps = [first, "Скопируйте ссылку подписки кнопкой ниже",
+             "Откройте Happ, нажмите «+» → «Вставить из буфера»",
+             "Нажмите большую кнопку подключения и разрешите добавить VPN"]
+    if dev == "t":
+        steps[2] = ("Откройте Happ на ТВ, нажмите «+» и добавьте подписку по ссылке — "
+                    "её удобно отправить себе в Telegram на телевизоре")
+    x = "\n".join(f"{i}. {t}" for i, t in enumerate(steps, 1))
+    kb = [[(lbl, "o:" + url)] for lbl, url in links]
+    if su:
+        kb += [[("Скопировать ссылку подписки", "c:" + su)], [("Открыть страницу подписки", "o:" + su)]]
+    else:
+        x += "\n\nСсылка подписки появится после оплаты."
+    kb.append([("Назад", "gd:")])
+    return {"t": name, "x": x, "kb": kb}
+
+
+async def pay_screen(uid: int, kind: str, qty: int, method: str) -> dict:
+    inv, err = await make_invoice(uid, kind, qty, "ton" if method == "t" else "platega")
+    back_btn = ("Назад", f"m:b:{kind}{qty}")
+    if not inv:
+        return {"t": "Оплата", "x": esc(err), "kb": [[back_btn]]}
+    name = esc(item_name(kind, qty))
+    if method == "t":
+        await db_exec("UPDATE cn_invoices SET msg_hash='link' WHERE id=$1", inv["id"])
+        url = (f"https://app.tonkeeper.com/transfer/{TON_WALLET}?amount={inv['ton_nano']}"
+               f"&text={inv['id']}")
+        return {"t": "Оплата TON", "x": f"{name}\nК оплате: <b>{ton_str(inv['ton_nano'])} TON</b> "
+                                         f"(≈ {inv['amount']} ₽)\n\nКнопка откроет кошелёк с уже заполненной "
+                                         f"суммой и комментарием <code>{inv['id']}</code> — его не меняйте. "
+                                         "После перевода всё включится само в течение пары минут.",
+                "kb": [[("Оплатить в кошельке", "o:" + url)], [back_btn]]}
+    return {"t": "Оплата", "x": f"{name}\nК оплате: <b>{inv['amount']} ₽</b>\n\n"
+                                 "После оплаты всё включится само, нажимать ничего не нужно.",
+            "kb": [[(f"Оплатить {inv['amount']} ₽", inv["url"])], [back_btn]]}
+
+
+async def classic_callback(cb: dict) -> None:
+    uid = cb["from"]["id"]
+    data = cb.get("data") or ""
+    msg = cb.get("message") or {}
+    mid = msg.get("message_id")
+    toast, screen, is_main, is_admin_screen = None, None, False, False
+    try:
+        if data.startswith("m:"):
+            parts = data.split(":")
+            screen = await main_screen(uid, parts[1], parts[2] if len(parts) > 2 else "p1")
+            is_main = True
+        elif data.startswith("gd:"):
+            try:
+                su = sub_url(await remna_get(uid, cached=True))
+            except Exception:
+                su = ""
+            screen = guide_screen(su, data[3:])
+        elif data.startswith("a:"):
+            if is_admin(uid):
+                screen, is_admin_screen = await adm_route(uid, data), True
+            else:
+                toast = "Нет доступа"
+        elif PAY_RE.fullmatch(data):
+            m = PAY_RE.fullmatch(data)
+            screen = await pay_screen(uid, m.group(1), int(m.group(2)), m.group(3))
+        elif data == "trial":
+            toast = await activate_trial(uid) or "Пробный доступ включён — инструкция ниже"
+            screen, is_main = await main_screen(uid, "h"), True
+        elif data == "wk":
+            err = await apply_weekend(uid)
+            toast = err or "Скидка применена"
+            screen, is_main = await main_screen(uid, "b" if not err else "h", "p1"), True
+        else:
+            ans = await widget_route({"from": cb["from"], "data": data, "type": {"type": "data"}})
+            toast = (ans or {}).get("m")
+            if toast and toast.endswith("↓"):
+                toast = None
+    except Exception:
+        log.exception("callback %s", data)
+        toast = "Ошибка, попробуйте ещё раз"
+    try:
+        await tg("answerCallbackQuery", callback_query_id=cb["id"], text=(toast or None) and toast[:190])
+    except TgError:
+        pass
+    if screen:
+        m = await show_screen(uid, screen, edit_mid=mid)
+        if m and is_main:
+            await db_exec("UPDATE cn_users SET last_main=$2 WHERE user_id=$1", uid, m["message_id"])
+        if m and is_admin_screen:
+            await db_exec("UPDATE cn_users SET aw=$2 WHERE user_id=$1", uid, m["message_id"])
