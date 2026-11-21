@@ -9403,8 +9403,8 @@ async def expiry_reminder_scheduler():
 #    шаг 2 — когда подарочные дни закончились: «вот тарифы». Дальше тишина.
 #  Платник (платил хотя бы раз):
 #    шаг 1 — через 2 дня после конца: опрос «почему ушёл» (4 кнопки);
-#    шаг 2 — через 14 дней после конца: «давно не виделись» + 3 дня или,
-#            если уже брал 3 дня по «Плохо работало», 3 месяца со скидкой.
+#    шаг 2 — через 14 дней после конца: «давно не виделись» + 3 месяца
+#            со скидкой за возвращение (дни не дарим).
 #            Не шлём тем, кто ответил «Больше не нужен». Дальше тишина.
 #
 #  Время отсчитывается от конца подписки, на которой цепочка началась
@@ -9421,7 +9421,7 @@ WB_KEY_ENABLED_AT = "winback_enabled_at"
 WB_KEY_NEWS       = "winback_news"
 WB_KEY_DISCOUNT   = "winback_discount3"
 
-WB_DEFAULT_DISCOUNT = 15          # скидка «за возвращение» на 3 месяца, %
+WB_DEFAULT_DISCOUNT = 20          # скидка «за возвращение» на 3 месяца, %
 WB_GIFT_DAYS        = 3
 WB_GIFT_COOLDOWN    = 90 * 86400  # подарочные дни не чаще раза в 90 дней
 WB_OFFER_TTL        = 7 * 86400   # сколько живёт предложение после сообщения
@@ -9694,10 +9694,8 @@ async def _wb_build(key: str, u: dict, now: int):
         return await wb_msg_trial_gift_over()
     if key == "paid_survey":
         return await wb_msg_paid_survey()
-    # paid_last: если уже брал 3 дня по «Плохо работало» (или подарок на
-    # кулдауне) — дни не дарим, предлагаем 3 месяца.
-    gift = (u.get("winback_gift_kind") != "bad") and _wb_gift_allowed(u, now)
-    return await wb_msg_paid_last(_wb_plan_key(u.get("plan")), gift=gift)
+    # paid_last: дни не дарим, только 3 месяца со скидкой за возвращение.
+    return await wb_msg_paid_last(_wb_plan_key(u.get("plan")), gift=False)
 
 
 async def _run_winback(force: bool = False) -> int:
@@ -10078,7 +10076,6 @@ async def admin_wb_test_cb(cb: CallbackQuery):
         [InlineKeyboardButton(text="Триал: доп. дни закончились", callback_data="admin_wbt_2")],
         [InlineKeyboardButton(text="Платник: +2 дня, опрос", callback_data="admin_wbt_3")],
         [InlineKeyboardButton(text="Платник: +14 дней", callback_data="admin_wbt_4")],
-        [InlineKeyboardButton(text="Платник: +14 дней, уже брал 3 дня", callback_data="admin_wbt_5")],
         [InlineKeyboardButton(text="Назад", callback_data="admin_wb")],
     ])
     await edit_screen(cb.message,
@@ -10104,8 +10101,6 @@ async def admin_wb_test_send_cb(cb: CallbackQuery):
     elif which == "3":
         text, kb = await wb_msg_paid_survey(test=True)
     elif which == "4":
-        text, kb = await wb_msg_paid_last(plan_key, gift=True, test=True)
-    elif which == "5":
         text, kb = await wb_msg_paid_last(plan_key, gift=False, test=True)
     else:
         return
