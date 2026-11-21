@@ -1382,7 +1382,8 @@ INPUT_HINTS = {
 
 async def adm_input(admin: int, mode: str, hint: str | None = None) -> dict:
     await db_exec("UPDATE cn_users SET amode=$2 WHERE user_id=$1", admin, mode)
-    return {"t": "Жду сообщение", "x": hint or INPUT_HINTS[mode], "b": [["Отмена", "a:x"]]}
+    return {"t": "Жду сообщение", "x": hint or INPUT_HINTS[mode], "in": mode.split(":")[0],
+            "b": [["Отмена", "a:x"]]}
 
 
 async def adm_user(uid: int, note: str = "") -> dict:
@@ -1578,6 +1579,11 @@ async def adm_show(admin: int, card: dict) -> None:
 async def adm_text(msg: dict, mode: str) -> None:
     admin = msg["from"]["id"]
     text = (msg.get("text") or msg.get("caption") or "").strip()
+    await adm_show(admin, await adm_text_card(admin, mode, text, msg))
+
+
+async def adm_text_card(admin: int, mode: str, text: str, msg: dict | None) -> dict:
+    """Ввод админа (из чата или из мини-приложения) → следующий экран."""
     await db_exec("UPDATE cn_users SET amode='' WHERE user_id=$1", admin)
     if mode == "find":
         q = text.lstrip("@")
@@ -1615,8 +1621,8 @@ async def adm_text(msg: dict, mode: str) -> None:
                           code, kind, val, uses_left, now())
             card = await adm_promos(f"Создан {esc(code)} ✓")
     elif mode == "bc":
-        await save_setting("bc_text", msg.get("text") or "")
-        await save_setting("bc_mid", msg["message_id"])
+        await save_setting("bc_text", (msg.get("text") or "") if msg else text)
+        await save_setting("bc_mid", msg["message_id"] if msg else 0)
         await save_setting("bc_chat", admin)
         card = await adm_bc_confirm()
     elif mode.startswith("msg:"):
@@ -1626,7 +1632,7 @@ async def adm_text(msg: dict, mode: str) -> None:
         card = await adm_user(uid, "Отправлено ✓" if sent else "Не доставлено")
     else:
         card = await adm_home()
-    await adm_show(admin, card)
+    return card
 
 
 async def broadcast(admin: int, only_active: bool, card: dict | None = None) -> None:
@@ -1979,6 +1985,7 @@ async def main() -> None:
     log.info("Бот @%s запущен. Platega: %s, TON: %s", BOT_USERNAME, PLATEGA_ON, bool(TON_WALLET))
     await tg("setMyCommands", commands=[{"command": "start", "description": "Меню"}])
     await tg("deleteWebhook")
+    await start_http()
     asyncio.create_task(payments_loop())
     asyncio.create_task(slow_loop())
     offset = 0
@@ -2044,6 +2051,8 @@ def screen_to_msg(card: dict) -> tuple[str, dict]:
             return {"text": label, "copy_text": {"text": act[2:][:256]}}
         if act[:2] in ("o:", "g:"):
             return {"text": label, "url": act[2:]}
+        if act.startswith("w:"):
+            return {"text": label, "web_app": {"url": act[2:]}}
         if act.startswith("https://"):
             return {"text": label, "url": act}
         return {"text": label, "callback_data": act[:64]}
@@ -2095,7 +2104,7 @@ async def main_screen(uid: int, view: str = "h", sel: str = "p1", state: dict | 
         x += f"\n\n🔥 Выходные: −{s['wk']}% по промокоду <b>{esc(s['wc'])}</b>"
     if s.get("pp"):
         x += f"\n\nПромокод {esc(s['pc'])}: −{s['pp']}% на следующую покупку"
-    kb = []
+    kb = [[("📱 Открыть приложение", "w:" + MINIAPP_URL)]] if MINIAPP_URL else []
     if s.get("t"):
         kb.append([(f"Попробовать бесплатно · {s['td']} дн.", "trial")])
     if s.get("wk"):
@@ -2236,3 +2245,135 @@ async def classic_callback(cb: dict) -> None:
             await db_exec("UPDATE cn_users SET last_main=$2 WHERE user_id=$1", uid, m["message_id"])
         if m and is_admin_screen:
             await db_exec("UPDATE cn_users SET aw=$2 WHERE user_id=$1", uid, m["message_id"])
+
+
+# ─────────────────────────────────────────────
+#  МИНИ-ПРИЛОЖЕНИЕ (Telegram Mini App)
+#
+#  Страница живёт на Cloudflare Worker (MINIAPP_URL). Worker отдаёт HTML и
+#  пересылает POST /api сюда — на встроенный HTTP-сервер бота (порт PORT).
+#  Каждый запрос подписан Telegram (initData) — проверяем подпись токеном бота.
+# ─────────────────────────────────────────────
+import hashlib
+import hmac
+from urllib.parse import parse_qsl
+
+from aiohttp import web
+
+MINIAPP_URL = env("MINIAPP_URL").rstrip("/")
+API_PORT = env_int("PORT", 8080)
+
+
+def check_init_data(raw: str) -> dict | None:
+    """Пользователь из initData, если подпись верна и ей меньше суток."""
+    try:
+        pairs = dict(parse_qsl(raw or "", keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        if not got:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got) or now() - int(pairs.get("auth_date") or 0) > 86400:
+            return None
+        user = json.loads(pairs.get("user") or "{}")
+        return user if user.get("id") else None
+    except Exception:
+        return None
+
+
+async def app_state(uid: int) -> dict:
+    st = await user_state(uid, cached=False)
+    if st["s"] in (1, 3):
+        try:
+            st["su"] = sub_url(await remna_get(uid, cached=True))
+        except Exception:
+            pass
+    if is_admin(uid):
+        st["adm"] = 1
+    return st
+
+
+async def app_api(body: dict, user: dict) -> dict:
+    uid = user["id"]
+    if not await get_user(uid):
+        await touch_user(user)
+    a = str(body.get("a") or "s")
+    if a == "s":
+        return {"st": await app_state(uid)}
+    if a == "trial":
+        err = await activate_trial(uid)
+        return {"m": err or "Пробный доступ включён — откройте «Подключить»", "st": await app_state(uid)}
+    if a == "wk":
+        err = await apply_weekend(uid)
+        return {"m": err, "st": await app_state(uid)} if err else {"st": await app_state(uid)}
+    if a == "promo":
+        code = str(body.get("code") or "").strip().upper()
+        if not re.fullmatch(r"[A-ZА-Я0-9_-]{3,32}", code):
+            return {"m": "Введите промокод"}
+        ok, reply = await apply_promo_code(uid, code)
+        if ok:
+            await push_state(uid)
+        return {"m": reply, "st": await app_state(uid)}
+    if a == "pay":
+        kind, method = str(body.get("k") or "p"), str(body.get("mt") or "p")
+        try:
+            qty = int(body.get("q") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        inv, err = await make_invoice(uid, kind, qty, "ton" if method == "t" else "platega")
+        if not inv:
+            return {"m": err}
+        if method == "t":
+            await db_exec("UPDATE cn_invoices SET msg_hash='link' WHERE id=$1", inv["id"])
+            url = f"https://app.tonkeeper.com/transfer/{TON_WALLET}?amount={inv['ton_nano']}&text={inv['id']}"
+            return {"pay": {"i": inv["id"], "a": ton_str(inv["ton_nano"]), "u": url, "m": "t", "st": "w"}}
+        return {"pay": {"i": inv["id"], "a": inv["amount"], "u": inv["url"], "m": "p", "st": "w"}}
+    if a.startswith("a:") or a == "ain":
+        if not is_admin(uid):
+            return {"m": "Нет доступа"}
+        if a == "ain":
+            u = await get_user(uid) or {}
+            mode = u.get("amode") or ""
+            if not mode:
+                return {"card": await adm_home()}
+            text = str(body.get("text") or "").strip()
+            if not text:
+                return {"m": "Пустое сообщение"}
+            return {"card": await adm_text_card(uid, mode, text, None)}
+        return {"card": await adm_route(uid, a)}
+    return {"m": "Обновите приложение"}
+
+
+async def http_api(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"m": "bad request"}, status=400)
+    user = check_init_data(str(body.get("initData") or ""))
+    if not user:
+        return web.json_response({"m": "Откройте приложение из Telegram"}, status=403)
+    try:
+        res = await asyncio.wait_for(app_api(body, user), timeout=25)
+    except asyncio.TimeoutError:
+        res = {"m": "Сервис отвечает долго, попробуйте ещё раз"}
+    except Exception:
+        log.exception("miniapp api %s", body.get("a"))
+        res = {"m": "Ошибка, попробуйте ещё раз"}
+    return web.json_response(res)
+
+
+async def start_http() -> None:
+    app = web.Application(client_max_size=64 * 1024)
+    app.router.add_post("/api", http_api)
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", API_PORT).start()
+    log.info("HTTP API мини-приложения слушает порт %s", API_PORT)
+    if MINIAPP_URL:
+        try:
+            await tg("setChatMenuButton", menu_button={"type": "web_app", "text": "Открыть",
+                                                       "web_app": {"url": MINIAPP_URL}})
+        except TgError as e:
+            log.warning("setChatMenuButton: %s", e)
