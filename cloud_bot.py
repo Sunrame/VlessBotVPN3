@@ -665,6 +665,91 @@ R();
 </script>
 '''
 
+APP_HTML = r'''<!doctype html><html lang=ru><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Cloud Networks VPN</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box}html,body{background:#050a17}
+body{margin:0;padding:14px 14px 28px;color:#fff;font:15px/1.4 system-ui,-apple-system,sans-serif;-webkit-tap-highlight-color:transparent}
+.hd{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px}.hd small{display:block;font-weight:400;font-size:12px;color:#7d90c4}
+.c{background:#0c1530;border:1px solid #19295a;border-radius:16px;padding:12px 14px;margin-top:10px}
+.mt{color:#7d90c4;font-size:13px}
+button{display:block;width:100%;margin-top:8px;padding:13px 8px;border:0;border-radius:12px;background:#132250;color:#fff;font:600 15px system-ui,sans-serif;cursor:pointer}
+button.p{background:#2b63ff}button:active{opacity:.8}button[disabled]{color:#5f70a3}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}.g button,.r button{margin:0}
+.r{display:flex;gap:6px;margin-top:8px}.r button{padding:10px 0}
+.bar{height:6px;border-radius:3px;background:#19295a;margin-top:6px}.bar i{display:block;height:6px;border-radius:3px;background:#3d7bff}
+.w{display:flex;justify-content:space-between;align-items:center;gap:8px}.w button{width:auto;margin:0;padding:8px 14px}
+s{color:#7d90c4}.big{font-size:24px;font-weight:700}.t{font-size:18px;font-weight:700}
+.sel{user-select:text;-webkit-user-select:text;word-break:break-all;font-size:13px}
+.e{margin-top:10px;font-size:13px;color:#9fb6ff;text-align:center}
+input,textarea{width:100%;margin-top:8px;padding:12px;border-radius:12px;border:1px solid #19295a;background:#0c1530;color:#fff;font:15px system-ui,sans-serif;outline:none}
+textarea{min-height:90px}ol{margin:0;padding-left:20px}li{margin:4px 0}table{width:100%;border-collapse:collapse}td{padding:3px 0}td+td{text-align:right;font-weight:600}
+</style></head><body><div id=a></div>
+<script>
+const T=window.Telegram&&Telegram.WebApp||{initData:'',ready(){},expand(){},openLink:u=>open(u),openTelegramLink:u=>open(u)},A=document.getElementById('a');
+try{T.ready();T.expand();T.setHeaderColor('#050a17');T.setBackgroundColor('#050a17')}catch(e){}
+let S=null,V='h',T2={k:'p',q:1},E='',C=null,DV='',PT=0;
+const MN='янв фев мар апр мая июн июл авг сен окт ноя дек'.split(' ');
+const dt=t=>{const d=new Date(t*1e3);return d.getDate()+' '+MN[d.getMonth()]+' '+d.getFullYear()};
+const dl=()=>Math.max(0,Math.ceil((S.e-Date.now()/1e3)/86400));
+const es=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const B=(t,a,c,x)=>`<button data-a="${es(a)}" class="${c||''}"${x?' disabled':''}>${t}</button>`;
+function pr(f,dm){const D=Math.min(5000,10000-(100-dm)*(100-(S.pp||0)));return[f,Math.floor((f*(10000-D)+5000)/10000)]}
+function cost(){const k=T2.k,q=T2.q;return k=='p'?pr(S.p*q,(S.dm||{})[q]||0):pr((k=='d'?S.dp:S.gp)*q,0)}
+const act=()=>S.s==1||S.s==3,back=v=>`<div class=w><span class=t>${v}</span>${B('Назад','v:h')}</div>`;
+const HD=`<div class=hd><svg width=36 height=36 viewBox="0 0 34 34"><rect width=34 height=34 rx=10 fill="#2b63ff"/><path d="M11 23h12a4.5 4.5 0 0 0 .6-9 6.5 6.5 0 0 0-12.4 2A3.6 3.6 0 0 0 11 23z" fill="#fff"/></svg><div>Cloud Networks<small>VPN</small></div></div>`;
+function home(){let h=HD,s=S.s;
+ if(act())h+=`<div class=c><div class=w><b>${s==3?'Пробный доступ':'Подписка активна'}</b><span class=mt>${dl()} дн.</span></div><div class=mt>до ${dt(S.e)} · устройств: ${S.d}</div>`+(S.g?`<div class=w style="margin-top:8px"><span class=mt>📶</span><span class=mt>${S.g[0]} из ${S.g[1]} ГБ</span></div><div class=bar><i style="width:${Math.min(100,S.g[0]/S.g[1]*100||0)}%"></i></div>`:'')+'</div>';
+ else if(s==2)h+=`<div class=c><b>Подписка закончилась</b><div class=mt>${dt(S.e)}. Продлите — всё заработает сразу</div></div>`;
+ else h+=`<div class=c><b>${S.p} ₽ в месяц</b><div class=mt>${S.bd} устройства · все локации · 📶 ${S.pg} ГБ в месяц</div></div>`;
+ if(S.pay&&S.pay.st=='ok')h+=`<div class=c style="border-color:#2b63ff"><b>Оплата прошла ✓</b><div class=mt>Подключитесь по инструкции — кнопка «Подключить»</div></div>`;
+ if(S.wk)h+=`<div class=c style="border-color:#2b63ff"><div class=w><div><b>−${S.wk}% на выходных</b><div class=mt>промокод ${es(S.wc)}</div></div>${B('Применить','wk','p')}</div></div>`;
+ if(S.pp)h+=`<div class=e>Промокод ${es(S.pc)}: скидка ${S.pp}% на следующую покупку</div>`;
+ if(S.t)h+=B(`Попробовать бесплатно · ${S.td} дн.`,'trial','p');
+ h+=B(s?'Продлить подписку':'Купить подписку','v:b',S.t?'':'p');
+ h+=`<div class=g>${B('Подключить','v:g','',!act())}${B('Друзья','v:r')}${B('Промокод','v:c')}${B('Поддержка','sp')}</div>`;
+ if(S.adm)h+=B('Админ-панель','a:h');return h}
+function buy(){let h=back('Покупка');const p=S.pay;
+ if(p&&p.st=='w'){h+=`<div class=c><div class=mt>К оплате</div><div class=big>${p.a} ${p.m=='t'?'TON':'₽'}</div><div class=mt>${p.m=='t'?'Переведите из кошелька — сумма и комментарий подставятся. Подтверждение — до пары минут.':'После оплаты всё включится само, этот экран обновится.'}</div></div>`;
+  if(p.u)h+=B('Перейти к оплате','go','p');return h+B('Выбрать другое','x')}
+ if(S.s==1)h+=`<div class=r>${[['p','Подписка'],['d','Устройства'],['g','📶 ГБ']].map(x=>B(x[1],'k:'+x[0],T2.k==x[0]?'p':'')).join('')}</div>`;
+ const k=T2.k,c=cost(),o=k=='p'?[1,3,6,12]:k=='d'?[1,2,3,5]:[10,25,50,100],dm=k=='p'?(S.dm||{})[T2.q]||0:0;
+ h+=`<div class=r>${o.map(q=>B(q+(k=='p'?' мес':k=='g'?' ГБ':''),'q:'+q,T2.q==q?'p':'')).join('')}</div>`;
+ h+=`<div class=c><div class=mt>${k=='p'?`${S.bd+(S.xd||0)} устройства · 📶 ${S.pg*T2.q} ГБ`+(dm?` · −${dm}% за срок`:''):k=='d'?`+${T2.q} к лимиту, навсегда · ${S.dp} ₽ за шт.`:`${S.gp} ₽ за 1 ГБ`}</div><div class=big>${c[1]} ₽ ${c[1]<c[0]?`<s>${c[0]} ₽</s>`:''}</div>${S.pp?`<div class=mt>Промокод ${es(S.pc)}: −${S.pp}%</div>`:''}</div>`;
+ h+=B('Картой или СБП','pay:p','p');if(S.ton)h+=B('Оплатить TON','pay:t');return h}
+function ref(){return back('Друзья')+`<div class=c>За каждого друга, который оформит подписку, — <b>${S.rd} дней</b> бесплатно.<div class=mt style="margin-top:6px">Приглашено: ${S.r[0]} · оплатили: ${S.r[1]}</div></div><div class="c sel">${es(S.rl)}</div><div class=g>${B('Скопировать','cp:'+S.rl,'p')}${B('Поделиться','sh')}</div>`}
+function code(){return back('Промокод')+`<input id=pc placeholder="Введите промокод" autocapitalize=characters>${B('Применить','pc','p')}`+(S.pp?`<div class=c>Сейчас действует <b>${es(S.pc)}</b>: −${S.pp}%</div>`:'')+`<div class=c><b>Каждые выходные −${S.wp}%</b><div class=mt>Промокод ${es(S.wc)} работает в субботу и воскресенье</div></div>`}
+const AS='https://apps.apple.com/',GH='https://github.com/Happ-proxy/',GP='https://play.google.com/store/apps/details?id=com.happproxy';
+const DEV={i:['iPhone и iPad','Установите Happ из App Store',[['App Store (Россия)',AS+'ru/app/happ-proxy-utility-plus/id6746188973'],['App Store (другие страны)',AS+'app/happ-proxy-utility/id6504287215']]],a:['Android','Установите Happ из Google Play или скачайте APK',[['Google Play',GP],['Скачать APK',GH+'happ-android/releases/latest/download/Happ.apk']]],w:['Windows','Скачайте и установите Happ для Windows',[['Скачать для Windows',GH+'happ-desktop/releases/latest/download/setup-Happ.x64.exe']]],m:['macOS','Установите Happ из App Store или скачайте DMG',[['App Store',AS+'ru/app/happ-proxy-utility-plus/id6746188973'],['Скачать DMG',GH+'happ-desktop/releases/latest/download/Happ.macOS.universal.dmg']]],t:['Телевизор','Установите Happ из Google Play на Android TV или из App Store на Apple TV',[['Google Play',GP],['Apple TV',AS+'app/happ-proxy-utility-for-tv/id6748297274']]]};
+function guide(){if(!DV)return back('Как подключиться')+`<div class=mt style="margin-top:6px">Выберите устройство</div><div class=g>${Object.keys(DEV).map(k=>B(DEV[k][0],'d:'+k)).join('')}${B('Поддержка','sp')}</div>`;
+ const d=DEV[DV],st=[d[1],'Скопируйте ссылку подписки кнопкой ниже','Откройте Happ, нажмите «+» → «Вставить из буфера»','Нажмите кнопку подключения и разрешите добавить VPN'];
+ if(DV=='t')st[2]='Откройте Happ на ТВ, нажмите «+» и добавьте подписку по ссылке — её удобно отправить себе в Telegram на ТВ';
+ return`<div class=w><span class=t>${d[0]}</span>${B('Назад','d:')}</div><div class=c><ol>${st.map(x=>`<li>${x}</li>`).join('')}</ol></div>${d[2].map(x=>B(x[0],'o:'+x[1])).join('')}`+(S.su?B('Скопировать ссылку подписки','cp:'+S.su,'p')+B('Открыть страницу подписки','o:'+S.su):'<div class=e>Ссылка подписки появится после оплаты</div>')}
+function card(){const c=C||{},b=c.b||[];return(c.t?`<div class=w><span class=t>${c.t}</span>${B('Закрыть','v:h')}</div>`:'')+(c.x?`<div class="c sel">${c.x}</div>`:'')+(c.r?`<div class=c><table>${c.r.map(r=>`<tr><td class=mt>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table></div>`:'')+(c.in?(c.in=='bc'?'<textarea id=ai placeholder="Текст"></textarea>':'<input id=ai placeholder="Введите">')+B('Отправить','ai','p'):'')+(b.length?`<div class=g style="grid-template-columns:repeat(${c.c||1},1fr)">${b.map(x=>B(x[0],x[1],x[2]?'p':'')).join('')}</div>`:'')}
+function R(){if(!S){A.innerHTML=HD+`<div class=e>${E||'Загрузка…'}</div>`;return}
+ A.innerHTML=({h:home,b:buy,r:ref,c:code,g:guide,a:card}[V]||home)()+(E?`<div class=e>${E}</div>`:'')}
+async function api(a,x){const r=await fetch('/api',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({initData:T.initData,a},x||{}))});if(!r.ok)throw 0;return r.json()}
+async function run(a,x,f){E='…';R();try{const r=await api(a,x);E=r.m||'';if(r.st)S=r.st;if(r.card){C=r.card;V='a'}if(f)f(r)}catch(e){E='Нет связи с сервером. Если не открывается — включите VPN или пользуйтесь меню в чате'}R()}
+function poll(){clearTimeout(PT);if(S&&S.pay&&S.pay.st=='w')PT=setTimeout(()=>api('s').then(r=>{S=r.st;if(S.pay&&S.pay.st=='ok')V='h';R();poll()}).catch(poll),5000)}
+function link(u){u.startsWith('https://t.me/')?T.openTelegramLink(u):T.openLink(u)}
+function copy(t){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{E='Скопировано ✓';R()},()=>{E=t;R()})}
+A.onclick=ev=>{const t=ev.target.closest('button');if(!t||t.disabled)return;const a=t.dataset.a,i=a.indexOf(':'),n=i<0?a:a.slice(0,i),v=i<0?'':a.slice(i+1);E='';
+ try{T.HapticFeedback.selectionChanged()}catch(e){}
+ if(n=='v'){V=v;DV='';if(v=='b')T2={k:'p',q:1};return R()}
+ if(n=='k'){T2={k:v,q:v=='g'?10:1};return R()}if(n=='q'){T2.q=+v;return R()}if(n=='d'){DV=v;return R()}
+ if(a=='x'){S.pay=null;return R()}if(a=='go')return link(S.pay.u);if(a=='sp')return link('https://t.me/'+S.sp);
+ if(n=='cp')return copy(v);if(n=='o')return link(v);if(n=='g')return link(v);if(n=='c')return copy(v);
+ if(a=='sh')return link('https://t.me/share/url?url='+encodeURIComponent(S.rl));
+ if(a=='pc')return run('promo',{code:document.getElementById('pc').value.trim()});
+ if(a=='wk')return run('wk',0,r=>{if(!r.m){V='b';T2={k:'p',q:1}}});
+ if(n=='pay')return run('pay',{k:T2.k,q:T2.q,mt:v},r=>{if(r.pay){S.pay=r.pay;if(r.pay.u)link(r.pay.u);poll()}});
+ if(a=='ai')return run('ain',{text:document.getElementById('ai').value});
+ if(a=='trial')return run('trial');
+ run(a)};
+api('s').then(r=>{S=r.st;R();poll()}).catch(()=>{E='Не удалось загрузить. Если не открывается — включите VPN или пользуйтесь меню в чате бота';R()});R();
+</script></body></html>
+'''
+
 
 # ─────────────────────────────────────────────
 #  ЦЕНЫ, ВЫХОДНЫЕ, ПРОМОКОДЫ
@@ -2366,7 +2451,9 @@ async def http_api(request: web.Request) -> web.Response:
 async def start_http() -> None:
     app = web.Application(client_max_size=64 * 1024)
     app.router.add_post("/api", http_api)
-    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    app.router.add_get("/", lambda r: web.Response(text=APP_HTML, content_type="text/html",
+                                                   headers={"Cache-Control": "no-cache"}))
+    app.router.add_get("/health", lambda r: web.Response(text="ok"))
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", API_PORT).start()
